@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    container_name: beanpon_messenger
+    restart: always
+    ports:
+      - "5082:5082" # Go uygulamanızın çalıştığı port
+    environment:
+      - ENV=production
