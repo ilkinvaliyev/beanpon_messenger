@@ -2,19 +2,21 @@ package utils
 
 import "strings"
 
-const BaseURL = "https://api.beanpon.com/"
+const BaseURL = "https://api.beanpon.com"
+const StoragePrefix = "/storage/"
 
-// PrependBaseURL resim yoluna domain prefix-ləyir
 func PrependBaseURL(path *string) *string {
 	if path == nil || *path == "" {
 		return nil
 	}
 
-	// Zaten tam URL'se, aynen dön
+	// Zaten tam URL isə dəyişdirmə
 	if strings.HasPrefix(*path, "http://") || strings.HasPrefix(*path, "https://") {
 		return path
 	}
 
-	fullURL := BaseURL + strings.TrimPrefix(*path, "/")
+	cleanedPath := strings.TrimPrefix(*path, "/") // baştaki / işarəsini sil
+	fullURL := BaseURL + StoragePrefix + cleanedPath
+
 	return &fullURL
 }
