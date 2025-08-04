@@ -3,6 +3,7 @@ package handlers
 import (
 	"beanpon_messenger/database"
 	"beanpon_messenger/models"
+	"beanpon_messenger/utils"
 	"net/http"
 	"strconv"
 	"time"
@@ -270,46 +271,55 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 		LastMessageTime time.Time `json:"last_message_time"`
 		IsLastFromMe    bool      `json:"is_last_from_me"`
 		UnreadCount     int       `json:"unread_count"`
+
+		OtherUserName string  `json:"other_user_name"`
+		AccountTypeID int     `json:"account_type_id"`
+		ProfileImage  *string `json:"profile_image"`
 	}
 
 	query := `
-		WITH latest_messages AS (
-			SELECT 
-				CASE 
-					WHEN sender_id = ? THEN receiver_id 
-					ELSE sender_id 
-				END as other_user_id,
-				id,
-				encrypted_text,
-				created_at,
-				sender_id = ? as is_from_me,
-				ROW_NUMBER() OVER (
-					PARTITION BY CASE WHEN sender_id = ? THEN receiver_id ELSE sender_id END 
-					ORDER BY created_at DESC
-				) as rn
-			FROM messages 
-			WHERE sender_id = ? OR receiver_id = ?
-		),
-		unread_counts AS (
-			SELECT 
-				sender_id as other_user_id,
-				COUNT(*) as unread_count
-			FROM messages 
-			WHERE receiver_id = ? AND read = false
-			GROUP BY sender_id
-		)
+	WITH latest_messages AS (
 		SELECT 
-			lm.other_user_id,
-			lm.id as last_message_id,
-			lm.encrypted_text as last_message_text,
-			lm.created_at as last_message_time,
-			lm.is_from_me,
-			COALESCE(uc.unread_count, 0) as unread_count
-		FROM latest_messages lm
-		LEFT JOIN unread_counts uc ON lm.other_user_id = uc.other_user_id
-		WHERE lm.rn = 1
-		ORDER BY lm.created_at DESC
-	`
+			CASE 
+				WHEN sender_id = ? THEN receiver_id 
+				ELSE sender_id 
+			END as other_user_id,
+			id,
+			encrypted_text,
+			created_at,
+			sender_id = ? as is_from_me,
+			ROW_NUMBER() OVER (
+				PARTITION BY CASE WHEN sender_id = ? THEN receiver_id ELSE sender_id END 
+				ORDER BY created_at DESC
+			) as rn
+		FROM messages 
+		WHERE sender_id = ? OR receiver_id = ?
+	),
+	unread_counts AS (
+		SELECT 
+			sender_id as other_user_id,
+			COUNT(*) as unread_count
+		FROM messages 
+		WHERE receiver_id = ? AND read = false
+		GROUP BY sender_id
+	)
+	SELECT 
+		lm.other_user_id,
+		lm.id as last_message_id,
+		lm.encrypted_text as last_message_text,
+		lm.created_at as last_message_time,
+		lm.is_from_me,
+		COALESCE(uc.unread_count, 0) as unread_count,
+		u.name as other_user_name,
+		u.account_type_id,
+		p.profile_image
+	FROM latest_messages lm
+	LEFT JOIN unread_counts uc ON lm.other_user_id = uc.other_user_id
+	LEFT JOIN users u ON u.id = lm.other_user_id
+	LEFT JOIN profiles p ON p.user_id = lm.other_user_id
+	WHERE lm.rn = 1
+	ORDER BY lm.created_at DESC
+`
 
 	err := database.DB.Raw(query, userID, userID, userID, userID, userID, userID).Scan(&conversations).Error
 	if err != nil {
@@ -327,6 +337,9 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 
 		responseConversations = append(responseConversations, gin.H{
 			"other_user_id":     conv.OtherUserID,
+			"other_user_name":   conv.OtherUserName,
+			"account_type_id":   conv.AccountTypeID,
+			"profile_image":     utils.PrependBaseURL(conv.ProfileImage),
 			"last_message_id":   conv.LastMessageID,
 			"last_message_text": decryptedText,
 			"last_message_time": conv.LastMessageTime,
