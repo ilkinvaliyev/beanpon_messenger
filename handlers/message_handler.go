@@ -3,21 +3,37 @@ package handlers
 import (
 	"beanpon_messenger/database"
 	"beanpon_messenger/models"
-	"beanpon_messenger/services"
-	"beanpon_messenger/websocket"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 type MessageHandler struct {
-	encryptionService *services.EncryptionService
-	wsHub             *websocket.Hub
+	encryptionService interface {
+		EncryptMessage(plainText string) (string, error)
+		DecryptMessage(encryptedText string) (string, error)
+	}
+	wsHub interface {
+		HandleNewMessage(senderID, receiverID uint, messageID, content string, createdAt time.Time)
+		HandleMessageRead(messageID string, senderID, readerID uint)
+		IsUserOnline(userID uint) bool
+		SendToUser(userID uint, messageType string, data interface{})
+	}
 }
 
-// NewMessageHandler yeni message handler oluştur
-func NewMessageHandler(encryptionService *services.EncryptionService, wsHub *websocket.Hub) *MessageHandler {
+func NewMessageHandler(encryptionService interface {
+	EncryptMessage(plainText string) (string, error)
+	DecryptMessage(encryptedText string) (string, error)
+}, wsHub interface {
+	HandleNewMessage(senderID, receiverID uint, messageID, content string, createdAt time.Time)
+	HandleMessageRead(messageID string, senderID, readerID uint)
+	IsUserOnline(userID uint) bool
+	SendToUser(userID uint, messageType string, data interface{})
+}) *MessageHandler {
 	return &MessageHandler{
 		encryptionService: encryptionService,
 		wsHub:             wsHub,
@@ -27,77 +43,76 @@ func NewMessageHandler(encryptionService *services.EncryptionService, wsHub *web
 // SendMessage mesaj gönder
 func (h *MessageHandler) SendMessage(c *gin.Context) {
 	// JWT'den user ID al
-	userID, exists := c.Get("user_id")
+	senderID, exists := c.Get("user_id")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 		return
 	}
 
-	var req models.SendMessageRequest
+	var req struct {
+		ReceiverID uint   `json:"receiver_id" binding:"required"`
+		Text       string `json:"text" binding:"required"`
+	}
+
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz mesaj formatı"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	// Kendi kendine mesaj gönderme kontrolü
-	if userID.(uint) == req.ReceiverID {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Kendinize mesaj gönderemezsiniz"})
-		return
-	}
-
-	// Alıcının var olup olmadığını kontrol et
-	var receiver models.User
-	if err := database.DB.First(&receiver, req.ReceiverID).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Alıcı bulunamadı"})
+	// Kendi kendine mesaj göndermesini engelle
+	if senderID.(uint) == req.ReceiverID {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Kendi kendinize mesaj gönderemezsiniz"})
 		return
 	}
 
 	// Mesajı şifrele
 	encryptedText, err := h.encryptionService.EncryptMessage(req.Text)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Mesaj şifreleme hatası"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Mesaj şifrelenirken hata oluştu"})
 		return
 	}
 
-	// Mesajı veritabanına kaydet
+	// Veritabanına kaydet
 	message := models.Message{
-		SenderID:      userID.(uint),
+		ID:            uuid.New().String(),
+		SenderID:      senderID.(uint),
 		ReceiverID:    req.ReceiverID,
 		EncryptedText: encryptedText,
+		Read:          false,
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
 	}
 
 	if err := database.DB.Create(&message).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Mesaj kaydetme hatası"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Mesaj kaydedilemedi"})
 		return
 	}
 
-	// WebSocket ile alıcıya gönder
-	h.wsHub.SendToUser(req.ReceiverID, "new_message", map[string]interface{}{
-		"id":         message.ID,
-		"sender_id":  message.SenderID,
-		"text":       req.Text, // Şifrelenmemiş metin
-		"created_at": message.CreatedAt,
-	})
+	// WebSocket üzerinden real-time yayınla (hem gönderen hem alıcıya)
+	h.wsHub.HandleNewMessage(
+		message.SenderID,
+		message.ReceiverID,
+		message.ID,
+		req.Text, // Şifrelenmemiş hali WebSocket'te
+		message.CreatedAt,
+	)
 
-	// Response döndür
+	// API response
 	c.JSON(http.StatusCreated, gin.H{
-		"success": true,
-		"message": "Mesaj gönderildi",
-		"data": models.MessageResponse{
-			ID:         message.ID,
-			SenderID:   message.SenderID,
-			ReceiverID: message.ReceiverID,
-			Text:       req.Text,
-			IsEdited:   message.IsEdited,
-			Delivered:  message.Delivered,
-			Read:       message.Read,
-			CreatedAt:  message.CreatedAt,
-			UpdatedAt:  message.UpdatedAt,
+		"message": "Mesaj başarıyla gönderildi",
+		"data": gin.H{
+			"id":          message.ID,
+			"sender_id":   message.SenderID,
+			"receiver_id": message.ReceiverID,
+			"text":        req.Text,
+			"read":        message.Read,
+			"created_at":  message.CreatedAt,
+			"is_online":   h.wsHub.IsUserOnline(req.ReceiverID),
 		},
 	})
 }
 
-// GetMessages mesajları listele (pagination ile)
+// GetMessages belirli kullanıcı ile mesajları getir
 func (h *MessageHandler) GetMessages(c *gin.Context) {
 	userID, exists := c.Get("user_id")
 	if !exists {
@@ -105,60 +120,83 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 		return
 	}
 
-	// URL parametrelerini al
-	otherUserIDStr := c.Param("user_id")
-	otherUserID, err := strconv.ParseUint(otherUserIDStr, 10, 32)
+	otherUserID, err := strconv.ParseUint(c.Param("user_id"), 10, 32)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz kullanıcı ID"})
 		return
 	}
 
-	// Pagination parametreleri
+	// Sayfa parametreleri
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
 	offset := (page - 1) * limit
 
-	// Mesajları getir
 	var messages []models.Message
-	query := database.DB.Where(
+	err = database.DB.Where(
 		"(sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?)",
-		userID.(uint), uint(otherUserID), uint(otherUserID), userID.(uint),
-	).Order("created_at DESC").Limit(limit).Offset(offset)
+		userID, otherUserID, otherUserID, userID,
+	).Order("created_at DESC").Limit(limit).Offset(offset).Find(&messages).Error
 
-	if err := query.Find(&messages).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Mesajlar getirilemedi"})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Mesajlar alınamadı"})
 		return
 	}
 
-	// Mesajları çöz ve response formatına çevir
-	var responses []models.MessageResponse
+	// Mesajları çöz ve response'a hazırla
+	var responseMessages []gin.H
 	for _, msg := range messages {
-		// Mesajı çöz
 		decryptedText, err := h.encryptionService.DecryptMessage(msg.EncryptedText)
 		if err != nil {
 			decryptedText = "Mesaj çözülemedi"
 		}
 
-		responses = append(responses, models.MessageResponse{
-			ID:         msg.ID,
-			SenderID:   msg.SenderID,
-			ReceiverID: msg.ReceiverID,
-			Text:       decryptedText,
-			IsEdited:   msg.IsEdited,
-			Delivered:  msg.Delivered,
-			Read:       msg.Read,
-			ReadAt:     msg.ReadAt,
-			CreatedAt:  msg.CreatedAt,
-			UpdatedAt:  msg.UpdatedAt,
+		responseMessages = append(responseMessages, gin.H{
+			"id":          msg.ID,
+			"sender_id":   msg.SenderID,
+			"receiver_id": msg.ReceiverID,
+			"text":        decryptedText,
+			"read":        msg.Read,
+			"created_at":  msg.CreatedAt,
+			"updated_at":  msg.UpdatedAt,
 		})
 	}
 
+	// Okunmamış mesajları okundu olarak işaretle (sadece gelen mesajlar)
+	go h.markReceivedMessagesAsRead(userID.(uint), uint(otherUserID))
+
 	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"data":    responses,
-		"page":    page,
-		"limit":   limit,
+		"messages":  responseMessages,
+		"page":      page,
+		"limit":     limit,
+		"total":     len(responseMessages),
+		"is_online": h.wsHub.IsUserOnline(uint(otherUserID)),
 	})
+}
+
+// markReceivedMessagesAsRead alınan mesajları okundu olarak işaretle
+func (h *MessageHandler) markReceivedMessagesAsRead(currentUserID, otherUserID uint) {
+	var unreadMessages []models.Message
+
+	// Karşı taraftan gelen okunmamış mesajları bul
+	err := database.DB.Where(
+		"sender_id = ? AND receiver_id = ? AND read = false",
+		otherUserID, currentUserID,
+	).Find(&unreadMessages).Error
+
+	if err != nil {
+		return
+	}
+
+	// Okundu olarak işaretle
+	database.DB.Model(&models.Message{}).Where(
+		"sender_id = ? AND receiver_id = ? AND read = false",
+		otherUserID, currentUserID,
+	).Update("read", true)
+
+	// Her mesaj için WebSocket bildirimi gönder
+	for _, msg := range unreadMessages {
+		h.wsHub.HandleMessageRead(msg.ID, msg.SenderID, currentUserID)
+	}
 }
 
 // MarkAsRead mesajı okundu olarak işaretle
@@ -171,27 +209,48 @@ func (h *MessageHandler) MarkAsRead(c *gin.Context) {
 
 	messageID := c.Param("message_id")
 
-	// Mesajı bul ve güncelle
-	result := database.DB.Model(&models.Message{}).
-		Where("id = ? AND receiver_id = ?", messageID, userID.(uint)).
-		Updates(map[string]interface{}{
-			"read":    true,
-			"read_at": "NOW()",
-		})
+	var message models.Message
+	err := database.DB.Where("id = ?", messageID).First(&message).Error
+	if err != nil {
+		if err == gorm.ErrRecordNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Mesaj bulunamadı"})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Veritabanı hatası"})
+		}
+		return
+	}
 
-	if result.Error != nil {
+	// Sadece alıcı mesajı okundu olarak işaretleyebilir
+	if message.ReceiverID != userID.(uint) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Bu mesajı okundu olarak işaretleme yetkiniz yok"})
+		return
+	}
+
+	// Zaten okunmuşsa
+	if message.Read {
+		c.JSON(http.StatusOK, gin.H{"message": "Mesaj zaten okunmuş"})
+		return
+	}
+
+	// Okundu olarak işaretle
+	message.Read = true
+	message.UpdatedAt = time.Now()
+
+	if err := database.DB.Save(&message).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Mesaj güncellenemedi"})
 		return
 	}
 
-	if result.RowsAffected == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Mesaj bulunamadı"})
-		return
-	}
+	// WebSocket üzerinden gönderene bildir
+	h.wsHub.HandleMessageRead(message.ID, message.SenderID, userID.(uint))
 
 	c.JSON(http.StatusOK, gin.H{
-		"success": true,
 		"message": "Mesaj okundu olarak işaretlendi",
+		"data": gin.H{
+			"message_id": message.ID,
+			"read":       message.Read,
+			"read_at":    message.UpdatedAt,
+		},
 	})
 }
 
@@ -203,35 +262,157 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 		return
 	}
 
-	// En son mesajları getir (her kullanıcı için)
+	// En son mesajları getir (her konuşma için sadece son mesaj)
 	var conversations []struct {
-		OtherUserID   uint   `json:"other_user_id"`
-		LastMessage   string `json:"last_message"`
-		LastMessageAt string `json:"last_message_at"`
-		UnreadCount   int    `json:"unread_count"`
+		OtherUserID     uint      `json:"other_user_id"`
+		LastMessageID   string    `json:"last_message_id"`
+		LastMessageText string    `json:"last_message_text"`
+		LastMessageTime time.Time `json:"last_message_time"`
+		IsLastFromMe    bool      `json:"is_last_from_me"`
+		UnreadCount     int       `json:"unread_count"`
 	}
 
-	// Bu karmaşık bir query, basitleştirilmiş hali
 	query := `
+		WITH latest_messages AS (
+			SELECT 
+				CASE 
+					WHEN sender_id = ? THEN receiver_id 
+					ELSE sender_id 
+				END as other_user_id,
+				id,
+				encrypted_text,
+				created_at,
+				sender_id = ? as is_from_me,
+				ROW_NUMBER() OVER (
+					PARTITION BY CASE WHEN sender_id = ? THEN receiver_id ELSE sender_id END 
+					ORDER BY created_at DESC
+				) as rn
+			FROM messages 
+			WHERE sender_id = ? OR receiver_id = ?
+		),
+		unread_counts AS (
+			SELECT 
+				sender_id as other_user_id,
+				COUNT(*) as unread_count
+			FROM messages 
+			WHERE receiver_id = ? AND read = false
+			GROUP BY sender_id
+		)
 		SELECT 
-			CASE 
-				WHEN sender_id = ? THEN receiver_id 
-				ELSE sender_id 
-			END as other_user_id,
-			encrypted_text as last_message,
-			created_at as last_message_at
-		FROM messages 
-		WHERE sender_id = ? OR receiver_id = ?
-		ORDER BY created_at DESC
+			lm.other_user_id,
+			lm.id as last_message_id,
+			lm.encrypted_text as last_message_text,
+			lm.created_at as last_message_time,
+			lm.is_from_me,
+			COALESCE(uc.unread_count, 0) as unread_count
+		FROM latest_messages lm
+		LEFT JOIN unread_counts uc ON lm.other_user_id = uc.other_user_id
+		WHERE lm.rn = 1
+		ORDER BY lm.created_at DESC
 	`
 
-	if err := database.DB.Raw(query, userID.(uint), userID.(uint), userID.(uint)).Scan(&conversations).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Sohbetler getirilemedi"})
+	err := database.DB.Raw(query, userID, userID, userID, userID, userID, userID).Scan(&conversations).Error
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Konuşmalar alınamadı"})
+		return
+	}
+
+	// Mesajları çöz ve online durumları ekle
+	var responseConversations []gin.H
+	for _, conv := range conversations {
+		decryptedText, err := h.encryptionService.DecryptMessage(conv.LastMessageText)
+		if err != nil {
+			decryptedText = "Mesaj çözülemedi"
+		}
+
+		responseConversations = append(responseConversations, gin.H{
+			"other_user_id":     conv.OtherUserID,
+			"last_message_id":   conv.LastMessageID,
+			"last_message_text": decryptedText,
+			"last_message_time": conv.LastMessageTime,
+			"is_last_from_me":   conv.IsLastFromMe,
+			"unread_count":      conv.UnreadCount,
+			"is_online":         h.wsHub.IsUserOnline(conv.OtherUserID),
+		})
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"conversations": responseConversations,
+		"total":         len(responseConversations),
+	})
+}
+
+// GetUnreadCount okunmamış mesaj sayısı
+func (h *MessageHandler) GetUnreadCount(c *gin.Context) {
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	var count int64
+	err := database.DB.Model(&models.Message{}).Where(
+		"receiver_id = ? AND read = false", userID,
+	).Count(&count).Error
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Sayım yapılamadı"})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"data":    conversations,
+		"unread_count": count,
+	})
+}
+
+// DeleteMessage mesajı sil (sadece gönderen silebilir)
+func (h *MessageHandler) DeleteMessage(c *gin.Context) {
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	messageID := c.Param("message_id")
+
+	var message models.Message
+	err := database.DB.Where("id = ?", messageID).First(&message).Error
+	if err != nil {
+		if err == gorm.ErrRecordNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Mesaj bulunamadı"})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Veritabanı hatası"})
+		}
+		return
+	}
+
+	// Sadece gönderen silebilir
+	if message.SenderID != userID.(uint) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Bu mesajı silme yetkiniz yok"})
+		return
+	}
+
+	// Mesajı sil
+	if err := database.DB.Delete(&message).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Mesaj silinemedi"})
+		return
+	}
+
+	// WebSocket üzerinden her iki tarafa da bildir
+	deleteData := map[string]interface{}{
+		"message_id": message.ID,
+		"deleted_by": userID.(uint),
+		"deleted_at": time.Now(),
+	}
+
+	h.wsHub.SendToUser(message.SenderID, "message_deleted", deleteData)
+	h.wsHub.SendToUser(message.ReceiverID, "message_deleted", deleteData)
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Mesaj başarıyla silindi",
+		"data": gin.H{
+			"message_id": message.ID,
+			"deleted_at": time.Now(),
+		},
 	})
 }

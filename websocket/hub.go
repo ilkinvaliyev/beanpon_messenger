@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -15,7 +16,6 @@ var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
 	CheckOrigin: func(r *http.Request) bool {
-		// CORS için - production'da daha güvenli yapılmalı
 		return true
 	},
 }
@@ -30,39 +30,53 @@ type Client struct {
 
 // Hub tüm client'ları yönetir
 type Hub struct {
-	// Kayıtlı client'lar
-	clients map[uint]*Client
-
-	// Client kayıt kanalı
-	register chan *Client
-
-	// Client çıkış kanalı
-	unregister chan *Client
-
-	// Mesaj broadcast kanalı
-	broadcast chan *Message
-
-	// Mutex thread safety için
-	mutex sync.RWMutex
-
-	// Database bağlantısı
-	db *gorm.DB
-
-	// Şifreleme servisi
+	clients           map[uint]*Client
+	register          chan *Client
+	unregister        chan *Client
+	broadcast         chan *Message
+	mutex             sync.RWMutex
+	db                *gorm.DB
 	encryptionService interface {
+		EncryptMessage(plainText string) (string, error)
 		DecryptMessage(encryptedText string) (string, error)
 	}
 }
 
-// Message WebSocket mesaj yapısı
+// IncomingMessage client'tan gelen mesaj yapısı
+type IncomingMessage struct {
+	Type       string      `json:"type"`
+	ReceiverID uint        `json:"receiver_id,omitempty"`
+	Content    string      `json:"content,omitempty"`
+	Data       interface{} `json:"data,omitempty"`
+}
+
+// OutgoingMessage client'a gönderilen mesaj yapısı
+type OutgoingMessage struct {
+	Type string      `json:"type"`
+	Data interface{} `json:"data"`
+}
+
+// Message WebSocket mesaj yapısı (broadcast için)
 type Message struct {
 	Type       string      `json:"type"`
 	ReceiverID uint        `json:"receiver_id"`
 	Data       interface{} `json:"data"`
 }
 
+// MessageData veritabanı mesaj yapısı
+type MessageData struct {
+	ID         string    `json:"id"`
+	SenderID   uint      `json:"sender_id"`
+	ReceiverID uint      `json:"receiver_id"`
+	Text       string    `json:"text"`
+	Read       bool      `json:"read"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
 // NewHub yeni hub oluştur
 func NewHub(db *gorm.DB, encryptionService interface {
+	EncryptMessage(plainText string) (string, error)
 	DecryptMessage(encryptedText string) (string, error)
 }) *Hub {
 	return &Hub{
@@ -96,14 +110,10 @@ func (h *Hub) registerClient(client *Client) {
 	h.mutex.Lock()
 	defer h.mutex.Unlock()
 
-	// Eğer kullanıcı zaten bağlıysa, eski bağlantıyı temizle
 	if existingClient, exists := h.clients[client.UserID]; exists {
-		// Eski client'ı map'ten çıkar
 		delete(h.clients, existingClient.UserID)
-		// Channel'ı güvenli şekilde kapat
 		select {
 		case <-existingClient.Send:
-			// Channel zaten kapalı
 		default:
 			close(existingClient.Send)
 		}
@@ -113,6 +123,9 @@ func (h *Hub) registerClient(client *Client) {
 
 	h.clients[client.UserID] = client
 	log.Printf("Kullanıcı %d WebSocket'e bağlandı", client.UserID)
+
+	// Kullanıcı online durumunu diğer kullanıcılara bildir
+	h.broadcastUserStatus(client.UserID, "online")
 
 	// Bağlandıktan sonra son 30 mesajı gönder
 	go h.sendRecentMessages(client)
@@ -126,20 +139,45 @@ func (h *Hub) unregisterClient(client *Client) {
 	if _, exists := h.clients[client.UserID]; exists {
 		delete(h.clients, client.UserID)
 
-		// Channel'ı güvenli şekilde kapat
 		select {
 		case <-client.Send:
-			// Channel zaten kapalı
 		default:
 			close(client.Send)
 		}
 
 		client.Conn.Close()
 		log.Printf("Kullanıcı %d WebSocket'ten ayrıldı", client.UserID)
+
+		// Kullanıcı offline durumunu diğer kullanıcılara bildir
+		h.broadcastUserStatus(client.UserID, "offline")
 	}
 }
 
-// broadcastMessage mesajı belirli kullanıcıya gönder
+// broadcastUserStatus kullanıcı durumunu yayınla
+func (h *Hub) broadcastUserStatus(userID uint, status string) {
+	statusMessage := &Message{
+		Type: "user_status",
+		Data: map[string]interface{}{
+			"user_id": userID,
+			"status":  status,
+		},
+	}
+
+	// Tüm bağlı kullanıcılara gönder
+	for _, client := range h.clients {
+		if client.UserID != userID { // Kendisi hariç
+			select {
+			case client.Send <- h.messageToBytes(statusMessage):
+			default:
+				go func(c *Client) {
+					h.unregister <- c
+				}(client)
+			}
+		}
+	}
+}
+
+// broadcastMessage mesajı yayınla
 func (h *Hub) broadcastMessage(message *Message) {
 	h.mutex.RLock()
 	defer h.mutex.RUnlock()
@@ -147,24 +185,12 @@ func (h *Hub) broadcastMessage(message *Message) {
 	if client, exists := h.clients[message.ReceiverID]; exists {
 		select {
 		case client.Send <- h.messageToBytes(message):
-			// Mesaj başarıyla gönderildi
 		default:
-			// Channel dolu veya kapalı, client'ı güvenli şekilde çıkar
 			go func() {
 				h.unregister <- client
 			}()
 		}
 	}
-}
-
-// messageToBytes mesajı JSON bytes'a çevir
-func (h *Hub) messageToBytes(message *Message) []byte {
-	data, err := json.Marshal(message)
-	if err != nil {
-		log.Printf("JSON marshal hatası: %v", err)
-		return []byte(`{"type":"error","data":"Mesaj formatı hatası"}`)
-	}
-	return data
 }
 
 // SendToUser belirli kullanıcıya mesaj gönder
@@ -177,6 +203,54 @@ func (h *Hub) SendToUser(userID uint, messageType string, data interface{}) {
 	h.broadcast <- message
 }
 
+// SendToMultipleUsers birden fazla kullanıcıya mesaj gönder
+func (h *Hub) SendToMultipleUsers(userIDs []uint, messageType string, data interface{}) {
+	for _, userID := range userIDs {
+		h.SendToUser(userID, messageType, data)
+	}
+}
+
+// HandleNewMessage yeni mesajı handle et ve WebSocket üzerinden yayınla
+func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content string, createdAt time.Time) {
+	messageData := map[string]interface{}{
+		"id":          messageID,
+		"sender_id":   senderID,
+		"receiver_id": receiverID,
+		"text":        content,
+		"read":        false,
+		"created_at":  createdAt,
+		"is_history":  false,
+	}
+
+	// Hem gönderen hem de alıcıya gönder
+	userIDs := []uint{senderID, receiverID}
+	h.SendToMultipleUsers(userIDs, "new_message", messageData)
+
+	log.Printf("Yeni mesaj WebSocket üzerinden yayınlandı: %s -> %d", messageID, receiverID)
+}
+
+// HandleMessageRead mesaj okundu durumunu handle et
+func (h *Hub) HandleMessageRead(messageID string, senderID, readerID uint) {
+	readData := map[string]interface{}{
+		"message_id": messageID,
+		"reader_id":  readerID,
+		"read_at":    time.Now(),
+	}
+
+	// Sadece gönderene bildir (alıcı zaten okudu)
+	h.SendToUser(senderID, "message_read", readData)
+
+	log.Printf("Mesaj okundu WebSocket üzerinden yayınlandı: %s", messageID)
+}
+
+// IsUserOnline kullanıcının online olup olmadığını kontrol et
+func (h *Hub) IsUserOnline(userID uint) bool {
+	h.mutex.RLock()
+	defer h.mutex.RUnlock()
+	_, exists := h.clients[userID]
+	return exists
+}
+
 // GetConnectedUsersCount bağlı kullanıcı sayısı
 func (h *Hub) GetConnectedUsersCount() int {
 	h.mutex.RLock()
@@ -184,24 +258,50 @@ func (h *Hub) GetConnectedUsersCount() int {
 	return len(h.clients)
 }
 
+// GetConnectedUsers bağlı kullanıcı listesi
+func (h *Hub) GetConnectedUsers() []uint {
+	h.mutex.RLock()
+	defer h.mutex.RUnlock()
+
+	users := make([]uint, 0, len(h.clients))
+	for userID := range h.clients {
+		users = append(users, userID)
+	}
+	return users
+}
+
+func (h *Hub) messageToBytes(message *Message) []byte {
+	outgoing := &OutgoingMessage{
+		Type: message.Type,
+		Data: message.Data,
+	}
+
+	data, err := json.Marshal(outgoing)
+	if err != nil {
+		log.Printf("JSON marshal hatası: %v", err)
+		return []byte(`{"type":"error","data":"Message format error"}`)
+	}
+	return data
+}
+
 // sendRecentMessages kullanıcıya son 30 mesajı gönder
 func (h *Hub) sendRecentMessages(client *Client) {
-	// Kullanıcının tüm sohbetlerinden son 30 mesajı al
 	var messages []struct {
 		ID         string `json:"id"`
 		SenderID   uint   `json:"sender_id"`
 		ReceiverID uint   `json:"receiver_id"`
 		Text       string `json:"text"`
+		Read       bool   `json:"read"`
 		CreatedAt  string `json:"created_at"`
 	}
 
-	// Raw SQL sorgusu - En eski mesajları al ve doğru sırada gönder
 	query := `
 		SELECT 
 			id, 
 			sender_id, 
 			receiver_id, 
 			encrypted_text as text,
+			read,
 			created_at
 		FROM messages 
 		WHERE sender_id = ? OR receiver_id = ?
@@ -214,43 +314,38 @@ func (h *Hub) sendRecentMessages(client *Client) {
 		return
 	}
 
-	// Mesajları doğru sırada gönder (eski -> yeni)
 	for i := 0; i < len(messages); i++ {
 		msg := messages[i]
 
-		// Mesajı çöz
 		decryptedText, err := h.encryptionService.DecryptMessage(msg.Text)
 		if err != nil {
 			log.Printf("Mesaj çözme hatası: %v", err)
 			decryptedText = "Mesaj çözülemedi"
 		}
 
-		messageData := &Message{
-			Type:       "history_message",
-			ReceiverID: client.UserID,
+		messageData := &OutgoingMessage{
+			Type: "history_message",
 			Data: map[string]interface{}{
 				"id":          msg.ID,
 				"sender_id":   msg.SenderID,
 				"receiver_id": msg.ReceiverID,
-				"text":        decryptedText, // Artık çözülmüş metin
+				"text":        decryptedText,
+				"read":        msg.Read,
 				"created_at":  msg.CreatedAt,
 				"is_history":  true,
 			},
 		}
 
-		// Direkt client'a gönder (broadcast kullanma)
 		select {
-		case client.Send <- h.messageToBytes(messageData):
+		case client.Send <- h.messageToBytes(&Message{Type: messageData.Type, Data: messageData.Data}):
 		default:
 			log.Printf("Kullanıcı %d için mesaj geçmişi gönderilemedi", client.UserID)
 			return
 		}
 	}
 
-	// Son olarak "mesaj geçmişi tamamlandı" bildirimi gönder
-	completedMessage := &Message{
-		Type:       "history_loaded",
-		ReceiverID: client.UserID,
+	completedMessage := &OutgoingMessage{
+		Type: "history_loaded",
 		Data: map[string]interface{}{
 			"message": "Son 30 mesaj yüklendi",
 			"count":   len(messages),
@@ -258,7 +353,7 @@ func (h *Hub) sendRecentMessages(client *Client) {
 	}
 
 	select {
-	case client.Send <- h.messageToBytes(completedMessage):
+	case client.Send <- h.messageToBytes(&Message{Type: completedMessage.Type, Data: completedMessage.Data}):
 	default:
 		log.Printf("Kullanıcı %d için tamamlanma bildirimi gönderilemedi", client.UserID)
 	}
@@ -266,7 +361,6 @@ func (h *Hub) sendRecentMessages(client *Client) {
 
 // HandleWebSocket WebSocket bağlantısını handle et
 func (h *Hub) HandleWebSocket(c *gin.Context) {
-	// JWT'den user ID al (middleware'den gelecek)
 	userID, exists := c.Get("user_id")
 	if !exists {
 		log.Printf("WebSocket: user_id context'te bulunamadı")
@@ -276,14 +370,12 @@ func (h *Hub) HandleWebSocket(c *gin.Context) {
 
 	log.Printf("WebSocket: Context'ten alınan userID: %v (tip: %T)", userID, userID)
 
-	// WebSocket'e upgrade et
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		log.Printf("WebSocket upgrade hatası: %v", err)
 		return
 	}
 
-	// Client oluştur
 	client := &Client{
 		UserID: userID.(uint),
 		Conn:   conn,
@@ -291,42 +383,135 @@ func (h *Hub) HandleWebSocket(c *gin.Context) {
 		Hub:    h,
 	}
 
-	// Client'ı kaydet
 	h.register <- client
 
-	// Goroutine'leri başlat
 	go client.writePump()
 	go client.readPump()
 }
 
-// readPump client'tan mesaj oku
+// readPump client'tan mesaj oku ve işle
 func (c *Client) readPump() {
 	defer func() {
 		c.Hub.unregister <- c
 	}()
 
+	// Ping/Pong setup
+	c.Conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	c.Conn.SetPongHandler(func(string) error {
+		c.Conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		return nil
+	})
+
 	for {
-		_, _, err := c.Conn.ReadMessage()
+		_, messageBytes, err := c.Conn.ReadMessage()
 		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("WebSocket hatası: %v", err)
+			}
 			break
 		}
-		// Gelen mesajları işle (şimdilik sadece ping/pong)
+
+		var incomingMsg IncomingMessage
+		if err := json.Unmarshal(messageBytes, &incomingMsg); err != nil {
+			log.Printf("Mesaj parse hatası: %v", err)
+			continue
+		}
+
+		// Gelen mesajları işle
+		c.handleIncomingMessage(&incomingMsg)
+	}
+}
+
+// handleIncomingMessage gelen mesajları işle
+func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
+	switch msg.Type {
+	case "ping":
+		// Ping mesajına pong ile cevap ver
+		response := &OutgoingMessage{
+			Type: "pong",
+			Data: map[string]interface{}{
+				"timestamp": time.Now().Unix(),
+			},
+		}
+		c.sendMessage(response)
+
+	case "typing":
+		// Yazıyor durumunu karşı tarafa bildir
+		if msg.ReceiverID > 0 {
+			c.Hub.SendToUser(msg.ReceiverID, "user_typing", map[string]interface{}{
+				"user_id": c.UserID,
+				"typing":  true,
+			})
+		}
+
+	case "typing_stop":
+		// Yazmayı bıraktı durumunu karşı tarafa bildir
+		if msg.ReceiverID > 0 {
+			c.Hub.SendToUser(msg.ReceiverID, "user_typing", map[string]interface{}{
+				"user_id": c.UserID,
+				"typing":  false,
+			})
+		}
+
+	case "get_online_users":
+		// Online kullanıcı listesini gönder
+		onlineUsers := c.Hub.GetConnectedUsers()
+		response := &OutgoingMessage{
+			Type: "online_users",
+			Data: map[string]interface{}{
+				"users": onlineUsers,
+				"count": len(onlineUsers),
+			},
+		}
+		c.sendMessage(response)
+
+	default:
+		log.Printf("Bilinmeyen mesaj tipi: %s", msg.Type)
+	}
+}
+
+// sendMessage client'a mesaj gönder
+func (c *Client) sendMessage(msg *OutgoingMessage) {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		log.Printf("JSON marshal hatası: %v", err)
+		return
+	}
+
+	select {
+	case c.Send <- data:
+	default:
+		log.Printf("Client %d için mesaj gönderilemedi", c.UserID)
 	}
 }
 
 // writePump client'a mesaj yaz
 func (c *Client) writePump() {
-	defer c.Conn.Close()
+	ticker := time.NewTicker(54 * time.Second)
+	defer func() {
+		ticker.Stop()
+		c.Conn.Close()
+	}()
 
 	for {
 		select {
 		case message, ok := <-c.Send:
+			c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if !ok {
 				c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
 
-			c.Conn.WriteMessage(websocket.TextMessage, message)
+			if err := c.Conn.WriteMessage(websocket.TextMessage, message); err != nil {
+				log.Printf("Mesaj yazma hatası: %v", err)
+				return
+			}
+
+		case <-ticker.C:
+			c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := c.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
 		}
 	}
 }
