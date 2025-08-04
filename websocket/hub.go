@@ -1,7 +1,9 @@
 package websocket
 
 import (
+	"beanpon_messenger/models"
 	"encoding/json"
+	"github.com/google/uuid"
 	"log"
 	"net/http"
 	"sync"
@@ -464,6 +466,63 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 			},
 		}
 		c.sendMessage(response)
+	case "send_message":
+		dataMap, ok := msg.Data.(map[string]interface{})
+		if !ok {
+			log.Printf("Mesaj data parse edilə bilmədi")
+			return
+		}
+
+		receiverIDFloat, ok1 := dataMap["receiver_id"].(float64)
+		content, ok2 := dataMap["text"].(string)
+		if !ok1 || !ok2 {
+			log.Printf("Geçersiz mesaj verisi: receiver_id veya text eksik")
+			return
+		}
+
+		receiverID := uint(receiverIDFloat)
+
+		if receiverID == 0 || content == "" {
+			log.Printf("receiverID boş veya content boş")
+			return
+		}
+
+		// 📡 1. Əvvəlcə mesajı dərhal çatdır (DB yazısını gözləmədən)
+		messageID := uuid.New().String()
+		createdAt := time.Now()
+
+		c.Hub.HandleNewMessage(
+			c.UserID,
+			receiverID,
+			messageID,
+			content,
+			createdAt,
+		)
+
+		// 🧵 2. Arxa planda DB-yə yaz
+		go func() {
+			encryptedText, err := c.Hub.encryptionService.EncryptMessage(content)
+			if err != nil {
+				log.Printf("Mesaj şifreleme hatası (async): %v", err)
+				return
+			}
+
+			message := models.Message{
+				ID:            messageID,
+				SenderID:      c.UserID,
+				ReceiverID:    receiverID,
+				EncryptedText: encryptedText,
+				Read:          false,
+				CreatedAt:     createdAt,
+				UpdatedAt:     createdAt,
+			}
+
+			if err := c.Hub.db.Create(&message).Error; err != nil {
+				log.Printf("Mesaj DB'ye yazılamadı (async): %v", err)
+			} else {
+				log.Printf("Mesaj DB'ye yazıldı (async): %s", message.ID)
+			}
+		}()
 
 	default:
 		log.Printf("Bilinmeyen mesaj tipi: %s", msg.Type)
