@@ -340,7 +340,7 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 		responseConversations = append(responseConversations, gin.H{
 			"other_user_id":       conv.OtherUserID,
 			"other_user_name":     conv.OtherUserName,
-			"other_user_username": conv.OtherUserName,
+			"other_user_username": conv.OtherUserUsername,
 			"account_type_id":     conv.AccountTypeID,
 			"profile_image":       utils.PrependBaseURL(conv.ProfileImage),
 			"last_message_id":     conv.LastMessageID,
