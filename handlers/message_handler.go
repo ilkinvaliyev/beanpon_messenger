@@ -272,9 +272,10 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 		IsLastFromMe    bool      `json:"is_last_from_me"`
 		UnreadCount     int       `json:"unread_count"`
 
-		OtherUserName string  `json:"other_user_name"`
-		AccountTypeID int     `json:"account_type_id"`
-		ProfileImage  *string `json:"profile_image"`
+		OtherUserName     string  `json:"other_user_name"`
+		OtherUserUsername string  `json:"other_user_username"`
+		AccountTypeID     int     `json:"account_type_id"`
+		ProfileImage      *string `json:"profile_image"`
 	}
 
 	query := `
@@ -311,6 +312,7 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 		lm.is_from_me,
 		COALESCE(uc.unread_count, 0) as unread_count,
 		u.name as other_user_name,
+		u.username as other_user_username,
 		u.account_type_id,
 		p.profile_image
 	FROM latest_messages lm
@@ -336,16 +338,17 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 		}
 
 		responseConversations = append(responseConversations, gin.H{
-			"other_user_id":     conv.OtherUserID,
-			"other_user_name":   conv.OtherUserName,
-			"account_type_id":   conv.AccountTypeID,
-			"profile_image":     utils.PrependBaseURL(conv.ProfileImage),
-			"last_message_id":   conv.LastMessageID,
-			"last_message_text": decryptedText,
-			"last_message_time": conv.LastMessageTime,
-			"is_last_from_me":   conv.IsLastFromMe,
-			"unread_count":      conv.UnreadCount,
-			"is_online":         h.wsHub.IsUserOnline(conv.OtherUserID),
+			"other_user_id":       conv.OtherUserID,
+			"other_user_name":     conv.OtherUserName,
+			"other_user_username": conv.OtherUserName,
+			"account_type_id":     conv.AccountTypeID,
+			"profile_image":       utils.PrependBaseURL(conv.ProfileImage),
+			"last_message_id":     conv.LastMessageID,
+			"last_message_text":   decryptedText,
+			"last_message_time":   conv.LastMessageTime,
+			"is_last_from_me":     conv.IsLastFromMe,
+			"unread_count":        conv.UnreadCount,
+			"is_online":           h.wsHub.IsUserOnline(conv.OtherUserID),
 		})
 	}
 
