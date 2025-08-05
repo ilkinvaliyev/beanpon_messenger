@@ -220,7 +220,7 @@ func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content str
 		"receiver_id": receiverID,
 		"text":        content,
 		"read":        false,
-		"created_at":  createdAt,
+		"created_at":  createdAt.Format(time.RFC3339),
 		"is_history":  false,
 	}
 
@@ -228,7 +228,38 @@ func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content str
 	userIDs := []uint{senderID, receiverID}
 	h.SendToMultipleUsers(userIDs, "new_message", messageData)
 
+	// YENI: Conversations sayfası için özel bildirim
+	h.sendConversationUpdate(senderID, receiverID, messageData)
+
 	log.Printf("Yeni mesaj WebSocket üzerinden yayınlandı: %s -> %d", messageID, receiverID)
+}
+
+// Bu yeni fonksiyonu ekle
+func (h *Hub) sendConversationUpdate(senderID, receiverID uint, messageData map[string]interface{}) {
+	// Gönderen ve alıcının conversation listelerini güncelle
+	conversationData := map[string]interface{}{
+		"type":              "conversation_update",
+		"message_data":      messageData,
+		"other_user_id":     receiverID, // Gönderende receiver görünür
+		"last_message":      messageData["text"],
+		"last_message_time": messageData["created_at"],
+		"is_from_me":        true,
+	}
+
+	// Gönderene
+	h.SendToUser(senderID, "conversation_update", conversationData)
+
+	// Alıcıya (onun için other_user_id sender olacak)
+	conversationDataForReceiver := map[string]interface{}{
+		"type":              "conversation_update",
+		"message_data":      messageData,
+		"other_user_id":     senderID, // Alıcıda sender görünür
+		"last_message":      messageData["text"],
+		"last_message_time": messageData["created_at"],
+		"is_from_me":        false,
+	}
+
+	h.SendToUser(receiverID, "conversation_update", conversationDataForReceiver)
 }
 
 // HandleMessageRead mesaj okundu durumunu handle et
