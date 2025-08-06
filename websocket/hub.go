@@ -587,6 +587,22 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 			})
 		}
 
+	case "call_reject":
+		if msg.ReceiverID > 0 {
+			c.Hub.SendToUser(msg.ReceiverID, "call_reject", map[string]interface{}{
+				"from": c.UserID,
+				"data": "Call rejected",
+			})
+		}
+
+	case "call_busy":
+		if msg.ReceiverID > 0 {
+			c.Hub.SendToUser(msg.ReceiverID, "call_busy", map[string]interface{}{
+				"from": c.UserID,
+				"data": "User is busy",
+			})
+		}
+
 	default:
 		log.Printf("Bilinmeyen mesaj tipi: %s", msg.Type)
 	}

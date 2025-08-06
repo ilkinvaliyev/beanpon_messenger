@@ -175,6 +175,14 @@ func main() {
 						"online_users - Online kullanıcı listesi",
 						"pong - Ping'e cevap",
 					},
+					"webrtc_messages": []string{
+						"call_offer - Arama teklifi gönder",
+						"call_answer - Arama cevabı gönder",
+						"ice_candidate - ICE adayı gönder",
+						"call_end - Aramayı sonlandır",
+						"call_reject - Aramayı reddet",
+						"call_busy - Meşgul durumu bildir",
+					},
 				},
 				"api": gin.H{
 					"base_url": "/api/v1",
