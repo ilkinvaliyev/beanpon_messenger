@@ -555,6 +555,38 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 			}
 		}()
 
+	case "call_offer":
+		if msg.ReceiverID > 0 {
+			c.Hub.SendToUser(msg.ReceiverID, "call_offer", map[string]interface{}{
+				"from": c.UserID,
+				"data": msg.Data, // SDP offer içeriği (Flutter'dan gelecek)
+			})
+		}
+
+	case "call_answer":
+		if msg.ReceiverID > 0 {
+			c.Hub.SendToUser(msg.ReceiverID, "call_answer", map[string]interface{}{
+				"from": c.UserID,
+				"data": msg.Data, // SDP answer içeriği
+			})
+		}
+
+	case "ice_candidate":
+		if msg.ReceiverID > 0 {
+			c.Hub.SendToUser(msg.ReceiverID, "ice_candidate", map[string]interface{}{
+				"from": c.UserID,
+				"data": msg.Data, // ICE bilgisi
+			})
+		}
+
+	case "call_end":
+		if msg.ReceiverID > 0 {
+			c.Hub.SendToUser(msg.ReceiverID, "call_end", map[string]interface{}{
+				"from": c.UserID,
+				"data": "Call ended",
+			})
+		}
+
 	default:
 		log.Printf("Bilinmeyen mesaj tipi: %s", msg.Type)
 	}
