@@ -558,49 +558,61 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 	case "call_offer":
 		if msg.ReceiverID > 0 {
 			c.Hub.SendToUser(msg.ReceiverID, "call_offer", map[string]interface{}{
-				"from": c.UserID,
-				"data": msg.Data, // SDP offer içeriği (Flutter'dan gelecek)
+				"from":        c.UserID,
+				"receiver_id": msg.ReceiverID, // ✅ Bu satırı ekle
+				"data":        msg.Data,
 			})
+			log.Printf("📞 Call offer gönderildi: %d -> %d", c.UserID, msg.ReceiverID)
 		}
 
 	case "call_answer":
 		if msg.ReceiverID > 0 {
 			c.Hub.SendToUser(msg.ReceiverID, "call_answer", map[string]interface{}{
-				"from": c.UserID,
-				"data": msg.Data, // SDP answer içeriği
+				"from":        c.UserID,
+				"receiver_id": msg.ReceiverID, // ✅ Bu satırı ekle
+				"data":        msg.Data,
 			})
+			log.Printf("📞 Call answer gönderildi: %d -> %d", c.UserID, msg.ReceiverID)
 		}
 
 	case "ice_candidate":
 		if msg.ReceiverID > 0 {
 			c.Hub.SendToUser(msg.ReceiverID, "ice_candidate", map[string]interface{}{
-				"from": c.UserID,
-				"data": msg.Data, // ICE bilgisi
+				"from":        c.UserID,
+				"receiver_id": msg.ReceiverID, // ✅ Bu satırı ekle
+				"data":        msg.Data,
 			})
+			log.Printf("🧊 ICE candidate gönderildi: %d -> %d", c.UserID, msg.ReceiverID)
 		}
 
 	case "call_end":
 		if msg.ReceiverID > 0 {
 			c.Hub.SendToUser(msg.ReceiverID, "call_end", map[string]interface{}{
-				"from": c.UserID,
-				"data": "Call ended",
+				"from":        c.UserID,
+				"receiver_id": msg.ReceiverID, // ✅ Bu satırı ekle
+				"data":        "Call ended",
 			})
+			log.Printf("📞 Call end gönderildi: %d -> %d", c.UserID, msg.ReceiverID)
 		}
 
 	case "call_reject":
 		if msg.ReceiverID > 0 {
 			c.Hub.SendToUser(msg.ReceiverID, "call_reject", map[string]interface{}{
-				"from": c.UserID,
-				"data": "Call rejected",
+				"from":        c.UserID,
+				"receiver_id": msg.ReceiverID, // ✅ Bu satırı ekle
+				"data":        "Call rejected",
 			})
+			log.Printf("📞 Call reject gönderildi: %d -> %d", c.UserID, msg.ReceiverID)
 		}
 
 	case "call_busy":
 		if msg.ReceiverID > 0 {
 			c.Hub.SendToUser(msg.ReceiverID, "call_busy", map[string]interface{}{
-				"from": c.UserID,
-				"data": "User is busy",
+				"from":        c.UserID,
+				"receiver_id": msg.ReceiverID, // ✅ Bu satırı ekle
+				"data":        "User is busy",
 			})
+			log.Printf("📞 Call busy gönderildi: %d -> %d", c.UserID, msg.ReceiverID)
 		}
 
 	default:
