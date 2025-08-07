@@ -382,7 +382,7 @@ func (h *MessageHandler) GetUnreadCount(c *gin.Context) {
 }
 
 // DeleteMessage mesajı sil (sadece gönderen silebilir)
-func (h *MessageHandler) DeleteMessage(c *gin.Context) {
+func (h *MessageHandler) DeleteMessageOld(c *gin.Context) {
 	userID, exists := c.Get("user_id")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
@@ -430,5 +430,86 @@ func (h *MessageHandler) DeleteMessage(c *gin.Context) {
 			"message_id": message.ID,
 			"deleted_at": time.Now(),
 		},
+	})
+}
+
+// DeleteMessage mesajı sil (yalnız özündən və ya hər iki tərəfdən)
+func (h *MessageHandler) DeleteMessage(c *gin.Context) {
+	userIDVal, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+	userID := userIDVal.(uint)
+
+	messageID := c.Param("message_id")
+
+	var body struct {
+		DeleteType string `json:"delete_type" binding:"required"` // "me" və ya "both"
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "delete_type: 'me' və ya 'both' olmalıdır"})
+		return
+	}
+
+	var message models.Message
+	err := database.DB.Where("id = ?", messageID).First(&message).Error
+	if err != nil {
+		if err == gorm.ErrRecordNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Mesaj tapılmadı"})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Veritabanı xətası"})
+		}
+		return
+	}
+
+	now := time.Now()
+
+	// Silmə növünə görə işləmə
+	switch body.DeleteType {
+	case "me":
+		if userID == message.SenderID {
+			message.IsDeletedBySender = true
+		} else if userID == message.ReceiverID {
+			message.IsDeletedByReceiver = true
+		} else {
+			c.JSON(http.StatusForbidden, gin.H{"error": "Bu mesajı silmək icazən yoxdur"})
+			return
+		}
+
+	case "both":
+		// Yalnız göndərən hər iki tərəfdən silə bilər
+		if userID != message.SenderID {
+			c.JSON(http.StatusForbidden, gin.H{"error": "Yalnız göndərən hər iki tərəfdən silə bilər"})
+			return
+		}
+		message.IsDeletedBySender = true
+		message.IsDeletedByReceiver = true
+
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçərsiz delete_type. 'me' və ya 'both' olmalıdır"})
+		return
+	}
+
+	message.UpdatedAt = now
+	if err := database.DB.Save(&message).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Silinmə uğursuz oldu"})
+		return
+	}
+
+	// 🔔 WebSocket bildirimi hər iki tərəfə
+	deletePayload := map[string]interface{}{
+		"message_id":  message.ID,
+		"deleted_by":  userID,
+		"delete_type": body.DeleteType,
+		"deleted_at":  now,
+	}
+
+	h.wsHub.SendToUser(message.SenderID, "message_deleted", deletePayload)
+	h.wsHub.SendToUser(message.ReceiverID, "message_deleted", deletePayload)
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Mesaj silindi",
+		"data":    deletePayload,
 	})
 }
