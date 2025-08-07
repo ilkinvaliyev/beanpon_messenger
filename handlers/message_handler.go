@@ -133,10 +133,26 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 	offset := (page - 1) * limit
 
 	var messages []models.Message
-	err = database.DB.Where(
-		"(sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?)",
-		userID, otherUserID, otherUserID, userID,
-	).Order("created_at DESC").Limit(limit).Offset(offset).Find(&messages).Error
+
+	// 🆕 Silinmiş mesajları filter et - user'a görə
+	query := `
+		SELECT * FROM messages 
+		WHERE ((sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?))
+		AND (
+			CASE 
+				WHEN sender_id = ? THEN is_deleted_by_sender = false
+				ELSE is_deleted_by_receiver = false
+			END
+		)
+		ORDER BY created_at DESC 
+		LIMIT ? OFFSET ?
+	`
+
+	err = database.DB.Raw(query,
+		userID, otherUserID, otherUserID, userID, // mesaj filtri
+		userID, // delete filtri üçün
+		limit, offset,
+	).Find(&messages).Error
 
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Mesajlar alınamadı"})
@@ -166,7 +182,7 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 	go h.markReceivedMessagesAsRead(userID.(uint), uint(otherUserID))
 
 	c.JSON(http.StatusOK, gin.H{
-		"messages":  responseMessages,
+		"data":      responseMessages, // "messages" deyil "data" olacaq
 		"page":      page,
 		"limit":     limit,
 		"total":     len(responseMessages),
@@ -263,7 +279,7 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 		return
 	}
 
-	// En son mesajları getir (her konuşma için sadece son mesaj)
+	// En son mesajları getir - silinmiş olanları hariç tut
 	var conversations []struct {
 		OtherUserID     uint      `json:"other_user_id"`
 		LastMessageID   string    `json:"last_message_id"`
@@ -294,14 +310,21 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 				ORDER BY created_at DESC
 			) as rn
 		FROM messages 
-		WHERE sender_id = ? OR receiver_id = ?
+		WHERE (sender_id = ? OR receiver_id = ?)
+		AND (
+			CASE 
+				WHEN sender_id = ? THEN is_deleted_by_sender = false
+				ELSE is_deleted_by_receiver = false
+			END
+		)
 	),
 	unread_counts AS (
 		SELECT 
 			sender_id as other_user_id,
 			COUNT(*) as unread_count
 		FROM messages 
-		WHERE receiver_id = ? AND read = false
+		WHERE receiver_id = ? AND read = false 
+		AND is_deleted_by_receiver = false
 		GROUP BY sender_id
 	)
 	SELECT 
@@ -321,9 +344,14 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 	LEFT JOIN profiles p ON p.user_id = lm.other_user_id
 	WHERE lm.rn = 1
 	ORDER BY lm.created_at DESC
-`
+	`
 
-	err := database.DB.Raw(query, userID, userID, userID, userID, userID, userID).Scan(&conversations).Error
+	err := database.DB.Raw(query,
+		userID, userID, userID, userID, userID, // latest_messages üçün
+		userID, // delete filter üçün
+		userID, // unread_counts üçün
+	).Scan(&conversations).Error
+
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Konuşmalar alınamadı"})
 		return
@@ -368,7 +396,8 @@ func (h *MessageHandler) GetUnreadCount(c *gin.Context) {
 
 	var count int64
 	err := database.DB.Model(&models.Message{}).Where(
-		"receiver_id = ? AND read = false", userID,
+		"receiver_id = ? AND read = false AND is_deleted_by_receiver = false",
+		userID,
 	).Count(&count).Error
 
 	if err != nil {
