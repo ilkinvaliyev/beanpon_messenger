@@ -4,6 +4,7 @@ import (
 	"beanpon_messenger/database"
 	"beanpon_messenger/models"
 	"beanpon_messenger/utils"
+	"errors"
 	"net/http"
 	"strconv"
 	"time"
@@ -410,58 +411,6 @@ func (h *MessageHandler) GetUnreadCount(c *gin.Context) {
 	})
 }
 
-// DeleteMessage mesajı sil (sadece gönderen silebilir)
-func (h *MessageHandler) DeleteMessageOld(c *gin.Context) {
-	userID, exists := c.Get("user_id")
-	if !exists {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
-		return
-	}
-
-	messageID := c.Param("message_id")
-
-	var message models.Message
-	err := database.DB.Where("id = ?", messageID).First(&message).Error
-	if err != nil {
-		if err == gorm.ErrRecordNotFound {
-			c.JSON(http.StatusNotFound, gin.H{"error": "Mesaj bulunamadı"})
-		} else {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Veritabanı hatası"})
-		}
-		return
-	}
-
-	// Sadece gönderen silebilir
-	if message.SenderID != userID.(uint) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Bu mesajı silme yetkiniz yok"})
-		return
-	}
-
-	// Mesajı sil
-	if err := database.DB.Delete(&message).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Mesaj silinemedi"})
-		return
-	}
-
-	// WebSocket üzerinden her iki tarafa da bildir
-	deleteData := map[string]interface{}{
-		"message_id": message.ID,
-		"deleted_by": userID.(uint),
-		"deleted_at": time.Now(),
-	}
-
-	h.wsHub.SendToUser(message.SenderID, "message_deleted", deleteData)
-	h.wsHub.SendToUser(message.ReceiverID, "message_deleted", deleteData)
-
-	c.JSON(http.StatusOK, gin.H{
-		"message": "Mesaj başarıyla silindi",
-		"data": gin.H{
-			"message_id": message.ID,
-			"deleted_at": time.Now(),
-		},
-	})
-}
-
 // DeleteMessage mesajı sil (yalnız özündən və ya hər iki tərəfdən)
 func (h *MessageHandler) DeleteMessage(c *gin.Context) {
 	userIDVal, exists := c.Get("user_id")
@@ -484,7 +433,7 @@ func (h *MessageHandler) DeleteMessage(c *gin.Context) {
 	var message models.Message
 	err := database.DB.Where("id = ?", messageID).First(&message).Error
 	if err != nil {
-		if err == gorm.ErrRecordNotFound {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Mesaj tapılmadı"})
 		} else {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Veritabanı xətası"})

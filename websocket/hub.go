@@ -328,6 +328,7 @@ func (h *Hub) sendRecentMessages(client *Client) {
 		CreatedAt  string `json:"created_at"`
 	}
 
+	// ✅ Silinmiş mesajları user-ə görə filter et
 	query := `
 		SELECT 
 			id, 
@@ -337,12 +338,19 @@ func (h *Hub) sendRecentMessages(client *Client) {
 			read,
 			created_at
 		FROM messages 
-		WHERE sender_id = ? OR receiver_id = ?
+		WHERE (sender_id = ? OR receiver_id = ?)
+		AND (
+			CASE 
+				WHEN sender_id = ? THEN is_deleted_by_sender = false
+				ELSE is_deleted_by_receiver = false
+			END
+		)
 		ORDER BY created_at ASC 
 		LIMIT 30
 	`
 
-	if err := h.db.Raw(query, client.UserID, client.UserID).Scan(&messages).Error; err != nil {
+	// 3 parameter lazım: client.UserID 3 dəfə
+	if err := h.db.Raw(query, client.UserID, client.UserID, client.UserID).Scan(&messages).Error; err != nil {
 		log.Printf("Son mesajlar alınamadı: %v", err)
 		return
 	}
