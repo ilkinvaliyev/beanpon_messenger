@@ -104,6 +104,9 @@ func main() {
 		api.PUT("/messages/:message_id/read", messageHandler.MarkAsRead)
 		api.DELETE("/messages/:message_id", messageHandler.DeleteMessage)
 
+		api.DELETE("/conversations/:other_user_id/clear", messageHandler.ClearConversation) // tek bir kullanıcıyla olan konuşmayı temizle
+		api.DELETE("/conversations/clear-all", messageHandler.ClearAllMyMessages)
+
 		// Sohbet operasyonları
 		api.GET("/conversations", messageHandler.GetConversations)
 		api.GET("/unread-count", messageHandler.GetUnreadCount)

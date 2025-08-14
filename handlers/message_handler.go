@@ -491,3 +491,222 @@ func (h *MessageHandler) DeleteMessage(c *gin.Context) {
 		"data":    deletePayload,
 	})
 }
+
+// DELETE /api/v1/conversations/:other_user_id/clear  body: { "delete_type": "me" | "both" }
+func (h *MessageHandler) ClearConversation(c *gin.Context) {
+	u, ok := c.Get("user_id")
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+	currentUserID := u.(uint)
+
+	otherStr := c.Param("other_user_id")
+	otherU64, err := strconv.ParseUint(otherStr, 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz user_id"})
+		return
+	}
+	otherUserID := uint(otherU64)
+
+	var body struct {
+		DeleteType string `json:"delete_type" binding:"required"` // "me" | "both"
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "delete_type 'me' veya 'both' olmalıdır"})
+		return
+	}
+
+	now := time.Now()
+	tx := database.DB.Begin()
+	if tx.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Transaction açılamadı"})
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+		}
+	}()
+
+	var sentRes, recvRes int64
+
+	switch body.DeleteType {
+	case "me":
+		// Benim GÖNDERDİKLERİM → sender tarafında gizle
+		r1 := tx.Model(&models.Message{}).
+			Where("sender_id = ? AND receiver_id = ? AND is_deleted_by_sender = FALSE", currentUserID, otherUserID).
+			Updates(map[string]interface{}{"is_deleted_by_sender": true, "updated_at": now})
+		sentRes = r1.RowsAffected
+		if r1.Error != nil {
+			tx.Rollback()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Gönderdiğin mesajlar gizlenemedi"})
+			return
+		}
+
+		// Benim ALDIKLARIM → receiver tarafında gizle
+		r2 := tx.Model(&models.Message{}).
+			Where("receiver_id = ? AND sender_id = ? AND is_deleted_by_receiver = FALSE", currentUserID, otherUserID).
+			Updates(map[string]interface{}{"is_deleted_by_receiver": true, "updated_at": now})
+		recvRes = r2.RowsAffected
+		if r2.Error != nil {
+			tx.Rollback()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Aldığın mesajlar gizlenemedi"})
+			return
+		}
+
+	case "both":
+		// SADECE BENİM GÖNDERDİKLERİM → iki taraf için de gizle
+		r1 := tx.Model(&models.Message{}).
+			Where("sender_id = ? AND receiver_id = ? AND (is_deleted_by_sender = FALSE OR is_deleted_by_receiver = FALSE)", currentUserID, otherUserID).
+			Updates(map[string]interface{}{"is_deleted_by_sender": true, "is_deleted_by_receiver": true, "updated_at": now})
+		sentRes = r1.RowsAffected
+		if r1.Error != nil {
+			tx.Rollback()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "İki taraftan gizleme (senin gönderdiklerin) başarısız"})
+			return
+		}
+
+		// Karşı tarafın GÖNDERDİKLERİ → yalnızca benim tarafımda gizle (etik/izin gereği)
+		r2 := tx.Model(&models.Message{}).
+			Where("receiver_id = ? AND sender_id = ? AND is_deleted_by_receiver = FALSE", currentUserID, otherUserID).
+			Updates(map[string]interface{}{"is_deleted_by_receiver": true, "updated_at": now})
+		recvRes = r2.RowsAffected
+		if r2.Error != nil {
+			tx.Rollback()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Karşıdan gelenleri gizleme başarısız"})
+			return
+		}
+
+	default:
+		tx.Rollback()
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz delete_type"})
+		return
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Commit başarısız"})
+		return
+	}
+
+	payload := gin.H{
+		"cleared_by":    currentUserID,
+		"other_user_id": otherUserID,
+		"delete_type":   body.DeleteType,
+		"cleared_at":    now,
+		"affected_sent": sentRes,
+		"affected_recv": recvRes,
+		"scope":         "conversation",
+	}
+	// UI’nin senkron olması için event
+	h.wsHub.SendToUser(currentUserID, "conversation_cleared", payload)
+	h.wsHub.SendToUser(otherUserID, "peer_conversation_cleared", payload)
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Konuşma temizlendi",
+		"data":    payload,
+	})
+}
+
+// DELETE /api/v1/conversations/clear-all  body: { "delete_type": "me" | "both" }
+func (h *MessageHandler) ClearAllMyMessages(c *gin.Context) {
+	u, ok := c.Get("user_id")
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+	currentUserID := u.(uint)
+
+	var body struct {
+		DeleteType string `json:"delete_type" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "delete_type 'me' veya 'both' olmalıdır"})
+		return
+	}
+
+	now := time.Now()
+	tx := database.DB.Begin()
+	if tx.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Transaction açılamadı"})
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+		}
+	}()
+
+	var sentRes, recvRes int64
+
+	switch body.DeleteType {
+	case "me":
+		r1 := tx.Model(&models.Message{}).
+			Where("sender_id = ? AND is_deleted_by_sender = FALSE", currentUserID).
+			Updates(map[string]interface{}{"is_deleted_by_sender": true, "updated_at": now})
+		sentRes = r1.RowsAffected
+		if r1.Error != nil {
+			tx.Rollback()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Gönderdiğin mesajlar gizlenemedi"})
+			return
+		}
+
+		r2 := tx.Model(&models.Message{}).
+			Where("receiver_id = ? AND is_deleted_by_receiver = FALSE", currentUserID).
+			Updates(map[string]interface{}{"is_deleted_by_receiver": true, "updated_at": now})
+		recvRes = r2.RowsAffected
+		if r2.Error != nil {
+			tx.Rollback()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Aldığın mesajlar gizlenemedi"})
+			return
+		}
+
+	case "both":
+		// Sadece benim GÖNDERDİKLERİM iki taraftan gizlenir
+		r1 := tx.Model(&models.Message{}).
+			Where("sender_id = ? AND (is_deleted_by_sender = FALSE OR is_deleted_by_receiver = FALSE)", currentUserID).
+			Updates(map[string]interface{}{"is_deleted_by_sender": true, "is_deleted_by_receiver": true, "updated_at": now})
+		sentRes = r1.RowsAffected
+		if r1.Error != nil {
+			tx.Rollback()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "İki taraf için gizleme (gönderdiğin) başarısız"})
+			return
+		}
+
+		// Aldıkların benim tarafımda gizlenir
+		r2 := tx.Model(&models.Message{}).
+			Where("receiver_id = ? AND is_deleted_by_receiver = FALSE", currentUserID).
+			Updates(map[string]interface{}{"is_deleted_by_receiver": true, "updated_at": now})
+		recvRes = r2.RowsAffected
+		if r2.Error != nil {
+			tx.Rollback()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Aldığın mesajlar gizlenemedi"})
+			return
+		}
+
+	default:
+		tx.Rollback()
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz delete_type"})
+		return
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Commit başarısız"})
+		return
+	}
+
+	payload := gin.H{
+		"cleared_by":    currentUserID,
+		"delete_type":   body.DeleteType,
+		"cleared_at":    now,
+		"affected_sent": sentRes,
+		"affected_recv": recvRes,
+		"scope":         "all",
+	}
+	h.wsHub.SendToUser(currentUserID, "all_messages_cleared", payload)
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Tüm mesaj geçmişin temizlendi",
+		"data":    payload,
+	})
+}
