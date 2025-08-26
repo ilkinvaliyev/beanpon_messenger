@@ -244,7 +244,7 @@ func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content str
 	go h.SendUnreadCountUpdate(receiverID)
 
 	//if !h.IsUserOnline(receiverID) {
-	//h.sendPushNotification(senderID, receiverID, content)
+	h.sendPushNotification(senderID, receiverID, content)
 	//}
 
 	log.Printf("Yeni mesaj WebSocket üzerinden yayınlandı: %s -> %d", messageID, receiverID)
