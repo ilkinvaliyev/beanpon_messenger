@@ -16,6 +16,8 @@ type Config struct {
 	PostgresHost string
 	PostgresPort string
 	PostgresDB   string
+	CloudToken   string
+	BackendUrl   string
 }
 
 // LoadConfig konfigürasyon dosyasını okur ve Config yapısına doldurur
@@ -35,6 +37,8 @@ func LoadConfig() *Config {
 		PostgresPort: os.Getenv("DB_PORT"),
 		PostgresDB:   os.Getenv("DB_NAME"),
 		AESKey:       os.Getenv("AES_KEY"),
+		CloudToken:   os.Getenv("CLOUD_TOKEN"),
+		BackendUrl:   os.Getenv("BACKEND_URL"),
 	}
 
 	// Default values
@@ -47,7 +51,7 @@ func LoadConfig() *Config {
 
 	// Zorunlu alanların kontrolü (PostgreSQL için)
 	if cfg.JWTSecret == "" || cfg.AESKey == "" || cfg.PostgresUser == "" || // ← AESKey ekle
-		cfg.PostgresPass == "" || cfg.PostgresHost == "" ||
+		cfg.PostgresPass == "" || cfg.PostgresHost == "" || cfg.CloudToken == "" || cfg.BackendUrl == "" ||
 		cfg.PostgresDB == "" {
 		log.Fatal("Some required PostgreSQL environment variables are missing!")
 	}

@@ -1,7 +1,9 @@
 package websocket
 
 import (
+	"beanpon_messenger/config"
 	"beanpon_messenger/models"
+	"bytes"
 	"encoding/json"
 	"github.com/google/uuid"
 	"log"
@@ -42,6 +44,8 @@ type Hub struct {
 		EncryptMessage(plainText string) (string, error)
 		DecryptMessage(encryptedText string) (string, error)
 	}
+	httpClient *http.Client   // ← YENI
+	config     *config.Config // ← YENI
 }
 
 // IncomingMessage client'tan gelen mesaj yapısı
@@ -80,7 +84,7 @@ type MessageData struct {
 func NewHub(db *gorm.DB, encryptionService interface {
 	EncryptMessage(plainText string) (string, error)
 	DecryptMessage(encryptedText string) (string, error)
-}) *Hub {
+}, config *config.Config) *Hub { // ← config parametri əlavə
 	return &Hub{
 		clients:           make(map[uint]*Client),
 		register:          make(chan *Client),
@@ -88,6 +92,8 @@ func NewHub(db *gorm.DB, encryptionService interface {
 		broadcast:         make(chan *Message),
 		db:                db,
 		encryptionService: encryptionService,
+		httpClient:        &http.Client{Timeout: 10 * time.Second}, // ← YENI
+		config:            config,                                  // ← YENI
 	}
 }
 
@@ -538,6 +544,10 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 			createdAt,
 		)
 
+		if !c.Hub.IsUserOnline(receiverID) {
+			c.Hub.sendPushNotification(c.UserID, receiverID, content)
+		}
+
 		// 🧵 2. Arxa planda DB-yə yaz
 		go func() {
 			encryptedText, err := c.Hub.encryptionService.EncryptMessage(content)
@@ -672,4 +682,45 @@ func (c *Client) writePump() {
 			}
 		}
 	}
+}
+
+// sendPushNotification push notification göndər (async)
+func (h *Hub) sendPushNotification(senderID, receiverID uint, message string) {
+	go func() {
+		url := h.config.BackendUrl + "/notifications/new-message"
+
+		payload := map[string]interface{}{
+			"receiver_id": receiverID,
+			"sender_id":   senderID,
+			"message":     message,
+		}
+
+		jsonData, err := json.Marshal(payload)
+		if err != nil {
+			log.Printf("Notification payload marshal hatası: %v", err)
+			return
+		}
+
+		req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+		if err != nil {
+			log.Printf("Notification request oluşturma hatası: %v", err)
+			return
+		}
+
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-api-key", h.config.CloudToken)
+
+		resp, err := h.httpClient.Do(req)
+		if err != nil {
+			log.Printf("Push notification gönderme hatası: %v", err)
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode == 200 {
+			log.Printf("✅ Push notification gönderildi: %d -> %d", senderID, receiverID)
+		} else {
+			log.Printf("❌ Push notification başarısız, status: %d", resp.StatusCode)
+		}
+	}()
 }
