@@ -687,7 +687,7 @@ func (c *Client) writePump() {
 // sendPushNotification push notification göndər (async)
 func (h *Hub) sendPushNotification(senderID, receiverID uint, message string) {
 	go func() {
-		url := h.config.BackendUrl + "/notifications/new-message"
+		url := h.config.BackendUrl + "/notification/new-message"
 
 		payload := map[string]interface{}{
 			"receiver_id": receiverID,
