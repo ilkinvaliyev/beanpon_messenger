@@ -47,7 +47,6 @@ func main() {
 
 		c.Next()
 	})
-
 	// Public routes
 	router.GET("/ping", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
