@@ -238,6 +238,8 @@ func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content str
 	// YENI: Conversations sayfası için özel bildirim
 	h.sendConversationUpdate(senderID, receiverID, messageData)
 
+	h.sendPushNotification(senderID, receiverID, content)
+
 	log.Printf("Yeni mesaj WebSocket üzerinden yayınlandı: %s -> %d", messageID, receiverID)
 }
 
@@ -546,8 +548,8 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 		)
 
 		//if !c.Hub.IsUserOnline(receiverID) {
-		log.Printf("🔔 User %d offline, notification göndəriliyor", receiverID)
-		c.Hub.sendPushNotification(c.UserID, receiverID, content)
+		//log.Printf("🔔 User %d offline, notification göndəriliyor", receiverID)
+		//c.Hub.sendPushNotification(c.UserID, receiverID, content)
 		//}
 
 		// 🧵 2. Arxa planda DB-yə yaz
