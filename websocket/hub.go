@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"github.com/google/uuid"
+	"io"
 	"log"
 	"net/http"
 	"sync"
@@ -544,9 +545,9 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 			createdAt,
 		)
 
-		if !c.Hub.IsUserOnline(receiverID) {
-			c.Hub.sendPushNotification(c.UserID, receiverID, content)
-		}
+		//if !c.Hub.IsUserOnline(receiverID) {
+		c.Hub.sendPushNotification(c.UserID, receiverID, content)
+		//}
 
 		// 🧵 2. Arxa planda DB-yə yaz
 		go func() {
@@ -715,7 +716,12 @@ func (h *Hub) sendPushNotification(senderID, receiverID uint, message string) {
 			log.Printf("Push notification gönderme hatası: %v", err)
 			return
 		}
-		defer resp.Body.Close()
+		defer func(Body io.ReadCloser) {
+			err := Body.Close()
+			if err != nil {
+
+			}
+		}(resp.Body)
 
 		if resp.StatusCode == 200 {
 			log.Printf("✅ Push notification gönderildi: %d -> %d", senderID, receiverID)
