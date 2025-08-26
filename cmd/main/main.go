@@ -25,7 +25,7 @@ func main() {
 
 	// Servisleri başlat
 	encryptionService := services.NewEncryptionService(cfg.AESKey)
-	wsHub := websocket.NewHub(database.DB, encryptionService)
+	wsHub := websocket.NewHub(database.DB, encryptionService, cfg)
 	go wsHub.Run()
 
 	// Handler'ları oluştur
