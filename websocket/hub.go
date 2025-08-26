@@ -136,6 +136,9 @@ func (h *Hub) registerClient(client *Client) {
 	// Kullanıcı online durumunu diğer kullanıcılara bildir
 	h.broadcastUserStatus(client.UserID, "online")
 
+	//İlk bağlantıda okunmamış mesaj sayısını gönder
+	go h.SendUnreadCountUpdate(client.UserID)
+
 	// Bağlandıktan sonra son 30 mesajı gönder
 	go h.sendRecentMessages(client)
 }
@@ -238,8 +241,10 @@ func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content str
 	// YENI: Conversations sayfası için özel bildirim
 	h.sendConversationUpdate(senderID, receiverID, messageData)
 
+	go h.SendUnreadCountUpdate(receiverID)
+
 	//if !h.IsUserOnline(receiverID) {
-	h.sendPushNotification(senderID, receiverID, content)
+	//h.sendPushNotification(senderID, receiverID, content)
 	//}
 
 	log.Printf("Yeni mesaj WebSocket üzerinden yayınlandı: %s -> %d", messageID, receiverID)
@@ -283,6 +288,8 @@ func (h *Hub) HandleMessageRead(messageID string, senderID, readerID uint) {
 
 	// Sadece gönderene bildir (alıcı zaten okudu)
 	h.SendToUser(senderID, "message_read", readData)
+
+	go h.SendUnreadCountUpdate(readerID)
 
 	log.Printf("Mesaj okundu WebSocket üzerinden yayınlandı: %s", messageID)
 }
@@ -634,6 +641,17 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 			log.Printf("📞 Call busy gönderildi: %d -> %d", c.UserID, msg.ReceiverID)
 		}
 
+	case "get_unread_count":
+		// ✅ YENİ: Client'ın talep ettiği durumda okunmamış sayıyı gönder
+		count := c.Hub.GetUnreadCount(c.UserID)
+		response := &OutgoingMessage{
+			Type: "unread_count",
+			Data: map[string]interface{}{
+				"count": count,
+			},
+		}
+		c.sendMessage(response)
+
 	default:
 		log.Printf("Bilinmeyen mesaj tipi: %s", msg.Type)
 	}
@@ -755,4 +773,35 @@ func (h *Hub) sendPushNotification(senderID, receiverID uint, message string) {
 			log.Printf("❌ Push notification başarısız, status: %d", resp.StatusCode)
 		}
 	}()
+}
+
+// GetUnreadCount kullanıcının okunmamış mesaj sayısını getir
+func (h *Hub) GetUnreadCount(userID uint) int {
+	var count int64
+
+	query := `
+		SELECT COUNT(*) 
+		FROM messages 
+		WHERE receiver_id = ? 
+		AND read = false 
+		AND is_deleted_by_receiver = false
+	`
+
+	if err := h.db.Raw(query, userID).Scan(&count).Error; err != nil {
+		log.Printf("Okunmamış mesaj sayısı alınamadı: %v", err)
+		return 0
+	}
+
+	return int(count)
+}
+
+// SendUnreadCountUpdate kullanıcıya okunmamış mesaj sayısını gönder
+func (h *Hub) SendUnreadCountUpdate(userID uint) {
+	count := h.GetUnreadCount(userID)
+
+	h.SendToUser(userID, "unread_count_update", map[string]interface{}{
+		"count": count,
+	})
+
+	log.Printf("Okunmamış mesaj sayısı gönderildi: User %d, Count: %d", userID, count)
 }
