@@ -238,9 +238,9 @@ func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content str
 	// YENI: Conversations sayfası için özel bildirim
 	h.sendConversationUpdate(senderID, receiverID, messageData)
 
-	if !h.IsUserOnline(receiverID) {
-		h.sendPushNotification(senderID, receiverID, content)
-	}
+	//if !h.IsUserOnline(receiverID) {
+	h.sendPushNotification(senderID, receiverID, content)
+	//}
 
 	log.Printf("Yeni mesaj WebSocket üzerinden yayınlandı: %s -> %d", messageID, receiverID)
 }
