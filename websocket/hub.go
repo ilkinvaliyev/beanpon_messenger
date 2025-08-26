@@ -546,6 +546,7 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 		)
 
 		//if !c.Hub.IsUserOnline(receiverID) {
+		log.Printf("🔔 User %d offline, notification göndəriliyor", receiverID)
 		c.Hub.sendPushNotification(c.UserID, receiverID, content)
 		//}
 
@@ -687,8 +688,23 @@ func (c *Client) writePump() {
 
 // sendPushNotification push notification göndər (async)
 func (h *Hub) sendPushNotification(senderID, receiverID uint, message string) {
+	log.Printf("🔔 sendPushNotification çağrıldı: %d -> %d, message: %s", senderID, receiverID, message)
+
 	go func() {
+		log.Printf("🔔 Goroutine başladı")
+
 		url := h.config.BackendUrl + "/notification/new-message"
+		log.Printf("🔔 URL: %s", url)
+
+		// Config yoxlayın
+		if h.config.CloudToken == "" {
+			log.Printf("❌ CloudToken boş!")
+			return
+		}
+		if h.config.BackendUrl == "" {
+			log.Printf("❌ BackendUrl boş!")
+			return
+		}
 
 		payload := map[string]interface{}{
 			"receiver_id": receiverID,
@@ -696,24 +712,31 @@ func (h *Hub) sendPushNotification(senderID, receiverID uint, message string) {
 			"message":     message,
 		}
 
+		log.Printf("🔔 Payload: %+v", payload)
+
 		jsonData, err := json.Marshal(payload)
 		if err != nil {
-			log.Printf("Notification payload marshal hatası: %v", err)
+			log.Printf("❌ Notification payload marshal hatası: %v", err)
 			return
 		}
 
+		log.Printf("🔔 JSON Data: %s", string(jsonData))
+
 		req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 		if err != nil {
-			log.Printf("Notification request oluşturma hatası: %v", err)
+			log.Printf("❌ Notification request oluşturma hatası: %v", err)
 			return
 		}
 
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("x-api-key", h.config.CloudToken)
 
+		log.Printf("🔔 Headers set edildi, CloudToken: %s", h.config.CloudToken[:10]+"...")
+
+		log.Printf("🔔 HTTP request göndəriliyor...")
 		resp, err := h.httpClient.Do(req)
 		if err != nil {
-			log.Printf("Push notification gönderme hatası: %v", err)
+			log.Printf("❌ Push notification gönderme hatası: %v", err)
 			return
 		}
 		defer func(Body io.ReadCloser) {
@@ -722,6 +745,10 @@ func (h *Hub) sendPushNotification(senderID, receiverID uint, message string) {
 
 			}
 		}(resp.Body)
+
+		// Response body-ni oxuyun
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		log.Printf("🔔 Response Status: %d, Body: %s", resp.StatusCode, string(bodyBytes))
 
 		if resp.StatusCode == 200 {
 			log.Printf("✅ Push notification gönderildi: %d -> %d", senderID, receiverID)
