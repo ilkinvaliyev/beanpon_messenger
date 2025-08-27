@@ -11,6 +11,7 @@ type Message struct {
 	ID                  string         `json:"id" gorm:"type:uuid;primary_key"`
 	SenderID            uint           `json:"sender_id" gorm:"not null;index"`
 	ReceiverID          uint           `json:"receiver_id" gorm:"not null;index"`
+	ReplyToMessageID    *string        `json:"reply_to_message_id" gorm:"type:uuid;index"`
 	EncryptedText       string         `json:"encrypted_text" gorm:"type:text;not null"`
 	EncryptedAESKey     *string        `json:"encrypted_aes_key" gorm:"type:text"`
 	IsEdited            bool           `json:"is_edited" gorm:"default:false"`
@@ -19,13 +20,16 @@ type Message struct {
 	Delivered           bool           `json:"delivered" gorm:"default:false"`
 	Read                bool           `json:"read" gorm:"default:false"`
 	ReadAt              *time.Time     `json:"read_at"`
+	SenderReaction      *string        `json:"sender_reaction" gorm:"type:varchar(10)"`
+	ReceiverReaction    *string        `json:"receiver_reaction" gorm:"type:varchar(10)"`
 	CreatedAt           time.Time      `json:"created_at"`
 	UpdatedAt           time.Time      `json:"updated_at"`
 	DeletedAt           gorm.DeletedAt `json:"deleted_at" gorm:"index"`
 
 	// İlişkiler
-	Sender   User `json:"sender" gorm:"foreignKey:SenderID"`
-	Receiver User `json:"receiver" gorm:"foreignKey:ReceiverID"`
+	Sender         User     `json:"sender" gorm:"foreignKey:SenderID"`
+	Receiver       User     `json:"receiver" gorm:"foreignKey:ReceiverID"`
+	ReplyToMessage *Message `json:"reply_to_message,omitempty" gorm:"foreignKey:ReplyToMessageID"`
 }
 
 // MessageEdit mesaj düzenleme geçmişi
@@ -74,6 +78,7 @@ type MessageResponse struct {
 
 // SendMessageRequest mesaj gönderme isteği
 type SendMessageRequest struct {
-	ReceiverID uint   `json:"receiver_id" binding:"required"`
-	Text       string `json:"text" binding:"required,min=1,max=1000"`
+	ReceiverID       uint    `json:"receiver_id" binding:"required"`
+	Text             string  `json:"text" binding:"required,min=1,max=1000"`
+	ReplyToMessageID *string `json:"reply_to_message_id,omitempty"`
 }

@@ -338,34 +338,40 @@ func (h *Hub) messageToBytes(message *Message) []byte {
 // sendRecentMessages kullanıcıya son 30 mesajı gönder
 func (h *Hub) sendRecentMessages(client *Client) {
 	var messages []struct {
-		ID         string `json:"id"`
-		SenderID   uint   `json:"sender_id"`
-		ReceiverID uint   `json:"receiver_id"`
-		Text       string `json:"text"`
-		Read       bool   `json:"read"`
-		CreatedAt  string `json:"created_at"`
+		ID               string  `json:"id"`
+		SenderID         uint    `json:"sender_id"`
+		ReceiverID       uint    `json:"receiver_id"`
+		ReplyToMessageID *string `json:"reply_to_message_id"`
+		Text             string  `json:"text"`
+		Read             bool    `json:"read"`
+		SenderReaction   *string `json:"sender_reaction"`
+		ReceiverReaction *string `json:"receiver_reaction"`
+		CreatedAt        string  `json:"created_at"`
 	}
 
 	// ✅ Silinmiş mesajları user-ə görə filter et
 	query := `
-		SELECT 
-			id, 
-			sender_id, 
-			receiver_id, 
-			encrypted_text as text,
-			read,
-			created_at
-		FROM messages 
-		WHERE (sender_id = ? OR receiver_id = ?)
-		AND (
-			CASE 
-				WHEN sender_id = ? THEN is_deleted_by_sender = false
-				ELSE is_deleted_by_receiver = false
-			END
-		)
-		ORDER BY created_at ASC 
-		LIMIT 30
-	`
+			SELECT 
+				id, 
+				sender_id, 
+				receiver_id,
+				reply_to_message_id,
+				encrypted_text as text,
+				read,
+				sender_reaction,
+				receiver_reaction,
+				created_at
+			FROM messages 
+			WHERE (sender_id = ? OR receiver_id = ?)
+			AND (
+				CASE 
+					WHEN sender_id = ? THEN is_deleted_by_sender = false
+					ELSE is_deleted_by_receiver = false
+				END
+			)
+			ORDER BY created_at ASC 
+			LIMIT 30
+		`
 
 	// 3 parameter lazım: client.UserID 3 dəfə
 	if err := h.db.Raw(query, client.UserID, client.UserID, client.UserID).Scan(&messages).Error; err != nil {
@@ -385,13 +391,16 @@ func (h *Hub) sendRecentMessages(client *Client) {
 		messageData := &OutgoingMessage{
 			Type: "history_message",
 			Data: map[string]interface{}{
-				"id":          msg.ID,
-				"sender_id":   msg.SenderID,
-				"receiver_id": msg.ReceiverID,
-				"text":        decryptedText,
-				"read":        msg.Read,
-				"created_at":  msg.CreatedAt,
-				"is_history":  true,
+				"id":                  msg.ID,
+				"sender_id":           msg.SenderID,
+				"receiver_id":         msg.ReceiverID,
+				"reply_to_message_id": msg.ReplyToMessageID, // YENİ
+				"text":                decryptedText,
+				"read":                msg.Read,
+				"sender_reaction":     msg.SenderReaction,   // YENİ
+				"receiver_reaction":   msg.ReceiverReaction, // YENİ
+				"created_at":          msg.CreatedAt,
+				"is_history":          true,
 			},
 		}
 
@@ -523,61 +532,87 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 			},
 		}
 		c.sendMessage(response)
-	case "send_message":
+	case "add_reaction":
 		dataMap, ok := msg.Data.(map[string]interface{})
 		if !ok {
-			log.Printf("Mesaj data parse edilə bilmədi")
+			log.Printf("Reaction data parse edilemedi")
+			return
+		}
+
+		messageID, ok1 := dataMap["message_id"].(string)
+		emoji, ok2 := dataMap["emoji"].(string)
+		if !ok1 || !ok2 {
+			log.Printf("MessageID veya emoji eksik")
+			return
+		}
+
+		c.Hub.handleAddReaction(c.UserID, messageID, emoji)
+
+	case "remove_reaction":
+		dataMap, ok := msg.Data.(map[string]interface{})
+		if !ok {
+			return
+		}
+
+		messageID, ok1 := dataMap["message_id"].(string)
+		if !ok1 {
+			return
+		}
+
+		c.Hub.handleRemoveReaction(c.UserID, messageID)
+	case "send_message":
+		// Mevcut kodu güncelle - reply desteği ekle
+		dataMap, ok := msg.Data.(map[string]interface{})
+		if !ok {
+			log.Printf("Mesaj data parse edilemedi")
 			return
 		}
 
 		receiverIDFloat, ok1 := dataMap["receiver_id"].(float64)
 		content, ok2 := dataMap["text"].(string)
 		if !ok1 || !ok2 {
-			log.Printf("Geçersiz mesaj verisi: receiver_id veya text eksik")
+			log.Printf("Geçersiz mesaj verisi")
 			return
 		}
 
 		receiverID := uint(receiverIDFloat)
+		var replyToMessageID *string
+
+		// Reply kontrolü
+		if replyID, exists := dataMap["reply_to_message_id"].(string); exists && replyID != "" {
+			replyToMessageID = &replyID
+		}
 
 		if receiverID == 0 || content == "" {
-			log.Printf("receiverID boş veya content boş")
 			return
 		}
 
-		// 📡 1. Əvvəlcə mesajı dərhal çatdır (DB yazısını gözləmədən)
 		messageID := uuid.New().String()
 		createdAt := time.Now()
 
-		c.Hub.HandleNewMessage(
-			c.UserID,
-			receiverID,
-			messageID,
-			content,
-			createdAt,
-		)
+		c.Hub.HandleNewMessage(c.UserID, receiverID, messageID, content, createdAt)
 
-		// 🧵 2. Arxa planda DB-yə yaz
+		// DB yazma
 		go func() {
 			encryptedText, err := c.Hub.encryptionService.EncryptMessage(content)
 			if err != nil {
-				log.Printf("Mesaj şifreleme hatası (async): %v", err)
+				log.Printf("Mesaj şifreleme hatası: %v", err)
 				return
 			}
 
 			message := models.Message{
-				ID:            messageID,
-				SenderID:      c.UserID,
-				ReceiverID:    receiverID,
-				EncryptedText: encryptedText,
-				Read:          false,
-				CreatedAt:     createdAt,
-				UpdatedAt:     createdAt,
+				ID:               messageID,
+				SenderID:         c.UserID,
+				ReceiverID:       receiverID,
+				ReplyToMessageID: replyToMessageID,
+				EncryptedText:    encryptedText,
+				Read:             false,
+				CreatedAt:        createdAt,
+				UpdatedAt:        createdAt,
 			}
 
 			if err := c.Hub.db.Create(&message).Error; err != nil {
-				log.Printf("Mesaj DB'ye yazılamadı (async): %v", err)
-			} else {
-				log.Printf("Mesaj DB'ye yazıldı (async): %s", message.ID)
+				log.Printf("Mesaj DB'ye yazılamadı: %v", err)
 			}
 		}()
 
@@ -804,4 +839,85 @@ func (h *Hub) SendUnreadCountUpdate(userID uint) {
 	})
 
 	log.Printf("Okunmamış mesaj sayısı gönderildi: User %d, Count: %d", userID, count)
+}
+
+// handleAddReaction mesaja reaction ekle
+func (h *Hub) handleAddReaction(userID uint, messageID, emoji string) {
+	var message models.Message
+	if err := h.db.Where("id = ?", messageID).First(&message).Error; err != nil {
+		log.Printf("Mesaj bulunamadı: %v", err)
+		return
+	}
+
+	// Kullanıcının bu mesaja reaction verebilir mi kontrol et
+	if userID != message.SenderID && userID != message.ReceiverID {
+		log.Printf("Kullanıcı %d bu mesaja reaction veremez", userID)
+		return
+	}
+
+	// Reaction güncelle
+	if userID == message.SenderID {
+		message.SenderReaction = &emoji
+	} else {
+		message.ReceiverReaction = &emoji
+	}
+
+	message.UpdatedAt = time.Now()
+
+	if err := h.db.Save(&message).Error; err != nil {
+		log.Printf("Reaction kaydedilemedi: %v", err)
+		return
+	}
+
+	// WebSocket ile bildir
+	reactionData := map[string]interface{}{
+		"message_id": messageID,
+		"user_id":    userID,
+		"emoji":      emoji,
+		"action":     "added",
+	}
+
+	h.SendToUser(message.SenderID, "reaction_updated", reactionData)
+	h.SendToUser(message.ReceiverID, "reaction_updated", reactionData)
+
+	log.Printf("Reaction eklendi: User %d, Message %s, Emoji %s", userID, messageID, emoji)
+}
+
+// handleRemoveReaction mesajdan reaction kaldır
+func (h *Hub) handleRemoveReaction(userID uint, messageID string) {
+	var message models.Message
+	if err := h.db.Where("id = ?", messageID).First(&message).Error; err != nil {
+		log.Printf("Mesaj bulunamadı: %v", err)
+		return
+	}
+
+	if userID != message.SenderID && userID != message.ReceiverID {
+		return
+	}
+
+	// Reaction kaldır
+	if userID == message.SenderID {
+		message.SenderReaction = nil
+	} else {
+		message.ReceiverReaction = nil
+	}
+
+	message.UpdatedAt = time.Now()
+
+	if err := h.db.Save(&message).Error; err != nil {
+		log.Printf("Reaction kaldırılamadı: %v", err)
+		return
+	}
+
+	// WebSocket ile bildir
+	reactionData := map[string]interface{}{
+		"message_id": messageID,
+		"user_id":    userID,
+		"action":     "removed",
+	}
+
+	h.SendToUser(message.SenderID, "reaction_updated", reactionData)
+	h.SendToUser(message.ReceiverID, "reaction_updated", reactionData)
+
+	log.Printf("Reaction kaldırıldı: User %d, Message %s", userID, messageID)
 }

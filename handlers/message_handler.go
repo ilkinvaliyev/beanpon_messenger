@@ -169,13 +169,16 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 		}
 
 		responseMessages = append(responseMessages, gin.H{
-			"id":          msg.ID,
-			"sender_id":   msg.SenderID,
-			"receiver_id": msg.ReceiverID,
-			"text":        decryptedText,
-			"read":        msg.Read,
-			"created_at":  msg.CreatedAt,
-			"updated_at":  msg.UpdatedAt,
+			"id":                  msg.ID,
+			"sender_id":           msg.SenderID,
+			"receiver_id":         msg.ReceiverID,
+			"reply_to_message_id": msg.ReplyToMessageID,
+			"text":                decryptedText,
+			"read":                msg.Read,
+			"sender_reaction":     msg.SenderReaction,
+			"receiver_reaction":   msg.ReceiverReaction,
+			"created_at":          msg.CreatedAt,
+			"updated_at":          msg.UpdatedAt,
 		})
 	}
 
