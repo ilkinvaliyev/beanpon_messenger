@@ -314,7 +314,17 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 		LastMessageTime    time.Time `json:"last_message_time"`
 		IsLastFromMe       bool      `json:"is_last_from_me"`
 		UnreadCount        int       `json:"unread_count"`
-		ConversationStatus string    `json:"conversation_status"` // YENI
+		ConversationStatus string    `json:"conversation_status"`
+
+		// Conversation detayları
+		ConversationID     *uint `json:"conversation_id"`
+		MyMessageCount     *int  `json:"my_message_count"`
+		OtherMessageCount  *int  `json:"other_message_count"`
+		AmIMuted           *bool `json:"am_i_muted"`
+		AmIRestricted      *bool `json:"am_i_restricted"`
+		IsOtherMuted       *bool `json:"is_other_muted"`
+		IsOtherRestricted  *bool `json:"is_other_restricted"`
+		MaxPendingMessages *int  `json:"max_pending_messages"`
 
 		OtherUserName     string  `json:"other_user_name"`
 		OtherUserUsername string  `json:"other_user_username"`
@@ -363,6 +373,38 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
         lm.is_from_me,
         COALESCE(uc.unread_count, 0) as unread_count,
         COALESCE(conv.status, 'active') as conversation_status,
+        conv.id as conversation_id,
+        CASE 
+            WHEN conv.user1_id = ? THEN conv.user1_message_count
+            WHEN conv.user2_id = ? THEN conv.user2_message_count
+            ELSE NULL
+        END as my_message_count,
+        CASE 
+            WHEN conv.user1_id = ? THEN conv.user2_message_count
+            WHEN conv.user2_id = ? THEN conv.user1_message_count
+            ELSE NULL
+        END as other_message_count,
+        CASE 
+            WHEN conv.user1_id = ? THEN conv.user1_muted
+            WHEN conv.user2_id = ? THEN conv.user2_muted
+            ELSE NULL
+        END as am_i_muted,
+        CASE 
+            WHEN conv.user1_id = ? THEN conv.user1_restricted
+            WHEN conv.user2_id = ? THEN conv.user2_restricted
+            ELSE NULL
+        END as am_i_restricted,
+        CASE 
+            WHEN conv.user1_id = ? THEN conv.user2_muted
+            WHEN conv.user2_id = ? THEN conv.user1_muted
+            ELSE NULL
+        END as is_other_muted,
+        CASE 
+            WHEN conv.user1_id = ? THEN conv.user2_restricted
+            WHEN conv.user2_id = ? THEN conv.user1_restricted
+            ELSE NULL
+        END as is_other_restricted,
+        conv.max_pending_messages,
         u.name as other_user_name,
         u.username as other_user_username,
         u.account_type_id,
@@ -380,8 +422,9 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 
 	err := database.DB.Raw(query,
 		userID, userID, userID, userID, userID, // latest_messages için
-		userID,         // delete filter için
-		userID,         // unread_counts için
+		userID,                                                                                         // delete filter için
+		userID,                                                                                         // unread_counts için
+		userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, // conversation detayları için
 		userID, userID, // conversations JOIN için
 	).Scan(&conversations).Error
 
@@ -390,7 +433,7 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 		return
 	}
 
-	// Mesajları çöz ve online durumları ekle
+	// Mesajları çöz ve detaylı conversation bilgileri ekle
 	var responseConversations []gin.H
 	for _, conv := range conversations {
 		decryptedText, err := h.encryptionService.DecryptMessage(conv.LastMessageText)
@@ -398,12 +441,38 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 			decryptedText = "Mesaj çözülemedi"
 		}
 
-		isActive := false
-		if conv.ConversationStatus == "" || conv.ConversationStatus == "active" {
-			isActive = true
+		// Conversation durumu analizi
+		canSendMessage := true
+		conversationActive := true
+		conversationType := "normal" // normal, pending, restricted
+
+		if conv.ConversationStatus != "" && conv.ConversationStatus != "active" {
+			conversationActive = false
+
+			switch conv.ConversationStatus {
+			case "pending":
+				conversationType = "pending"
+				// Pending durumda mesaj limiti kontrol et
+				if conv.MyMessageCount != nil && conv.MaxPendingMessages != nil {
+					if *conv.MyMessageCount >= *conv.MaxPendingMessages {
+						canSendMessage = false
+					}
+				}
+			case "restricted":
+				conversationType = "restricted"
+				canSendMessage = false
+			}
 		}
 
-		responseConversations = append(responseConversations, gin.H{
+		// Kişisel kısıtlamalar
+		if conv.AmIRestricted != nil && *conv.AmIRestricted {
+			canSendMessage = false
+		}
+
+		// Mute durumu (mesaj göndermeyi engellemez ama UI'da farklı gösterilebilir)
+		isMutedByMe := conv.AmIMuted != nil && *conv.AmIMuted
+
+		responseData := gin.H{
 			"other_user_id":       conv.OtherUserID,
 			"other_user_name":     conv.OtherUserName,
 			"other_user_username": conv.OtherUserUsername,
@@ -414,9 +483,28 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 			"last_message_time":   conv.LastMessageTime,
 			"is_last_from_me":     conv.IsLastFromMe,
 			"unread_count":        conv.UnreadCount,
-			"conversation_active": isActive, // YENI
 			"is_online":           h.wsHub.IsUserOnline(conv.OtherUserID),
-		})
+
+			// Conversation durumu (eski uyumluluk için)
+			"conversation_active": conversationActive,
+
+			// Detaylı conversation bilgileri
+			"conversation": gin.H{
+				"id":                   conv.ConversationID,
+				"status":               conv.ConversationStatus,
+				"type":                 conversationType,
+				"can_send_message":     canSendMessage,
+				"is_muted_by_me":       isMutedByMe,
+				"am_i_restricted":      conv.AmIRestricted,
+				"is_other_muted":       conv.IsOtherMuted,
+				"is_other_restricted":  conv.IsOtherRestricted,
+				"my_message_count":     conv.MyMessageCount,
+				"other_message_count":  conv.OtherMessageCount,
+				"max_pending_messages": conv.MaxPendingMessages,
+			},
+		}
+
+		responseConversations = append(responseConversations, responseData)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
