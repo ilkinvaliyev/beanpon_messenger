@@ -223,12 +223,13 @@ func (h *Hub) SendToMultipleUsers(userIDs []uint, messageType string, data inter
 }
 
 // HandleNewMessage yeni mesajı handle et ve WebSocket üzerinden yayınla
-func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content string, createdAt time.Time) {
+func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, msgType string, createdAt time.Time) {
 	messageData := map[string]interface{}{
 		"id":          messageID,
 		"sender_id":   senderID,
 		"receiver_id": receiverID,
 		"text":        content,
+		"type":        msgType, // Bu satırı ekle
 		"read":        false,
 		"created_at":  createdAt.Format(time.RFC3339),
 		"is_history":  false,
@@ -244,7 +245,7 @@ func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content str
 	go h.SendUnreadCountUpdate(receiverID)
 
 	if !h.IsUserOnline(receiverID) {
-		h.sendPushNotification(senderID, receiverID, content)
+		h.sendPushNotification(senderID, receiverID, content, msgType) // msgType parametresi ekle
 	}
 
 	log.Printf("Yeni mesaj WebSocket üzerinden yayınlandı: %s -> %d", messageID, receiverID)
@@ -577,10 +578,17 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 
 		receiverID := uint(receiverIDFloat)
 		var replyToMessageID *string
+		var msgType string
 
 		// Reply kontrolü
 		if replyID, exists := dataMap["reply_to_message_id"].(string); exists && replyID != "" {
 			replyToMessageID = &replyID
+		}
+
+		if typeStr, exists := dataMap["type"].(string); exists {
+			msgType = typeStr
+		} else {
+			msgType = "text" // Default type
 		}
 
 		if receiverID == 0 || content == "" {
@@ -590,7 +598,7 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 		messageID := uuid.New().String()
 		createdAt := time.Now()
 
-		c.Hub.HandleNewMessage(c.UserID, receiverID, messageID, content, createdAt)
+		c.Hub.HandleNewMessage(c.UserID, receiverID, messageID, content, msgType, createdAt)
 
 		// DB yazma
 		go func() {
@@ -739,7 +747,7 @@ func (c *Client) writePump() {
 }
 
 // sendPushNotification push notification göndər (async)
-func (h *Hub) sendPushNotification(senderID, receiverID uint, message string) {
+func (h *Hub) sendPushNotification(senderID, receiverID uint, message, msgType string) {
 	//log.Printf("🔔 sendPushNotification çağrıldı: %d -> %d, message: %s", senderID, receiverID, message)
 
 	go func() {
@@ -747,6 +755,18 @@ func (h *Hub) sendPushNotification(senderID, receiverID uint, message string) {
 
 		url := h.config.BackendUrl + "/notification/new-message"
 		//log.Printf("🔔 URL: %s", url)
+
+		var notificationMessage string
+		switch msgType {
+		case "image":
+			notificationMessage = "Image"
+		case "video":
+			notificationMessage = "Video"
+		case "voice":
+			notificationMessage = "Voice"
+		default:
+			notificationMessage = message // Normal text mesaj
+		}
 
 		// Config yoxlayın
 		if h.config.CloudToken == "" {
@@ -761,7 +781,7 @@ func (h *Hub) sendPushNotification(senderID, receiverID uint, message string) {
 		payload := map[string]interface{}{
 			"receiver_id": receiverID,
 			"sender_id":   senderID,
-			"message":     message,
+			"message":     notificationMessage, // Type'a göre ayarlanmış mesaj
 		}
 
 		//log.Printf("🔔 Payload: %+v", payload)

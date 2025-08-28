@@ -20,7 +20,7 @@ type MessageHandler struct {
 		DecryptMessage(encryptedText string) (string, error)
 	}
 	wsHub interface {
-		HandleNewMessage(senderID, receiverID uint, messageID, content string, createdAt time.Time)
+		HandleNewMessage(senderID, receiverID uint, messageID, content, msgType string, createdAt time.Time)
 		HandleMessageRead(messageID string, senderID, readerID uint)
 		IsUserOnline(userID uint) bool
 		SendToUser(userID uint, messageType string, data interface{})
@@ -31,7 +31,7 @@ func NewMessageHandler(encryptionService interface {
 	EncryptMessage(plainText string) (string, error)
 	DecryptMessage(encryptedText string) (string, error)
 }, wsHub interface {
-	HandleNewMessage(senderID, receiverID uint, messageID, content string, createdAt time.Time)
+	HandleNewMessage(senderID, receiverID uint, messageID, content, msgType string, createdAt time.Time)
 	HandleMessageRead(messageID string, senderID, readerID uint)
 	IsUserOnline(userID uint) bool
 	SendToUser(userID uint, messageType string, data interface{})
@@ -52,8 +52,10 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 	}
 
 	var req struct {
-		ReceiverID uint   `json:"receiver_id" binding:"required"`
-		Text       string `json:"text" binding:"required"`
+		ReceiverID       uint    `json:"receiver_id" binding:"required"`
+		Text             string  `json:"text" binding:"required"`
+		Type             string  `json:"type,omitempty"` // Bu satırı ekle
+		ReplyToMessageID *string `json:"reply_to_message_id,omitempty"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -96,6 +98,7 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 		message.ReceiverID,
 		message.ID,
 		req.Text, // Şifrelenmemiş hali WebSocket'te
+		req.Type,
 		message.CreatedAt,
 	)
 

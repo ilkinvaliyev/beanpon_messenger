@@ -78,7 +78,8 @@ type MessageResponse struct {
 
 // SendMessageRequest mesaj gönderme isteği
 type SendMessageRequest struct {
-	ReceiverID       uint    `json:"receiver_id" binding:"required"`
-	Text             string  `json:"text" binding:"required,min=1,max=1000"`
+	ReceiverID uint   `json:"receiver_id" binding:"required"`
+	Text       string `json:"text" binding:"required,min=1,max=5000"`
+	//Type             string  `json:"type,omitempty"` // Bu satırı ekle
 	ReplyToMessageID *string `json:"reply_to_message_id,omitempty"`
 }
