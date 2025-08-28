@@ -299,7 +299,6 @@ func (h *MessageHandler) MarkAsRead(c *gin.Context) {
 }
 
 // GetConversations sohbet listesi
-// GetConversations sohbet listesi - handlers/message_handler.go'da bu fonksiyonu değiştir
 func (h *MessageHandler) GetConversations(c *gin.Context) {
 	userID, exists := c.Get("user_id")
 	if !exists {
@@ -309,12 +308,13 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 
 	// En son mesajları getir - silinmiş olanları hariç tut
 	var conversations []struct {
-		OtherUserID     uint      `json:"other_user_id"`
-		LastMessageID   string    `json:"last_message_id"`
-		LastMessageText string    `json:"last_message_text"`
-		LastMessageTime time.Time `json:"last_message_time"`
-		IsLastFromMe    bool      `json:"is_last_from_me"`
-		UnreadCount     int       `json:"unread_count"`
+		OtherUserID        uint      `json:"other_user_id"`
+		LastMessageID      string    `json:"last_message_id"`
+		LastMessageText    string    `json:"last_message_text"`
+		LastMessageTime    time.Time `json:"last_message_time"`
+		IsLastFromMe       bool      `json:"is_last_from_me"`
+		UnreadCount        int       `json:"unread_count"`
+		ConversationStatus string    `json:"conversation_status"` // YENI
 
 		OtherUserName     string  `json:"other_user_name"`
 		OtherUserUsername string  `json:"other_user_username"`
@@ -322,63 +322,67 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 		ProfileImage      *string `json:"profile_image"`
 	}
 
-	// Mevcut query'yi değiştirmeden kullan
 	query := `
-	WITH latest_messages AS (
-		SELECT 
-			CASE 
-				WHEN sender_id = ? THEN receiver_id 
-				ELSE sender_id 
-			END as other_user_id,
-			id,
-			encrypted_text,
-			created_at,
-			sender_id = ? as is_from_me,
-			ROW_NUMBER() OVER (
-				PARTITION BY CASE WHEN sender_id = ? THEN receiver_id ELSE sender_id END 
-				ORDER BY created_at DESC
-			) as rn
-		FROM messages 
-		WHERE (sender_id = ? OR receiver_id = ?)
-		AND (
-			CASE 
-				WHEN sender_id = ? THEN is_deleted_by_sender = false
-				ELSE is_deleted_by_receiver = false
-			END
-		)
-	),
-	unread_counts AS (
-		SELECT 
-			sender_id as other_user_id,
-			COUNT(*) as unread_count
-		FROM messages 
-		WHERE receiver_id = ? AND read = false 
-		AND is_deleted_by_receiver = false
-		GROUP BY sender_id
-	)
-	SELECT 
-		lm.other_user_id,
-		lm.id as last_message_id,
-		lm.encrypted_text as last_message_text,
-		lm.created_at as last_message_time,
-		lm.is_from_me,
-		COALESCE(uc.unread_count, 0) as unread_count,
-		u.name as other_user_name,
-		u.username as other_user_username,
-		u.account_type_id,
-		p.profile_image
-	FROM latest_messages lm
-	LEFT JOIN unread_counts uc ON lm.other_user_id = uc.other_user_id
-	LEFT JOIN users u ON u.id = lm.other_user_id
-	LEFT JOIN profiles p ON p.user_id = lm.other_user_id
-	WHERE lm.rn = 1
-	ORDER BY lm.created_at DESC
-	`
+    WITH latest_messages AS (
+        SELECT 
+            CASE 
+                WHEN sender_id = ? THEN receiver_id 
+                ELSE sender_id 
+            END as other_user_id,
+            id,
+            encrypted_text,
+            created_at,
+            sender_id = ? as is_from_me,
+            ROW_NUMBER() OVER (
+                PARTITION BY CASE WHEN sender_id = ? THEN receiver_id ELSE sender_id END 
+                ORDER BY created_at DESC
+            ) as rn
+        FROM messages 
+        WHERE (sender_id = ? OR receiver_id = ?)
+        AND (
+            CASE 
+                WHEN sender_id = ? THEN is_deleted_by_sender = false
+                ELSE is_deleted_by_receiver = false
+            END
+        )
+    ),
+    unread_counts AS (
+        SELECT 
+            sender_id as other_user_id,
+            COUNT(*) as unread_count
+        FROM messages 
+        WHERE receiver_id = ? AND read = false 
+        AND is_deleted_by_receiver = false
+        GROUP BY sender_id
+    )
+    SELECT 
+        lm.other_user_id,
+        lm.id as last_message_id,
+        lm.encrypted_text as last_message_text,
+        lm.created_at as last_message_time,
+        lm.is_from_me,
+        COALESCE(uc.unread_count, 0) as unread_count,
+        COALESCE(conv.status, 'active') as conversation_status,
+        u.name as other_user_name,
+        u.username as other_user_username,
+        u.account_type_id,
+        p.profile_image
+    FROM latest_messages lm
+    LEFT JOIN unread_counts uc ON lm.other_user_id = uc.other_user_id
+    LEFT JOIN users u ON u.id = lm.other_user_id
+    LEFT JOIN profiles p ON p.user_id = lm.other_user_id
+    LEFT JOIN conversations conv ON (
+        (conv.user1_id = LEAST(?, lm.other_user_id) AND conv.user2_id = GREATEST(?, lm.other_user_id))
+    )
+    WHERE lm.rn = 1
+    ORDER BY lm.created_at DESC
+    `
 
 	err := database.DB.Raw(query,
 		userID, userID, userID, userID, userID, // latest_messages için
-		userID, // delete filter için
-		userID, // unread_counts için
+		userID,         // delete filter için
+		userID,         // unread_counts için
+		userID, userID, // conversations JOIN için
 	).Scan(&conversations).Error
 
 	if err != nil {
@@ -386,17 +390,17 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 		return
 	}
 
-	// Mesajları çöz ve restricted conversation'ları filtrele
+	// Mesajları çöz ve online durumları ekle
 	var responseConversations []gin.H
 	for _, conv := range conversations {
-		// Bu conversation restricted mı kontrol et
-		if h.isConversationRestricted(userID.(uint), conv.OtherUserID) {
-			continue // Restricted ise atla
-		}
-
 		decryptedText, err := h.encryptionService.DecryptMessage(conv.LastMessageText)
 		if err != nil {
 			decryptedText = "Mesaj çözülemedi"
+		}
+
+		isActive := false
+		if conv.ConversationStatus == "" || conv.ConversationStatus == "active" {
+			isActive = true
 		}
 
 		responseConversations = append(responseConversations, gin.H{
@@ -410,6 +414,7 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 			"last_message_time":   conv.LastMessageTime,
 			"is_last_from_me":     conv.IsLastFromMe,
 			"unread_count":        conv.UnreadCount,
+			"conversation_active": isActive, // YENI
 			"is_online":           h.wsHub.IsUserOnline(conv.OtherUserID),
 		})
 	}
@@ -418,34 +423,6 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 		"conversations": responseConversations,
 		"total":         len(responseConversations),
 	})
-}
-
-// Bu helper fonksiyonu ekle - handlers/message_handler.go'ya
-func (h *MessageHandler) isConversationRestricted(userID, otherUserID uint) bool {
-	var conv models.Conversation
-
-	// Küçük ID user1, büyük ID user2 olacak şekilde ara
-	user1ID := userID
-	user2ID := otherUserID
-	if userID > otherUserID {
-		user1ID = otherUserID
-		user2ID = userID
-	}
-
-	err := database.DB.Where("user1_id = ? AND user2_id = ?", user1ID, user2ID).First(&conv).Error
-
-	// Conversation kaydı yoksa (eski mesajlar) - göster
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return false
-	}
-
-	// Database hatası varsa - güvenlik için gizle
-	if err != nil {
-		return true
-	}
-
-	// Restricted ise gizle, diğer durumlarda göster
-	return conv.Status == "restricted"
 }
 
 // GetUnreadCount okunmamış mesaj sayısı
