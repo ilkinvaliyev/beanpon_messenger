@@ -325,11 +325,70 @@ func (h *ConversationHandler) GetConversationDetails(c *gin.Context) {
 		return
 	}
 
-	// Response'u kullanıcıya göre ayarla
-	response := h.buildConversationResponse(conversation, userID.(uint))
+	// Conversation durumu analizi
+	canSendMessage := true
+	conversationType := "normal" // normal, pending, restricted
+
+	switch conversation.Status {
+	case "pending":
+		conversationType = "pending"
+		// Pending durumda mesaj limiti kontrol et
+		var myMessageCount int
+		if userID.(uint) == conversation.User1ID {
+			myMessageCount = conversation.User1MessageCount
+		} else {
+			myMessageCount = conversation.User2MessageCount
+		}
+
+		if myMessageCount >= conversation.MaxPendingMessages {
+			canSendMessage = false
+		}
+	case "restricted":
+		conversationType = "restricted"
+		canSendMessage = false
+	case "active":
+		conversationType = "normal"
+	}
+
+	// Kullanıcıya göre detayları ayarla
+	var myMessageCount, otherMessageCount int
+	var isMutedByMe, amIRestricted, isOtherMuted, isOtherRestricted bool
+
+	if userID.(uint) == conversation.User1ID {
+		myMessageCount = conversation.User1MessageCount
+		otherMessageCount = conversation.User2MessageCount
+		isMutedByMe = conversation.User1Muted
+		amIRestricted = conversation.User1Restricted
+		isOtherMuted = conversation.User2Muted
+		isOtherRestricted = conversation.User2Restricted
+	} else {
+		myMessageCount = conversation.User2MessageCount
+		otherMessageCount = conversation.User1MessageCount
+		isMutedByMe = conversation.User2Muted
+		amIRestricted = conversation.User2Restricted
+		isOtherMuted = conversation.User1Muted
+		isOtherRestricted = conversation.User1Restricted
+	}
+
+	// Kişisel kısıtlamalar kontrol et
+	if amIRestricted {
+		canSendMessage = false
+	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"conversation": response,
+		"conversation": gin.H{
+			"id":                   conversation.ID,
+			"status":               conversation.Status,
+			"type":                 conversationType,
+			"can_send_message":     canSendMessage,
+			"is_muted_by_me":       isMutedByMe,
+			"am_i_restricted":      amIRestricted,
+			"is_other_muted":       isOtherMuted,
+			"is_other_restricted":  isOtherRestricted,
+			"my_message_count":     myMessageCount,
+			"other_message_count":  otherMessageCount,
+			"max_pending_messages": conversation.MaxPendingMessages,
+		},
 	})
 }
 
