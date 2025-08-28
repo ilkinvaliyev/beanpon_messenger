@@ -85,7 +85,7 @@ func main() {
 		// Conversation yönetimi (mevcut)
 		api.GET("/conversations/:user_id/details", conversationHandler.GetConversationDetails)
 		api.POST("/conversations/:user_id/mute", conversationHandler.MuteConversation)
-		api.DELETE("/conversations/:user_id/mute", conversationHandler.UnmuteConversation)
+		api.POST("/conversations/:user_id/unmute", conversationHandler.UnmuteConversation)
 
 		// WebSocket bilgi endpoint'leri
 		api.GET("/online-users", func(c *gin.Context) {
