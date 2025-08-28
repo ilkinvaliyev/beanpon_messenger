@@ -71,7 +71,7 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 	}
 
 	// Conversation kontrolü - mesaj gönderebilir mi?
-	conversationHandler := NewConversationHandler(h.wsHub)
+	conversationHandler := NewConversationHandler(h.wsHub, h.encryptionService)
 	canSend, reason, err := conversationHandler.CanSendMessage(senderID.(uint), req.ReceiverID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Conversation kontrolü başarısız"})
@@ -322,56 +322,61 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 	}
 
 	query := `
-	WITH latest_messages AS (
-		SELECT 
-			CASE 
-				WHEN sender_id = ? THEN receiver_id 
-				ELSE sender_id 
-			END as other_user_id,
-			id,
-			encrypted_text,
-			created_at,
-			sender_id = ? as is_from_me,
-			ROW_NUMBER() OVER (
-				PARTITION BY CASE WHEN sender_id = ? THEN receiver_id ELSE sender_id END 
-				ORDER BY created_at DESC
-			) as rn
-		FROM messages 
-		WHERE (sender_id = ? OR receiver_id = ?)
-		AND (
-			CASE 
-				WHEN sender_id = ? THEN is_deleted_by_sender = false
-				ELSE is_deleted_by_receiver = false
-			END
-		)
-	),
-	unread_counts AS (
-		SELECT 
-			sender_id as other_user_id,
-			COUNT(*) as unread_count
-		FROM messages 
-		WHERE receiver_id = ? AND read = false 
-		AND is_deleted_by_receiver = false
-		GROUP BY sender_id
-	)
-	SELECT 
-		lm.other_user_id,
-		lm.id as last_message_id,
-		lm.encrypted_text as last_message_text,
-		lm.created_at as last_message_time,
-		lm.is_from_me,
-		COALESCE(uc.unread_count, 0) as unread_count,
-		u.name as other_user_name,
-		u.username as other_user_username,
-		u.account_type_id,
-		p.profile_image
-	FROM latest_messages lm
-	LEFT JOIN unread_counts uc ON lm.other_user_id = uc.other_user_id
-	LEFT JOIN users u ON u.id = lm.other_user_id
-	LEFT JOIN profiles p ON p.user_id = lm.other_user_id
-	WHERE lm.rn = 1
-	ORDER BY lm.created_at DESC
-	`
+		WITH latest_messages AS (
+			SELECT 
+			   CASE 
+				  WHEN sender_id = ? THEN receiver_id 
+				  ELSE sender_id 
+			   END as other_user_id,
+			   id,
+			   encrypted_text,
+			   created_at,
+			   sender_id = ? as is_from_me,
+			   ROW_NUMBER() OVER (
+				  PARTITION BY CASE WHEN sender_id = ? THEN receiver_id ELSE sender_id END 
+				  ORDER BY created_at DESC
+			   ) as rn
+			FROM messages 
+			WHERE (sender_id = ? OR receiver_id = ?)
+			AND (
+			   CASE 
+				  WHEN sender_id = ? THEN is_deleted_by_sender = false
+				  ELSE is_deleted_by_receiver = false
+			   END
+			)
+			),
+			unread_counts AS (
+				SELECT 
+				   sender_id as other_user_id,
+				   COUNT(*) as unread_count
+				FROM messages 
+				WHERE receiver_id = ? AND read = false 
+				AND is_deleted_by_receiver = false
+				GROUP BY sender_id
+			)
+			SELECT 
+				lm.other_user_id,
+				lm.id as last_message_id,
+				lm.encrypted_text as last_message_text,
+				lm.created_at as last_message_time,
+				lm.is_from_me,
+				COALESCE(uc.unread_count, 0) as unread_count,
+				u.name as other_user_name,
+				u.username as other_user_username,
+				u.account_type_id,
+				p.profile_image
+			FROM latest_messages lm
+			LEFT JOIN unread_counts uc ON lm.other_user_id = uc.other_user_id
+			LEFT JOIN users u ON u.id = lm.other_user_id
+			LEFT JOIN profiles p ON p.user_id = lm.other_user_id
+			LEFT JOIN conversations conv ON (
+			  (conv.user1_id = ? AND conv.user2_id = lm.other_user_id) OR 
+			  (conv.user2_id = ? AND conv.user1_id = lm.other_user_id)
+			)
+			WHERE lm.rn = 1 
+			AND (conv.status = 'active' OR conv.status IS NULL)
+			ORDER BY lm.created_at DESC
+			`
 
 	err := database.DB.Raw(query,
 		userID, userID, userID, userID, userID, // latest_messages üçün

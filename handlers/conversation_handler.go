@@ -16,14 +16,22 @@ type ConversationHandler struct {
 		IsUserOnline(userID uint) bool
 		SendToUser(userID uint, messageType string, data interface{})
 	}
+	encryptionService interface {
+		EncryptMessage(plainText string) (string, error)
+		DecryptMessage(encryptedText string) (string, error)
+	}
 }
 
 func NewConversationHandler(wsHub interface {
 	IsUserOnline(userID uint) bool
 	SendToUser(userID uint, messageType string, data interface{})
+}, encryptionService interface {
+	EncryptMessage(plainText string) (string, error)
+	DecryptMessage(encryptedText string) (string, error)
 }) *ConversationHandler {
 	return &ConversationHandler{
-		wsHub: wsHub,
+		wsHub:             wsHub,
+		encryptionService: encryptionService,
 	}
 }
 
@@ -368,4 +376,221 @@ func (h *ConversationHandler) buildConversationResponse(conv *models.Conversatio
 // StringPtr string pointer helper
 func StringPtr(s string) *string {
 	return &s
+}
+
+// GetPendingRequests bekleyen istekleri getir
+func (h *ConversationHandler) GetPendingRequests(c *gin.Context) {
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	var requests []struct {
+		ConversationID    uint      `json:"conversation_id"`
+		RequesterID       uint      `json:"requester_id"`
+		RequesterName     string    `json:"requester_name"`
+		RequesterUsername string    `json:"requester_username"`
+		ProfileImage      *string   `json:"profile_image"`
+		MessageCount      int       `json:"message_count"`
+		LastMessageText   string    `json:"last_message_text"`
+		LastMessageTime   time.Time `json:"last_message_time"`
+		CreatedAt         time.Time `json:"created_at"`
+	}
+
+	query := `
+        SELECT 
+            c.id as conversation_id,
+            CASE 
+                WHEN c.user1_id = ? THEN c.user2_id 
+                ELSE c.user1_id 
+            END as requester_id,
+            u.name as requester_name,
+            u.username as requester_username,
+            p.profile_image,
+            CASE 
+                WHEN c.user1_id = ? THEN c.user2_message_count 
+                ELSE c.user1_message_count 
+            END as message_count,
+            '' as last_message_text,
+            COALESCE(c.last_message_at, c.created_at) as last_message_time,
+            c.created_at
+        FROM conversations c
+        JOIN users u ON u.id = CASE WHEN c.user1_id = ? THEN c.user2_id ELSE c.user1_id END
+        LEFT JOIN profiles p ON p.user_id = u.id
+        WHERE (c.user1_id = ? OR c.user2_id = ?)
+        AND c.status = 'pending'
+        AND CASE 
+            WHEN c.user1_id = ? THEN c.user2_message_count > 0 
+            ELSE c.user1_message_count > 0 
+        END
+        ORDER BY c.last_message_at DESC
+    `
+
+	err := database.DB.Raw(query, userID, userID, userID, userID, userID, userID).Scan(&requests).Error
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "İstekler alınamadı"})
+		return
+	}
+
+	// Son mesajları al
+	for i := range requests {
+		var lastMessage struct {
+			EncryptedText string `json:"encrypted_text"`
+		}
+
+		database.DB.Raw(`
+            SELECT encrypted_text 
+            FROM messages 
+            WHERE sender_id = ? AND receiver_id = ?
+            AND is_deleted_by_receiver = false
+            ORDER BY created_at DESC 
+            LIMIT 1
+        `, requests[i].RequesterID, userID).Scan(&lastMessage)
+
+		if lastMessage.EncryptedText != "" {
+			if decrypted, err := h.encryptionService.DecryptMessage(lastMessage.EncryptedText); err == nil {
+				requests[i].LastMessageText = decrypted
+			}
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"requests": requests,
+		"count":    len(requests),
+	})
+}
+
+// GetPendingRequestCount bekleyen istek sayısı
+func (h *ConversationHandler) GetPendingRequestCount(c *gin.Context) {
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	var count int64
+
+	query := `
+        SELECT COUNT(*) 
+        FROM conversations c
+        WHERE (c.user1_id = ? OR c.user2_id = ?)
+        AND c.status = 'pending'
+        AND CASE 
+            WHEN c.user1_id = ? THEN c.user2_message_count > 0 
+            ELSE c.user1_message_count > 0 
+        END
+    `
+
+	database.DB.Raw(query, userID, userID, userID).Scan(&count)
+
+	c.JSON(http.StatusOK, gin.H{
+		"pending_requests_count": count,
+	})
+}
+
+// AcceptConversationRequest conversation isteğini kabul et
+func (h *ConversationHandler) AcceptConversationRequest(c *gin.Context) {
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	requesterID, err := strconv.ParseUint(c.Param("requester_id"), 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz requester ID"})
+		return
+	}
+
+	conversation, err := h.GetOrCreateConversation(userID.(uint), uint(requesterID))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Conversation bulunamadı"})
+		return
+	}
+
+	if conversation.Status != "pending" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Bu conversation zaten kabul edilmiş"})
+		return
+	}
+
+	// Conversation'ı active yap
+	now := time.Now()
+	conversation.Status = "active"
+	conversation.HasPreviousConversation = true
+	conversation.StatusChangedAt = &now
+
+	if err := database.DB.Save(conversation).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "İstek kabul edilemedi"})
+		return
+	}
+
+	// WebSocket bildirimi gönder
+	h.wsHub.SendToUser(uint(requesterID), "conversation_accepted", map[string]interface{}{
+		"conversation_id": conversation.ID,
+		"accepted_by":     userID,
+		"accepted_at":     now,
+	})
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Conversation isteği kabul edildi",
+		"data": gin.H{
+			"conversation_id": conversation.ID,
+			"status":          conversation.Status,
+			"accepted_at":     now,
+		},
+	})
+}
+
+// RejectConversationRequest conversation isteğini reddet
+func (h *ConversationHandler) RejectConversationRequest(c *gin.Context) {
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	requesterID, err := strconv.ParseUint(c.Param("requester_id"), 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz requester ID"})
+		return
+	}
+
+	conversation, err := h.GetOrCreateConversation(userID.(uint), uint(requesterID))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Conversation bulunamadı"})
+		return
+	}
+
+	if conversation.Status != "pending" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Bu conversation zaten işlenmiş"})
+		return
+	}
+
+	// Conversation'ı restricted yap
+	now := time.Now()
+	conversation.Status = "restricted"
+	conversation.StatusChangedAt = &now
+	conversation.RestrictionReason = StringPtr("İstek reddedildi")
+
+	if err := database.DB.Save(conversation).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "İstek reddedilemedi"})
+		return
+	}
+
+	// WebSocket bildirimi gönder
+	h.wsHub.SendToUser(uint(requesterID), "conversation_rejected", map[string]interface{}{
+		"conversation_id": conversation.ID,
+		"rejected_by":     userID,
+		"rejected_at":     now,
+	})
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Conversation isteği reddedildi",
+		"data": gin.H{
+			"conversation_id": conversation.ID,
+			"status":          conversation.Status,
+			"rejected_at":     now,
+		},
+	})
 }

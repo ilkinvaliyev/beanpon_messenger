@@ -38,7 +38,7 @@ func main() {
 
 	// Handler'ları oluştur
 	messageHandler := handlers.NewMessageHandler(encryptionService, wsHub)
-	conversationHandler := handlers.NewConversationHandler(wsHub)
+	conversationHandler := handlers.NewConversationHandler(wsHub, encryptionService)
 
 	// Gin router'ını oluştur
 	router := gin.Default()
@@ -56,49 +56,6 @@ func main() {
 
 		c.Next()
 	})
-	// Public routes
-	router.GET("/ping", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{
-			"message": "pong running",
-		})
-	})
-
-	router.GET("/health", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{
-			"status":    "healthy",
-			"database":  "connected",
-			"websocket": "running",
-		})
-	})
-
-	// WebSocket status endpoint
-	router.GET("/ws-status", func(c *gin.Context) {
-		onlineUsers := wsHub.GetConnectedUsers()
-		c.JSON(http.StatusOK, gin.H{
-			"connected_users": wsHub.GetConnectedUsersCount(),
-			"online_user_ids": onlineUsers,
-			"status":          "running",
-			"websocket_url":   "/ws",
-			"supported_message_types": []string{
-				"ping",
-				"typing",
-				"typing_stop",
-				"get_online_users",
-			},
-			"broadcasted_message_types": []string{
-				"new_message",
-				"message_read",
-				"message_deleted",
-				"user_status",
-				"user_typing",
-				"history_message",
-				"history_loaded",
-				"online_users",
-				"pong",
-			},
-		})
-	})
-
 	// WebSocket endpoint (JWT middleware ile)
 	router.GET("/ws", middleware.JWTMiddlewareForWebSocket(cfg.JWTSecret), wsHub.HandleWebSocket)
 
@@ -119,7 +76,13 @@ func main() {
 		api.GET("/conversations", messageHandler.GetConversations)
 		api.GET("/unread-count", messageHandler.GetUnreadCount)
 
-		// YENİ: Conversation yönetimi
+		// YENİ: Conversation request yönetimi
+		api.GET("/conversation-requests", conversationHandler.GetPendingRequests)
+		api.GET("/conversation-requests/count", conversationHandler.GetPendingRequestCount)
+		api.POST("/conversation-requests/:requester_id/accept", conversationHandler.AcceptConversationRequest)
+		api.POST("/conversation-requests/:requester_id/reject", conversationHandler.RejectConversationRequest)
+
+		// Conversation yönetimi (mevcut)
 		api.GET("/conversations/:user_id/details", conversationHandler.GetConversationDetails)
 		api.POST("/conversations/:user_id/mute", conversationHandler.MuteConversation)
 		api.DELETE("/conversations/:user_id/mute", conversationHandler.UnmuteConversation)
@@ -255,6 +218,49 @@ func main() {
 						},
 					},
 				},
+			},
+		})
+	})
+
+	// Public routes
+	router.GET("/ping", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"message": "pong running",
+		})
+	})
+
+	router.GET("/health", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"status":    "healthy",
+			"database":  "connected",
+			"websocket": "running",
+		})
+	})
+
+	// WebSocket status endpoint
+	router.GET("/ws-status", func(c *gin.Context) {
+		onlineUsers := wsHub.GetConnectedUsers()
+		c.JSON(http.StatusOK, gin.H{
+			"connected_users": wsHub.GetConnectedUsersCount(),
+			"online_user_ids": onlineUsers,
+			"status":          "running",
+			"websocket_url":   "/ws",
+			"supported_message_types": []string{
+				"ping",
+				"typing",
+				"typing_stop",
+				"get_online_users",
+			},
+			"broadcasted_message_types": []string{
+				"new_message",
+				"message_read",
+				"message_deleted",
+				"user_status",
+				"user_typing",
+				"history_message",
+				"history_loaded",
+				"online_users",
+				"pong",
 			},
 		})
 	})
