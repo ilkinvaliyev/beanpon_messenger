@@ -5,6 +5,7 @@ import (
 	"beanpon_messenger/models"
 	"beanpon_messenger/utils"
 	"errors"
+	"log"
 	"net/http"
 	"strconv"
 	"time"
@@ -54,7 +55,7 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 	var req struct {
 		ReceiverID       uint    `json:"receiver_id" binding:"required"`
 		Text             string  `json:"text" binding:"required"`
-		Type             string  `json:"type,omitempty"` // Bu satırı ekle
+		Type             string  `json:"type,omitempty"`
 		ReplyToMessageID *string `json:"reply_to_message_id,omitempty"`
 	}
 
@@ -66,6 +67,19 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 	// Kendi kendine mesaj göndermesini engelle
 	if senderID.(uint) == req.ReceiverID {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Kendi kendinize mesaj gönderemezsiniz"})
+		return
+	}
+
+	// Conversation kontrolü - mesaj gönderebilir mi?
+	conversationHandler := NewConversationHandler(h.wsHub)
+	canSend, reason, err := conversationHandler.CanSendMessage(senderID.(uint), req.ReceiverID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Conversation kontrolü başarısız"})
+		return
+	}
+
+	if !canSend {
+		c.JSON(http.StatusForbidden, gin.H{"error": reason})
 		return
 	}
 
@@ -92,12 +106,18 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 		return
 	}
 
+	// Conversation durumunu güncelle
+	if err := conversationHandler.UpdateConversationOnMessage(senderID.(uint), req.ReceiverID); err != nil {
+		// Log et ama işlemi durdurmaja
+		log.Printf("Conversation güncellemesi başarısız: %v", err)
+	}
+
 	// WebSocket üzerinden real-time yayınla (hem gönderen hem alıcıya)
 	h.wsHub.HandleNewMessage(
 		message.SenderID,
 		message.ReceiverID,
 		message.ID,
-		req.Text, // Şifrelenmemiş hali WebSocket'te
+		req.Text,
 		req.Type,
 		message.CreatedAt,
 	)

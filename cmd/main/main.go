@@ -38,6 +38,7 @@ func main() {
 
 	// Handler'ları oluştur
 	messageHandler := handlers.NewMessageHandler(encryptionService, wsHub)
+	conversationHandler := handlers.NewConversationHandler(wsHub)
 
 	// Gin router'ını oluştur
 	router := gin.Default()
@@ -117,6 +118,11 @@ func main() {
 		// Sohbet operasyonları
 		api.GET("/conversations", messageHandler.GetConversations)
 		api.GET("/unread-count", messageHandler.GetUnreadCount)
+
+		// YENİ: Conversation yönetimi
+		api.GET("/conversations/:user_id/details", conversationHandler.GetConversationDetails)
+		api.POST("/conversations/:user_id/mute", conversationHandler.MuteConversation)
+		api.DELETE("/conversations/:user_id/mute", conversationHandler.UnmuteConversation)
 
 		// WebSocket bilgi endpoint'leri
 		api.GET("/online-users", func(c *gin.Context) {
