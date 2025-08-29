@@ -21,7 +21,7 @@ type MessageHandler struct {
 		DecryptMessage(encryptedText string) (string, error)
 	}
 	wsHub interface {
-		HandleNewMessage(senderID, receiverID uint, messageID, content, msgType string, createdAt time.Time)
+		HandleNewMessage(senderID, receiverID uint, messageID, content, msgType string, createdAt time.Time, replyToMessageID *string) // Güncellendi
 		HandleMessageRead(messageID string, senderID, readerID uint)
 		IsUserOnline(userID uint) bool
 		SendToUser(userID uint, messageType string, data interface{})
@@ -32,7 +32,7 @@ func NewMessageHandler(encryptionService interface {
 	EncryptMessage(plainText string) (string, error)
 	DecryptMessage(encryptedText string) (string, error)
 }, wsHub interface {
-	HandleNewMessage(senderID, receiverID uint, messageID, content, msgType string, createdAt time.Time)
+	HandleNewMessage(senderID, receiverID uint, messageID, content, msgType string, createdAt time.Time, replyToMessageID *string) // Güncellendi
 	HandleMessageRead(messageID string, senderID, readerID uint)
 	IsUserOnline(userID uint) bool
 	SendToUser(userID uint, messageType string, data interface{})
@@ -92,13 +92,14 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 
 	// Veritabanına kaydet
 	message := models.Message{
-		ID:            uuid.New().String(),
-		SenderID:      senderID.(uint),
-		ReceiverID:    req.ReceiverID,
-		EncryptedText: encryptedText,
-		Read:          false,
-		CreatedAt:     time.Now(),
-		UpdatedAt:     time.Now(),
+		ID:               uuid.New().String(),
+		SenderID:         senderID.(uint),
+		ReceiverID:       req.ReceiverID,
+		EncryptedText:    encryptedText,
+		ReplyToMessageID: req.ReplyToMessageID,
+		Read:             false,
+		CreatedAt:        time.Now(),
+		UpdatedAt:        time.Now(),
 	}
 
 	if err := database.DB.Create(&message).Error; err != nil {
@@ -120,19 +121,21 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 		req.Text,
 		req.Type,
 		message.CreatedAt,
+		req.ReplyToMessageID, // YENİ parametre
 	)
 
 	// API response
 	c.JSON(http.StatusCreated, gin.H{
 		"message": "Mesaj başarıyla gönderildi",
 		"data": gin.H{
-			"id":          message.ID,
-			"sender_id":   message.SenderID,
-			"receiver_id": message.ReceiverID,
-			"text":        req.Text,
-			"read":        message.Read,
-			"created_at":  message.CreatedAt,
-			"is_online":   h.wsHub.IsUserOnline(req.ReceiverID),
+			"id":                  message.ID,
+			"sender_id":           message.SenderID,
+			"receiver_id":         message.ReceiverID,
+			"reply_to_message_id": message.ReplyToMessageID,
+			"text":                req.Text,
+			"read":                message.Read,
+			"created_at":          message.CreatedAt,
+			"is_online":           h.wsHub.IsUserOnline(req.ReceiverID),
 		},
 	})
 }

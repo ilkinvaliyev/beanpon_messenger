@@ -223,29 +223,30 @@ func (h *Hub) SendToMultipleUsers(userIDs []uint, messageType string, data inter
 }
 
 // HandleNewMessage yeni mesajı handle et ve WebSocket üzerinden yayınla
-func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, msgType string, createdAt time.Time) {
+// HandleNewMessage fonksiyon imzasını güncelle
+func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, msgType string, createdAt time.Time, replyToMessageID *string) {
 	messageData := map[string]interface{}{
-		"id":          messageID,
-		"sender_id":   senderID,
-		"receiver_id": receiverID,
-		"text":        content,
-		"type":        msgType, // Bu satırı ekle
-		"read":        false,
-		"created_at":  createdAt.Format(time.RFC3339),
-		"is_history":  false,
+		"id":                  messageID,
+		"sender_id":           senderID,
+		"receiver_id":         receiverID,
+		"reply_to_message_id": replyToMessageID, // YENİ
+		"text":                content,
+		"type":                msgType,
+		"read":                false,
+		"created_at":          createdAt.Format(time.RFC3339),
+		"is_history":          false,
 	}
 
 	// Hem gönderen hem de alıcıya gönder
 	userIDs := []uint{senderID, receiverID}
 	h.SendToMultipleUsers(userIDs, "new_message", messageData)
 
-	// YENI: Conversations sayfası için özel bildirim
 	h.sendConversationUpdate(senderID, receiverID, messageData)
 
 	go h.SendUnreadCountUpdate(receiverID)
 
 	if !h.IsUserOnline(receiverID) {
-		h.sendPushNotification(senderID, receiverID, content, msgType) // msgType parametresi ekle
+		h.sendPushNotification(senderID, receiverID, content, msgType)
 	}
 
 	log.Printf("Yeni mesaj WebSocket üzerinden yayınlandı: %s -> %d", messageID, receiverID)
@@ -598,7 +599,7 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 		messageID := uuid.New().String()
 		createdAt := time.Now()
 
-		c.Hub.HandleNewMessage(c.UserID, receiverID, messageID, content, msgType, createdAt)
+		c.Hub.HandleNewMessage(c.UserID, receiverID, messageID, content, msgType, createdAt, replyToMessageID)
 
 		// DB yazma
 		go func() {
