@@ -11,15 +11,16 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"time"
 )
 
 func main() {
 	// 🕒 Global timezone Asia/Baku olaraq set et
-	//loc, err := time.LoadLocation("Asia/Baku")
-	//if err != nil {
-	//	log.Fatalf("Location yüklenemedi: %v", err)
-	//}
-	//time.Local = loc
+	loc, err := time.LoadLocation("Asia/Baku")
+	if err != nil {
+		log.Fatalf("Location yüklenemedi: %v", err)
+	}
+	time.Local = loc
 
 	// Konfigürasyonu yükle
 	cfg := config.LoadConfig()
