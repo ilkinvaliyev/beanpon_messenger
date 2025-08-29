@@ -245,10 +245,10 @@ func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, ms
 			}
 
 			messageData["reply_to_message"] = map[string]interface{}{
-				"id":         replyMessage.ID,
-				"sender_id":  replyMessage.SenderID,
-				"text":       replyDecryptedText,
-				"type":       replyMessage.Type,
+				"id":        replyMessage.ID,
+				"sender_id": replyMessage.SenderID,
+				"text":      replyDecryptedText,
+				//"type":       replyMessage.Type,
 				"created_at": replyMessage.CreatedAt,
 			}
 		}
