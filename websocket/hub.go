@@ -624,6 +624,23 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 			}
 		}()
 
+	case "mark_read":
+		// Mesajları okundu olarak işaretle
+		dataMap, ok := msg.Data.(map[string]interface{})
+		if !ok {
+			log.Printf("mark_read data parse edilemedi")
+			return
+		}
+
+		otherUserIDFloat, ok := dataMap["other_user_id"].(float64)
+		if !ok {
+			log.Printf("other_user_id eksik veya geçersiz")
+			return
+		}
+
+		otherUserID := uint(otherUserIDFloat)
+		c.Hub.handleMarkRead(c.UserID, otherUserID)
+
 	case "call_offer":
 		if msg.ReceiverID > 0 {
 			c.Hub.SendToUser(msg.ReceiverID, "call_offer", map[string]interface{}{
@@ -940,4 +957,37 @@ func (h *Hub) handleRemoveReaction(userID uint, messageID string) {
 	h.SendToUser(message.ReceiverID, "reaction_updated", reactionData)
 
 	log.Printf("Reaction kaldırıldı: User %d, Message %s", userID, messageID)
+}
+
+// handleMarkRead kullanıcının mesajlarını okundu olarak işaretle
+func (h *Hub) handleMarkRead(readerID, otherUserID uint) {
+	// Bu conversation'daki okunmamış mesajları okundu olarak işaretle
+	result := h.db.Model(&models.Message{}).
+		Where("sender_id = ? AND receiver_id = ? AND read = false", otherUserID, readerID).
+		Update("read", true)
+
+	if result.Error != nil {
+		log.Printf("Mesajları okundu olarak işaretleme hatası: %v", result.Error)
+		return
+	}
+
+	// Kaç mesaj okundu olarak işaretlendi
+	updatedCount := result.RowsAffected
+
+	if updatedCount > 0 {
+		// Mesaj gönderende unread count güncelle
+		go h.SendUnreadCountUpdate(otherUserID)
+
+		// Mesaj gönderen kişiye bildir (message_read event)
+		readData := map[string]interface{}{
+			"reader_id":     readerID,
+			"other_user_id": otherUserID,
+			"read_count":    updatedCount,
+		}
+
+		h.SendToUser(otherUserID, "message_read", readData)
+
+		log.Printf("Mesajlar okundu olarak işaretlendi: %d mesaj, reader: %d, sender: %d",
+			updatedCount, readerID, otherUserID)
+	}
 }
