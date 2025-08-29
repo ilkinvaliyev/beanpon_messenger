@@ -14,6 +14,7 @@ type Message struct {
 	ReplyToMessageID    *string        `json:"reply_to_message_id" gorm:"type:uuid;index"`
 	EncryptedText       string         `json:"encrypted_text" gorm:"type:text;not null"`
 	EncryptedAESKey     *string        `json:"encrypted_aes_key" gorm:"type:text"`
+	Type                string         `json:"type" gorm:"default:'text'"`
 	IsEdited            bool           `json:"is_edited" gorm:"default:false"`
 	IsDeletedBySender   bool           `json:"is_deleted_by_sender" gorm:"default:false"`
 	IsDeletedByReceiver bool           `json:"is_deleted_by_receiver" gorm:"default:false"`

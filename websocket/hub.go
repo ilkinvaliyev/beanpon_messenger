@@ -223,7 +223,6 @@ func (h *Hub) SendToMultipleUsers(userIDs []uint, messageType string, data inter
 }
 
 // HandleNewMessage yeni mesajı handle et ve WebSocket üzerinden yayınla
-// HandleNewMessage fonksiyon imzasını güncelle
 func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, msgType string, createdAt time.Time, replyToMessageID *string) {
 	messageData := map[string]interface{}{
 		"id":                  messageID,
@@ -235,6 +234,24 @@ func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, ms
 		"read":                false,
 		"created_at":          createdAt.Format(time.RFC3339),
 		"is_history":          false,
+	}
+
+	if replyToMessageID != nil {
+		var replyMessage models.Message
+		if err := h.db.Where("id = ?", *replyToMessageID).First(&replyMessage).Error; err == nil {
+			replyDecryptedText, err := h.encryptionService.DecryptMessage(replyMessage.EncryptedText)
+			if err != nil {
+				replyDecryptedText = "Mesaj çözülemedi"
+			}
+
+			messageData["reply_to_message"] = map[string]interface{}{
+				"id":         replyMessage.ID,
+				"sender_id":  replyMessage.SenderID,
+				"text":       replyDecryptedText,
+				"type":       replyMessage.Type,
+				"created_at": replyMessage.CreatedAt,
+			}
+		}
 	}
 
 	// Hem gönderen hem de alıcıya gönder
@@ -349,33 +366,41 @@ func (h *Hub) sendRecentMessages(client *Client) {
 		SenderReaction   *string `json:"sender_reaction"`
 		ReceiverReaction *string `json:"receiver_reaction"`
 		CreatedAt        string  `json:"created_at"`
+		// YENİ: Reply mesajı bilgileri
+		ReplyToMessageText   *string `json:"reply_to_message_text"`
+		ReplyToMessageSender *uint   `json:"reply_to_message_sender"`
+		ReplyToMessageType   *string `json:"reply_to_message_type"`
+		ReplyToCreatedAt     *string `json:"reply_to_created_at"`
 	}
 
-	// ✅ Silinmiş mesajları user-ə görə filter et
 	query := `
-			SELECT 
-				id, 
-				sender_id, 
-				receiver_id,
-				reply_to_message_id,
-				encrypted_text as text,
-				read,
-				sender_reaction,
-				receiver_reaction,
-				created_at
-			FROM messages 
-			WHERE (sender_id = ? OR receiver_id = ?)
-			AND (
-				CASE 
-					WHEN sender_id = ? THEN is_deleted_by_sender = false
-					ELSE is_deleted_by_receiver = false
-				END
-			)
-			ORDER BY created_at ASC 
-			LIMIT 30
-		`
+        SELECT 
+            m.id, 
+            m.sender_id, 
+            m.receiver_id,
+            m.reply_to_message_id,
+            m.encrypted_text as text,
+            m.read,
+            m.sender_reaction,
+            m.receiver_reaction,
+            m.created_at,
+            reply.encrypted_text as reply_to_message_text,
+            reply.sender_id as reply_to_message_sender,
+            reply.type as reply_to_message_type,
+            reply.created_at as reply_to_created_at
+        FROM messages m
+        LEFT JOIN messages reply ON m.reply_to_message_id = reply.id
+        WHERE (m.sender_id = ? OR m.receiver_id = ?)
+        AND (
+            CASE 
+                WHEN m.sender_id = ? THEN m.is_deleted_by_sender = false
+                ELSE m.is_deleted_by_receiver = false
+            END
+        )
+        ORDER BY m.created_at ASC 
+        LIMIT 30
+    `
 
-	// 3 parameter lazım: client.UserID 3 dəfə
 	if err := h.db.Raw(query, client.UserID, client.UserID, client.UserID).Scan(&messages).Error; err != nil {
 		log.Printf("Son mesajlar alınamadı: %v", err)
 		return
@@ -386,28 +411,45 @@ func (h *Hub) sendRecentMessages(client *Client) {
 
 		decryptedText, err := h.encryptionService.DecryptMessage(msg.Text)
 		if err != nil {
-			log.Printf("Mesaj çözme hatası: %v", err)
 			decryptedText = "Mesaj çözülemedi"
 		}
 
-		messageData := &OutgoingMessage{
+		messageData := map[string]interface{}{
+			"id":                  msg.ID,
+			"sender_id":           msg.SenderID,
+			"receiver_id":         msg.ReceiverID,
+			"reply_to_message_id": msg.ReplyToMessageID,
+			"text":                decryptedText,
+			"read":                msg.Read,
+			"sender_reaction":     msg.SenderReaction,
+			"receiver_reaction":   msg.ReceiverReaction,
+			"created_at":          msg.CreatedAt,
+			"is_history":          true,
+		}
+
+		// Reply mesajı varsa ekle
+		if msg.ReplyToMessageID != nil && msg.ReplyToMessageText != nil {
+			replyDecryptedText, err := h.encryptionService.DecryptMessage(*msg.ReplyToMessageText)
+			if err != nil {
+				replyDecryptedText = "Mesaj çözülemedi"
+			}
+
+			messageData["reply_to_message"] = map[string]interface{}{
+				"id":         *msg.ReplyToMessageID,
+				"sender_id":  msg.ReplyToMessageSender,
+				"text":       replyDecryptedText,
+				"type":       msg.ReplyToMessageType,
+				"created_at": msg.ReplyToCreatedAt,
+			}
+		}
+
+		outgoingMessage := &OutgoingMessage{
 			Type: "history_message",
-			Data: map[string]interface{}{
-				"id":                  msg.ID,
-				"sender_id":           msg.SenderID,
-				"receiver_id":         msg.ReceiverID,
-				"reply_to_message_id": msg.ReplyToMessageID, // YENİ
-				"text":                decryptedText,
-				"read":                msg.Read,
-				"sender_reaction":     msg.SenderReaction,   // YENİ
-				"receiver_reaction":   msg.ReceiverReaction, // YENİ
-				"created_at":          msg.CreatedAt,
-				"is_history":          true,
-			},
+			Data: messageData,
 		}
 
 		select {
-		case client.Send <- h.messageToBytes(&Message{Type: messageData.Type, Data: messageData.Data}):
+		case client.Send <- h.messageToBytes(&Message{Type: outgoingMessage.Type, Data: outgoingMessage.Data}):
 		default:
 			log.Printf("Kullanıcı %d için mesaj geçmişi gönderilemedi", client.UserID)
 			return

@@ -154,32 +154,44 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 		return
 	}
 
-	// Sayfa parametreleri
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
 	offset := (page - 1) * limit
 
-	var messages []models.Message
+	// YENİ: LEFT JOIN ile reply mesajını da getir
+	var messages []struct {
+		models.Message
+		ReplyToMessageText   *string    `json:"reply_to_message_text"`
+		ReplyToMessageSender *uint      `json:"reply_to_message_sender"`
+		ReplyToMessageType   *string    `json:"reply_to_message_type"`
+		ReplyToCreatedAt     *time.Time `json:"reply_to_created_at"`
+	}
 
-	// 🆕 Silinmiş mesajları filter et - user'a görə
 	query := `
-		SELECT * FROM messages 
-		WHERE ((sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?))
-		AND (
-			CASE 
-				WHEN sender_id = ? THEN is_deleted_by_sender = false
-				ELSE is_deleted_by_receiver = false
-			END
-		)
-		ORDER BY created_at DESC 
-		LIMIT ? OFFSET ?
-	`
+        SELECT 
+            m.*,
+            reply.encrypted_text as reply_to_message_text,
+            reply.sender_id as reply_to_message_sender,
+            reply.type as reply_to_message_type,
+            reply.created_at as reply_to_created_at
+        FROM messages m
+        LEFT JOIN messages reply ON m.reply_to_message_id = reply.id
+        WHERE ((m.sender_id = ? AND m.receiver_id = ?) OR (m.sender_id = ? AND m.receiver_id = ?))
+        AND (
+            CASE 
+                WHEN m.sender_id = ? THEN m.is_deleted_by_sender = false
+                ELSE m.is_deleted_by_receiver = false
+            END
+        )
+        ORDER BY m.created_at DESC 
+        LIMIT ? OFFSET ?
+    `
 
 	err = database.DB.Raw(query,
 		userID, otherUserID, otherUserID, userID, // mesaj filtri
-		userID, // delete filtri üçün
+		userID, // delete filtri
 		limit, offset,
-	).Find(&messages).Error
+	).Scan(&messages).Error
 
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Mesajlar alınamadı"})
@@ -194,7 +206,7 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 			decryptedText = "Mesaj çözülemedi"
 		}
 
-		responseMessages = append(responseMessages, gin.H{
+		responseMessage := gin.H{
 			"id":                  msg.ID,
 			"sender_id":           msg.SenderID,
 			"receiver_id":         msg.ReceiverID,
@@ -205,14 +217,31 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 			"receiver_reaction":   msg.ReceiverReaction,
 			"created_at":          msg.CreatedAt,
 			"updated_at":          msg.UpdatedAt,
-		})
+		}
+
+		// Reply mesajı varsa ekle
+		if msg.ReplyToMessageID != nil && msg.ReplyToMessageText != nil {
+			replyDecryptedText, err := h.encryptionService.DecryptMessage(*msg.ReplyToMessageText)
+			if err != nil {
+				replyDecryptedText = "Mesaj çözülemedi"
+			}
+
+			responseMessage["reply_to_message"] = gin.H{
+				"id":         *msg.ReplyToMessageID,
+				"sender_id":  msg.ReplyToMessageSender,
+				"text":       replyDecryptedText,
+				"type":       msg.ReplyToMessageType,
+				"created_at": msg.ReplyToCreatedAt,
+			}
+		}
+
+		responseMessages = append(responseMessages, responseMessage)
 	}
 
-	// Okunmamış mesajları okundu olarak işaretle (sadece gelen mesajlar)
 	go h.markReceivedMessagesAsRead(userID.(uint), uint(otherUserID))
 
 	c.JSON(http.StatusOK, gin.H{
-		"data":      responseMessages, // "messages" deyil "data" olacaq
+		"data":      responseMessages,
 		"page":      page,
 		"limit":     limit,
 		"total":     len(responseMessages),
