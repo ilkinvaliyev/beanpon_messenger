@@ -140,8 +140,124 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 	})
 }
 
-// GetMessages belirli kullanıcı ile mesajları getir
 func (h *MessageHandler) GetMessages(c *gin.Context) {
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	otherUserID, err := strconv.ParseUint(c.Param("user_id"), 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz kullanıcı ID"})
+		return
+	}
+
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
+	offset := (page - 1) * limit
+
+	// YENİ: LEFT JOIN ile reply mesajını da getir
+	var messages []struct {
+		ID                   string    `gorm:"column:id"`
+		SenderID             uint      `gorm:"column:sender_id"`
+		ReceiverID           uint      `gorm:"column:receiver_id"`
+		ReplyToMessageID     *string   `gorm:"column:reply_to_message_id"`
+		EncryptedText        string    `gorm:"column:encrypted_text"`
+		Read                 bool      `gorm:"column:read"`
+		SenderReaction       *string   `gorm:"column:sender_reaction"`
+		ReceiverReaction     *string   `gorm:"column:receiver_reaction"`
+		CreatedAt            time.Time `gorm:"column:created_at"`
+		UpdatedAt            time.Time `gorm:"column:updated_at"`
+		ReplyToMessageText   *string   `gorm:"column:reply_to_message_text"`
+		ReplyToMessageSender *uint     `gorm:"column:reply_to_message_sender"`
+		//ReplyToMessageType   *string    `gorm:"column:reply_to_message_type"`
+		ReplyToCreatedAt *time.Time `gorm:"column:reply_to_created_at"`
+	}
+
+	query := `
+        SELECT 
+            m.*,
+            reply.encrypted_text as reply_to_message_text,
+            reply.sender_id as reply_to_message_sender,
+--             reply.type as reply_to_message_type,
+            reply.created_at as reply_to_created_at
+        FROM messages m
+        LEFT JOIN messages reply ON m.reply_to_message_id = reply.id
+        WHERE ((m.sender_id = ? AND m.receiver_id = ?) OR (m.sender_id = ? AND m.receiver_id = ?))
+        AND (
+            CASE 
+                WHEN m.sender_id = ? THEN m.is_deleted_by_sender = false
+                ELSE m.is_deleted_by_receiver = false
+            END
+        )
+        ORDER BY m.created_at DESC 
+        LIMIT ? OFFSET ?
+    `
+
+	err = database.DB.Raw(query,
+		userID, otherUserID, otherUserID, userID, // mesaj filtri
+		userID, // delete filtri
+		limit, offset,
+	).Scan(&messages).Error
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Mesajlar alınamadı"})
+		return
+	}
+
+	// Mesajları çöz ve response'a hazırla
+	var responseMessages []gin.H
+	for _, msg := range messages {
+		decryptedText, err := h.encryptionService.DecryptMessage(msg.EncryptedText)
+		if err != nil {
+			decryptedText = "Mesaj çözülemedi"
+		}
+
+		responseMessage := gin.H{
+			"id":                  msg.ID,
+			"sender_id":           msg.SenderID,
+			"receiver_id":         msg.ReceiverID,
+			"reply_to_message_id": msg.ReplyToMessageID,
+			"text":                decryptedText,
+			"read":                msg.Read,
+			"sender_reaction":     msg.SenderReaction,
+			"receiver_reaction":   msg.ReceiverReaction,
+			"created_at":          msg.CreatedAt,
+			"updated_at":          msg.UpdatedAt,
+		}
+
+		// Reply mesajı varsa ekle
+		if msg.ReplyToMessageID != nil && msg.ReplyToMessageText != nil {
+			replyDecryptedText, err := h.encryptionService.DecryptMessage(*msg.ReplyToMessageText)
+			if err != nil {
+				replyDecryptedText = "Mesaj çözülemedi"
+			}
+
+			responseMessage["reply_to_message"] = gin.H{
+				"id":         *msg.ReplyToMessageID,
+				"sender_id":  msg.ReplyToMessageSender,
+				"text":       replyDecryptedText,
+				"created_at": msg.ReplyToCreatedAt,
+			}
+		}
+
+		responseMessages = append(responseMessages, responseMessage)
+	}
+
+	go h.markReceivedMessagesAsRead(userID.(uint), uint(otherUserID))
+
+	c.JSON(http.StatusOK, gin.H{
+		"data":      responseMessages,
+		"page":      page,
+		"limit":     limit,
+		"total":     len(responseMessages),
+		"is_online": h.wsHub.IsUserOnline(uint(otherUserID)),
+	})
+}
+
+// GetMessages belirli kullanıcı ile mesajları getir
+func (h *MessageHandler) GetMessagesOld(c *gin.Context) {
 	userID, exists := c.Get("user_id")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
