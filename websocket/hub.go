@@ -232,7 +232,7 @@ func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, ms
 		"text":                content,
 		"type":                msgType,
 		"read":                false,
-		"created_at":          createdAt.Format(time.RFC3339),
+		"created_at":          createdAt.In(time.Local).Format(time.RFC3339),
 		"is_history":          false,
 	}
 
