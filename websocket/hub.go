@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"github.com/google/uuid"
-	"io"
 	"log"
 	"net/http"
 	"sync"
@@ -263,7 +262,7 @@ func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, ms
 	go h.SendUnreadCountUpdate(receiverID)
 
 	if !h.IsUserOnline(receiverID) {
-		h.sendPushNotification(senderID, receiverID, content, msgType)
+		go h.sendPushNotification(senderID, receiverID, content, msgType)
 	}
 
 	log.Printf("Yeni mesaj WebSocket üzerinden yayınlandı: %s -> %d", messageID, receiverID)
@@ -808,13 +807,59 @@ func (c *Client) writePump() {
 
 // sendPushNotification push notification göndər (async)
 func (h *Hub) sendPushNotification(senderID, receiverID uint, message, msgType string) {
-	//log.Printf("🔔 sendPushNotification çağrıldı: %d -> %d, message: %s", senderID, receiverID, message)
-
 	go func() {
-		//log.Printf("🔔 Goroutine başladı")
+		// Önce conversation'ı bulup mute kontrolü yap
+		var conversation models.Conversation
+		err := h.db.Where("(user1_id = ? AND user2_id = ?) OR (user1_id = ? AND user2_id = ?)",
+			senderID, receiverID, receiverID, senderID).First(&conversation).Error
 
+		if err != nil {
+			log.Printf("❌ Conversation bulunamadı, notification gönderilmiyor: %v", err)
+			return
+		}
+
+		// Receiver'ın mute durumunu kontrol et
+		var isMuted bool
+		var mutedUntil *time.Time
+
+		if conversation.User1ID == receiverID {
+			isMuted = conversation.User1Muted
+			mutedUntil = conversation.User1MutedUntil
+		} else {
+			isMuted = conversation.User2Muted
+			mutedUntil = conversation.User2MutedUntil
+		}
+
+		// Mute kontrolü
+		if isMuted {
+			// Eğer sürekli mute ise (MutedUntil == nil) notification gönderme
+			if mutedUntil == nil {
+				log.Printf("🔕 Kullanıcı %d sürekli mute, notification gönderilmiyor", receiverID)
+				return
+			}
+
+			// Eğer mute süresi henüz bitmemişse notification gönderme
+			if time.Now().Before(*mutedUntil) {
+				log.Printf("🔕 Kullanıcı %d mute (bitiş: %s), notification gönderilmiyor",
+					receiverID, mutedUntil.Format("15:04:05"))
+				return
+			}
+
+			// Mute süresi bitmiş, mute'u kaldır
+			if conversation.User1ID == receiverID {
+				conversation.User1Muted = false
+				conversation.User1MutedUntil = nil
+			} else {
+				conversation.User2Muted = false
+				conversation.User2MutedUntil = nil
+			}
+
+			h.db.Save(&conversation)
+			log.Printf("🔔 Kullanıcı %d mute süresi bittiği için mute kaldırıldı", receiverID)
+		}
+
+		// Mute değilse normal notification gönderme işlemi
 		url := h.config.BackendUrl + "/notification/new-message"
-		//log.Printf("🔔 URL: %s", url)
 
 		var notificationMessage string
 		switch msgType {
@@ -825,10 +870,9 @@ func (h *Hub) sendPushNotification(senderID, receiverID uint, message, msgType s
 		case "voice":
 			notificationMessage = "Voice"
 		default:
-			notificationMessage = message // Normal text mesaj
+			notificationMessage = message
 		}
 
-		// Config yoxlayın
 		if h.config.CloudToken == "" {
 			log.Printf("❌ CloudToken boş!")
 			return
@@ -841,18 +885,14 @@ func (h *Hub) sendPushNotification(senderID, receiverID uint, message, msgType s
 		payload := map[string]interface{}{
 			"receiver_id": receiverID,
 			"sender_id":   senderID,
-			"message":     notificationMessage, // Type'a göre ayarlanmış mesaj
+			"message":     notificationMessage,
 		}
-
-		//log.Printf("🔔 Payload: %+v", payload)
 
 		jsonData, err := json.Marshal(payload)
 		if err != nil {
 			log.Printf("❌ Notification payload marshal hatası: %v", err)
 			return
 		}
-
-		//log.Printf("🔔 JSON Data: %s", string(jsonData))
 
 		req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 		if err != nil {
@@ -863,27 +903,15 @@ func (h *Hub) sendPushNotification(senderID, receiverID uint, message, msgType s
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("x-api-key", h.config.CloudToken)
 
-		//log.Printf("🔔 Headers set edildi, CloudToken: %s", h.config.CloudToken[:10]+"...")
-
-		//log.Printf("🔔 HTTP request göndəriliyor...")
 		resp, err := h.httpClient.Do(req)
 		if err != nil {
 			log.Printf("❌ Push notification gönderme hatası: %v", err)
 			return
 		}
-		defer func(Body io.ReadCloser) {
-			err := Body.Close()
-			if err != nil {
-
-			}
-		}(resp.Body)
-
-		// Response body-ni oxuyun
-		//bodyBytes, _ := io.ReadAll(resp.Body)
-		//log.Printf("🔔 Response Status: %d, Body: %s", resp.StatusCode, string(bodyBytes))
+		defer resp.Body.Close()
 
 		if resp.StatusCode == 200 {
-			//log.Printf("✅ Push notification gönderildi: %d -> %d", senderID, receiverID)
+			log.Printf("✅ Push notification gönderildi: %d -> %d", senderID, receiverID)
 		} else {
 			log.Printf("❌ Push notification başarısız, status: %d", resp.StatusCode)
 		}
