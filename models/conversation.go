@@ -25,6 +25,8 @@ type Conversation struct {
 	User2Muted              bool           `json:"user2_muted" gorm:"default:false"`
 	User1MutedAt            *time.Time     `json:"user1_muted_at"`
 	User2MutedAt            *time.Time     `json:"user2_muted_at"`
+	User1MutedUntil         *time.Time     `json:"user1_muted_until"`
+	User2MutedUntil         *time.Time     `json:"user2_muted_until"`
 	User1Restricted         bool           `json:"user1_restricted" gorm:"default:false"`
 	User2Restricted         bool           `json:"user2_restricted" gorm:"default:false"`
 	RestrictionReason       *string        `json:"restriction_reason" gorm:"type:text"`

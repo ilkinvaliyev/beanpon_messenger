@@ -238,6 +238,15 @@ func (h *ConversationHandler) MuteConversation(c *gin.Context) {
 		return
 	}
 
+	var requestBody struct {
+		MuteDuration int `json:"muteDuration"` // dakika cinsinden
+	}
+
+	if err := c.ShouldBindJSON(&requestBody); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz request body"})
+		return
+	}
+
 	conversation, err := h.GetOrCreateConversation(userID.(uint), uint(otherUserID))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Conversation bulunamadı"})
@@ -250,9 +259,27 @@ func (h *ConversationHandler) MuteConversation(c *gin.Context) {
 	if userID.(uint) == conversation.User1ID {
 		conversation.User1Muted = true
 		conversation.User1MutedAt = &now
+
+		// MuteDuration kontrolü
+		if requestBody.MuteDuration > 0 {
+			mutedUntil := now.Add(time.Duration(requestBody.MuteDuration) * time.Minute)
+			conversation.User1MutedUntil = &mutedUntil
+		} else {
+			// Always mute (0 geldiyse null olsun)
+			conversation.User1MutedUntil = nil
+		}
 	} else {
 		conversation.User2Muted = true
 		conversation.User2MutedAt = &now
+
+		// MuteDuration kontrolü
+		if requestBody.MuteDuration > 0 {
+			mutedUntil := now.Add(time.Duration(requestBody.MuteDuration) * time.Minute)
+			conversation.User2MutedUntil = &mutedUntil
+		} else {
+			// Always mute (0 geldiyse null olsun)
+			conversation.User2MutedUntil = nil
+		}
 	}
 
 	if err := database.DB.Save(conversation).Error; err != nil {
@@ -260,10 +287,18 @@ func (h *ConversationHandler) MuteConversation(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
+	response := gin.H{
 		"message":  "Konuşma sessize alındı",
 		"muted_at": now,
-	})
+	}
+
+	// Eğer süre belirtilmişse response'a ekle
+	if requestBody.MuteDuration > 0 {
+		mutedUntil := now.Add(time.Duration(requestBody.MuteDuration) * time.Minute)
+		response["muted_until"] = mutedUntil
+	}
+
+	c.JSON(http.StatusOK, response)
 }
 
 // UnmuteConversation konuşma sesini aç
@@ -290,9 +325,11 @@ func (h *ConversationHandler) UnmuteConversation(c *gin.Context) {
 	if userID.(uint) == conversation.User1ID {
 		conversation.User1Muted = false
 		conversation.User1MutedAt = nil
+		conversation.User1MutedUntil = nil
 	} else {
 		conversation.User2Muted = false
 		conversation.User2MutedAt = nil
+		conversation.User2MutedUntil = nil
 	}
 
 	if err := database.DB.Save(conversation).Error; err != nil {
