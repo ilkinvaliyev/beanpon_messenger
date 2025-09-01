@@ -247,11 +247,34 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 
 	go h.markReceivedMessagesAsRead(userID.(uint), uint(otherUserID))
 
+	var totalCount int64
+	countQuery := `
+        SELECT COUNT(*) 
+        FROM messages 
+        WHERE ((sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?))
+        AND (
+            CASE 
+                WHEN sender_id = ? THEN is_deleted_by_sender = false
+                ELSE is_deleted_by_receiver = false
+            END
+        )
+    `
+
+	err = database.DB.Raw(countQuery,
+		userID, otherUserID, otherUserID, userID, // mesaj filtri
+		userID, // delete filtri
+	).Count(&totalCount).Error
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Toplam sayı alınamadı"})
+		return
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"data":      responseMessages,
 		"page":      page,
 		"limit":     limit,
-		"total":     len(responseMessages),
+		"total":     int(totalCount),
 		"is_online": h.wsHub.IsUserOnline(uint(otherUserID)),
 	})
 }
