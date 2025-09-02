@@ -108,6 +108,11 @@ func (h *ConversationHandler) updateFollowRelations(conversation *models.Convers
 
 // CanSendMessage kullanıcının mesaj gönderip gönderemeyeceğini kontrol et
 func (h *ConversationHandler) CanSendMessage(senderID, receiverID uint) (bool, string, error) {
+	// Block kontrolü
+	if models.IsBlocked(database.DB, senderID, receiverID) {
+		return false, "Bu kullanıcıya mesaj gönderemezsiniz", nil
+	}
+
 	conversation, err := h.GetOrCreateConversation(senderID, receiverID)
 	if err != nil {
 		return false, "Conversation kontrolü başarısız", err

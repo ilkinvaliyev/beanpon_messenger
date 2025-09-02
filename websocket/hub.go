@@ -637,6 +637,21 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 			return
 		}
 
+		// Block kontrolü ekle
+		if models.IsBlocked(c.Hub.db, c.UserID, receiverID) {
+			log.Printf("Blocked kullanıcı mesaj göndermeye çalışıyor: %d -> %d", c.UserID, receiverID)
+
+			// Client'a hata mesajı gönder
+			c.sendMessage(&OutgoingMessage{
+				Type: "message_error",
+				Data: map[string]interface{}{
+					"error": "Bu kullanıcıya mesaj gönderemezsiniz",
+					"code":  "USER_BLOCKED",
+				},
+			})
+			return
+		}
+
 		messageID := uuid.New().String()
 		createdAt := time.Now()
 

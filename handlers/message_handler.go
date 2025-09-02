@@ -70,6 +70,12 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 		return
 	}
 
+	// Block kontrolü ekle
+	if models.IsBlocked(database.DB, senderID.(uint), req.ReceiverID) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Bu kullanıcıya mesaj gönderemezsiniz"})
+		return
+	}
+
 	// Conversation kontrolü - mesaj gönderebilir mi?
 	conversationHandler := NewConversationHandler(h.wsHub, h.encryptionService)
 	canSend, reason, err := conversationHandler.CanSendMessage(senderID.(uint), req.ReceiverID)
