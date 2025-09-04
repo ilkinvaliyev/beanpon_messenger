@@ -26,10 +26,11 @@ var upgrader = websocket.Upgrader{
 
 // Client WebSocket bağlantısını temsil eder
 type Client struct {
-	UserID uint
-	Conn   *websocket.Conn
-	Send   chan []byte
-	Hub    *Hub
+	UserID         uint
+	Conn           *websocket.Conn
+	Send           chan []byte
+	Hub            *Hub
+	ActiveChatWith *uint
 }
 
 // Hub tüm client'ları yönetir
@@ -261,7 +262,15 @@ func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, ms
 
 	go h.SendUnreadCountUpdate(receiverID)
 
+	//if !h.IsUserOnline(receiverID) {
+	//	go h.sendPushNotification(senderID, receiverID, content, msgType)
+	//}
+
 	if !h.IsUserOnline(receiverID) {
+		// Offline ise push gönder
+		go h.sendPushNotification(senderID, receiverID, content, msgType)
+	} else if !h.IsUserInChatWith(receiverID, senderID) {
+		// Online ama bu chat'te değilse push gönder
 		go h.sendPushNotification(senderID, receiverID, content, msgType)
 	}
 
@@ -698,66 +707,6 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 		otherUserID := uint(otherUserIDFloat)
 		c.Hub.handleMarkRead(c.UserID, otherUserID)
 
-	case "call_offer":
-		if msg.ReceiverID > 0 {
-			c.Hub.SendToUser(msg.ReceiverID, "call_offer", map[string]interface{}{
-				"from":        c.UserID,
-				"receiver_id": msg.ReceiverID, // ✅ Bu satırı ekle
-				"data":        msg.Data,
-			})
-			log.Printf("📞 Call offer gönderildi: %d -> %d", c.UserID, msg.ReceiverID)
-		}
-
-	case "call_answer":
-		if msg.ReceiverID > 0 {
-			c.Hub.SendToUser(msg.ReceiverID, "call_answer", map[string]interface{}{
-				"from":        c.UserID,
-				"receiver_id": msg.ReceiverID, // ✅ Bu satırı ekle
-				"data":        msg.Data,
-			})
-			log.Printf("📞 Call answer gönderildi: %d -> %d", c.UserID, msg.ReceiverID)
-		}
-
-	case "ice_candidate":
-		if msg.ReceiverID > 0 {
-			c.Hub.SendToUser(msg.ReceiverID, "ice_candidate", map[string]interface{}{
-				"from":        c.UserID,
-				"receiver_id": msg.ReceiverID, // ✅ Bu satırı ekle
-				"data":        msg.Data,
-			})
-			log.Printf("🧊 ICE candidate gönderildi: %d -> %d", c.UserID, msg.ReceiverID)
-		}
-
-	case "call_end":
-		if msg.ReceiverID > 0 {
-			c.Hub.SendToUser(msg.ReceiverID, "call_end", map[string]interface{}{
-				"from":        c.UserID,
-				"receiver_id": msg.ReceiverID, // ✅ Bu satırı ekle
-				"data":        "Call ended",
-			})
-			log.Printf("📞 Call end gönderildi: %d -> %d", c.UserID, msg.ReceiverID)
-		}
-
-	case "call_reject":
-		if msg.ReceiverID > 0 {
-			c.Hub.SendToUser(msg.ReceiverID, "call_reject", map[string]interface{}{
-				"from":        c.UserID,
-				"receiver_id": msg.ReceiverID, // ✅ Bu satırı ekle
-				"data":        "Call rejected",
-			})
-			log.Printf("📞 Call reject gönderildi: %d -> %d", c.UserID, msg.ReceiverID)
-		}
-
-	case "call_busy":
-		if msg.ReceiverID > 0 {
-			c.Hub.SendToUser(msg.ReceiverID, "call_busy", map[string]interface{}{
-				"from":        c.UserID,
-				"receiver_id": msg.ReceiverID, // ✅ Bu satırı ekle
-				"data":        "User is busy",
-			})
-			log.Printf("📞 Call busy gönderildi: %d -> %d", c.UserID, msg.ReceiverID)
-		}
-
 	case "get_unread_count":
 		// ✅ YENİ: Client'ın talep ettiği durumda okunmamış sayıyı gönder
 		count := c.Hub.GetUnreadCount(c.UserID)
@@ -769,9 +718,52 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 		}
 		c.sendMessage(response)
 
+	case "chat_opened":
+		dataMap, ok := msg.Data.(map[string]interface{})
+		if !ok {
+			return
+		}
+
+		otherUserIDFloat, ok := dataMap["other_user_id"].(float64)
+		if !ok {
+			return
+		}
+
+		otherUserID := uint(otherUserIDFloat)
+		c.Hub.SetActiveChat(c.UserID, &otherUserID)
+
+	case "chat_closed":
+		c.Hub.SetActiveChat(c.UserID, nil)
+
 	default:
 		log.Printf("Bilinmeyen mesaj tipi: %s", msg.Type)
 	}
+}
+
+func (h *Hub) SetActiveChat(userID uint, chatWithUserID *uint) {
+	h.mutex.Lock()
+	defer h.mutex.Unlock()
+
+	if client, exists := h.clients[userID]; exists {
+		client.ActiveChatWith = chatWithUserID
+
+		if chatWithUserID != nil {
+			log.Printf("Kullanıcı %d aktif chat: %d", userID, *chatWithUserID)
+		} else {
+			log.Printf("Kullanıcı %d chat'ten çıktı", userID)
+		}
+	}
+}
+
+// IsUserInChatWith kontrol fonksiyonu
+func (h *Hub) IsUserInChatWith(userID, otherUserID uint) bool {
+	h.mutex.RLock()
+	defer h.mutex.RUnlock()
+
+	if client, exists := h.clients[userID]; exists {
+		return client.ActiveChatWith != nil && *client.ActiveChatWith == otherUserID
+	}
+	return false
 }
 
 // sendMessage client'a mesaj gönder
@@ -794,15 +786,24 @@ func (c *Client) writePump() {
 	ticker := time.NewTicker(54 * time.Second)
 	defer func() {
 		ticker.Stop()
-		c.Conn.Close()
+		err := c.Conn.Close()
+		if err != nil {
+			return
+		}
 	}()
 
 	for {
 		select {
 		case message, ok := <-c.Send:
-			c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			err := c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err != nil {
+				return
+			}
 			if !ok {
-				c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
+				err := c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
+				if err != nil {
+					return
+				}
 				return
 			}
 
@@ -812,7 +813,10 @@ func (c *Client) writePump() {
 			}
 
 		case <-ticker.C:
-			c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			err := c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err != nil {
+				return
+			}
 			if err := c.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				return
 			}
