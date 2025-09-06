@@ -11,6 +11,7 @@ type Message struct {
 	ID               string  `json:"id" gorm:"type:uuid;primary_key"`
 	SenderID         uint    `json:"sender_id" gorm:"not null;index"`
 	ReceiverID       uint    `json:"receiver_id" gorm:"not null;index"`
+	StoryID          *uint   `json:"story_id" gorm:"index"` // BU SATIRI EKLE
 	ReplyToMessageID *string `json:"reply_to_message_id" gorm:"type:uuid;index"`
 	EncryptedText    string  `json:"encrypted_text" gorm:"type:text;not null"`
 	EncryptedAESKey  *string `json:"encrypted_aes_key" gorm:"type:text"`

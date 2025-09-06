@@ -223,11 +223,12 @@ func (h *Hub) SendToMultipleUsers(userIDs []uint, messageType string, data inter
 }
 
 // HandleNewMessage yeni mesajı handle et ve WebSocket üzerinden yayınla
-func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, msgType string, createdAt time.Time, replyToMessageID *string) {
+func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, msgType string, createdAt time.Time, replyToMessageID *string, storyID *uint) {
 	messageData := map[string]interface{}{
 		"id":                  messageID,
 		"sender_id":           senderID,
 		"receiver_id":         receiverID,
+		"story_id":            storyID,
 		"reply_to_message_id": replyToMessageID, // YENİ
 		"text":                content,
 		"type":                msgType,
@@ -613,7 +614,6 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 
 		c.Hub.handleRemoveReaction(c.UserID, messageID)
 	case "send_message":
-		// Mevcut kodu güncelle - reply desteği ekle
 		dataMap, ok := msg.Data.(map[string]interface{})
 		if !ok {
 			log.Printf("Mesaj data parse edilemedi")
@@ -629,6 +629,7 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 
 		receiverID := uint(receiverIDFloat)
 		var replyToMessageID *string
+		var storyID *uint // YENİ EKLENEN
 		var msgType string
 
 		// Reply kontrolü
@@ -636,21 +637,25 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 			replyToMessageID = &replyID
 		}
 
+		// Story ID kontrolü - YENİ EKLENEN
+		if storyIDFloat, exists := dataMap["story_id"].(float64); exists && storyIDFloat > 0 {
+			storyIDUint := uint(storyIDFloat)
+			storyID = &storyIDUint
+		}
+
 		if typeStr, exists := dataMap["type"].(string); exists {
 			msgType = typeStr
 		} else {
-			msgType = "text" // Default type
+			msgType = "text"
 		}
 
 		if receiverID == 0 || content == "" {
 			return
 		}
 
-		// Block kontrolü ekle
+		// Block kontrolü
 		if models.IsBlocked(c.Hub.db, c.UserID, receiverID) {
 			log.Printf("Blocked kullanıcı mesaj göndermeye çalışıyor: %d -> %d", c.UserID, receiverID)
-
-			// Client'a hata mesajı gönder
 			c.sendMessage(&OutgoingMessage{
 				Type: "message_error",
 				Data: map[string]interface{}{
@@ -664,7 +669,8 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 		messageID := uuid.New().String()
 		createdAt := time.Now()
 
-		c.Hub.HandleNewMessage(c.UserID, receiverID, messageID, content, msgType, createdAt, replyToMessageID)
+		// HandleNewMessage'a storyID'yi de ekle
+		c.Hub.HandleNewMessage(c.UserID, receiverID, messageID, content, msgType, createdAt, replyToMessageID, storyID)
 
 		// DB yazma
 		go func() {
@@ -678,6 +684,7 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 				ID:               messageID,
 				SenderID:         c.UserID,
 				ReceiverID:       receiverID,
+				StoryID:          storyID, // YENİ EKLENEN
 				ReplyToMessageID: replyToMessageID,
 				EncryptedText:    encryptedText,
 				Read:             false,

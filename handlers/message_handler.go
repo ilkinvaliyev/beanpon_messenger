@@ -21,7 +21,7 @@ type MessageHandler struct {
 		DecryptMessage(encryptedText string) (string, error)
 	}
 	wsHub interface {
-		HandleNewMessage(senderID, receiverID uint, messageID, content, msgType string, createdAt time.Time, replyToMessageID *string) // Güncellendi
+		HandleNewMessage(senderID, receiverID uint, messageID, content, msgType string, createdAt time.Time, replyToMessageID *string, storyID *uint) // Güncellendi
 		HandleMessageRead(messageID string, senderID, readerID uint)
 		IsUserOnline(userID uint) bool
 		SendToUser(userID uint, messageType string, data interface{})
@@ -32,7 +32,7 @@ func NewMessageHandler(encryptionService interface {
 	EncryptMessage(plainText string) (string, error)
 	DecryptMessage(encryptedText string) (string, error)
 }, wsHub interface {
-	HandleNewMessage(senderID, receiverID uint, messageID, content, msgType string, createdAt time.Time, replyToMessageID *string) // Güncellendi
+	HandleNewMessage(senderID, receiverID uint, messageID, content, msgType string, createdAt time.Time, replyToMessageID *string, storyID *uint) // Güncellendi
 	HandleMessageRead(messageID string, senderID, readerID uint)
 	IsUserOnline(userID uint) bool
 	SendToUser(userID uint, messageType string, data interface{})
@@ -56,6 +56,7 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 		ReceiverID       uint    `json:"receiver_id" binding:"required"`
 		Text             string  `json:"text" binding:"required"`
 		Type             string  `json:"type,omitempty"`
+		StoryID          *uint   `json:"story_id,omitempty"` // BU SATIRI EKLE
 		ReplyToMessageID *string `json:"reply_to_message_id,omitempty"`
 	}
 
@@ -96,6 +97,25 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 		return
 	}
 
+	if req.StoryID != nil {
+		var story models.Story
+		err := database.DB.Where("id = ?", *req.StoryID).First(&story).Error
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Story bulunamadı"})
+			return
+		}
+
+		if story.UserID != req.ReceiverID {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Story ve alıcı uyuşmuyor"})
+			return
+		}
+
+		if story.UserID == senderID.(uint) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Kendi story'nize mesaj gönderemezsiniz"})
+			return
+		}
+	}
+
 	// Veritabanına kaydet
 	message := models.Message{
 		ID:               uuid.New().String(),
@@ -128,6 +148,7 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 		req.Type,
 		message.CreatedAt,
 		req.ReplyToMessageID, // YENİ parametre
+		req.StoryID,
 	)
 
 	// API response
