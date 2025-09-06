@@ -123,6 +123,7 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 		ReceiverID:       req.ReceiverID,
 		EncryptedText:    encryptedText,
 		ReplyToMessageID: req.ReplyToMessageID,
+		StoryID:          req.StoryID,
 		Read:             false,
 		CreatedAt:        time.Now(),
 		UpdatedAt:        time.Now(),
