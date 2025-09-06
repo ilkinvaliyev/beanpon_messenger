@@ -3,6 +3,7 @@ package websocket
 import (
 	"beanpon_messenger/config"
 	"beanpon_messenger/models"
+	"beanpon_messenger/utils"
 	"bytes"
 	"encoding/json"
 	"github.com/google/uuid"
@@ -223,13 +224,14 @@ func (h *Hub) SendToMultipleUsers(userIDs []uint, messageType string, data inter
 }
 
 // HandleNewMessage yeni mesajı handle et ve WebSocket üzerinden yayınla
+// HandleNewMessage yeni mesajı handle et ve WebSocket üzerinden yayınla
 func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, msgType string, createdAt time.Time, replyToMessageID *string, storyID *uint) {
 	messageData := map[string]interface{}{
 		"id":                  messageID,
 		"sender_id":           senderID,
 		"receiver_id":         receiverID,
-		"story_id":            storyID,
-		"reply_to_message_id": replyToMessageID, // YENİ
+		"story_id":            storyID, // YENİ ALAN
+		"reply_to_message_id": replyToMessageID,
 		"text":                content,
 		"type":                msgType,
 		"read":                false,
@@ -237,6 +239,7 @@ func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, ms
 		"is_history":          false,
 	}
 
+	// Reply mesajı kontrolü (mevcut kod aynı...)
 	if replyToMessageID != nil {
 		var replyMessage models.Message
 		if err := h.db.Where("id = ?", *replyToMessageID).First(&replyMessage).Error; err == nil {
@@ -246,11 +249,44 @@ func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, ms
 			}
 
 			messageData["reply_to_message"] = map[string]interface{}{
-				"id":        replyMessage.ID,
-				"sender_id": replyMessage.SenderID,
-				"text":      replyDecryptedText,
-				//"type":       replyMessage.Type,
+				"id":         replyMessage.ID,
+				"sender_id":  replyMessage.SenderID,
+				"text":       replyDecryptedText,
 				"created_at": replyMessage.CreatedAt,
+			}
+		}
+	}
+
+	// Story bilgisi kontrolü kısmını bununla değiştir:
+	if storyID != nil {
+		var story models.Story
+		if err := h.db.Where("id = ?", *storyID).First(&story).Error; err == nil {
+			storyResponse := map[string]interface{}{
+				"id":         story.ID,
+				"type":       story.Type,
+				"media_url":  utils.PrependBaseURL(&story.MediaURL), // PrependBaseURL ekle
+				"content":    story.Content,
+				"user_id":    story.UserID,
+				"created_at": story.CreatedAt,
+				"available":  true,
+			}
+
+			// Video ise ve metadata varsa thumbnail kontrolü
+			if story.Type == "video" && story.MediaMetadata != nil {
+				var metadata map[string]interface{}
+				if err := json.Unmarshal([]byte(*story.MediaMetadata), &metadata); err == nil {
+					if thumbnailURL, exists := metadata["thumbnail_url"].(string); exists && thumbnailURL != "" {
+						storyResponse["thumbnail_url"] = utils.PrependBaseURL(&thumbnailURL)
+					}
+				}
+			}
+
+			messageData["story"] = storyResponse
+		} else {
+			messageData["story"] = map[string]interface{}{
+				"id":        *storyID,
+				"available": false,
+				"message":   "Bu story artık mevcut değil",
 			}
 		}
 	}
@@ -263,19 +299,13 @@ func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, ms
 
 	go h.SendUnreadCountUpdate(receiverID)
 
-	//if !h.IsUserOnline(receiverID) {
-	//	go h.sendPushNotification(senderID, receiverID, content, msgType)
-	//}
-
+	// Push notification kontrolü
 	if !h.IsUserOnline(receiverID) {
-		// Offline ise push gönder
 		go h.sendPushNotification(senderID, receiverID, content, msgType)
 	} else if !h.IsUserInChatWith(receiverID, senderID) {
-		// Online ama bu chat'te değilse push gönder
 		go h.sendPushNotification(senderID, receiverID, content, msgType)
 	}
 
-	log.Printf("Yeni mesaj WebSocket üzerinden yayınlandı: %s -> %d", messageID, receiverID)
 }
 
 // Bu yeni fonksiyonu ekle
@@ -364,22 +394,30 @@ func (h *Hub) messageToBytes(message *Message) []byte {
 }
 
 // sendRecentMessages kullanıcıya son 30 mesajı gönder
+// sendRecentMessages kullanıcıya son 30 mesajı gönder
 func (h *Hub) sendRecentMessages(client *Client) {
 	var messages []struct {
 		ID               string  `json:"id"`
 		SenderID         uint    `json:"sender_id"`
 		ReceiverID       uint    `json:"receiver_id"`
+		StoryID          *uint   `json:"story_id"` // YENİ ALAN
 		ReplyToMessageID *string `json:"reply_to_message_id"`
 		Text             string  `json:"text"`
 		Read             bool    `json:"read"`
 		SenderReaction   *string `json:"sender_reaction"`
 		ReceiverReaction *string `json:"receiver_reaction"`
 		CreatedAt        string  `json:"created_at"`
-		// YENİ: Reply mesajı bilgileri
+		// Reply mesajı bilgileri
 		ReplyToMessageText   *string `json:"reply_to_message_text"`
 		ReplyToMessageSender *uint   `json:"reply_to_message_sender"`
 		ReplyToMessageType   *string `json:"reply_to_message_type"`
 		ReplyToCreatedAt     *string `json:"reply_to_created_at"`
+		// Story bilgileri
+		StoryType      *string `json:"story_type"`
+		StoryMediaURL  *string `json:"story_media_url"`
+		StoryContent   *string `json:"story_content"`
+		StoryUserID    *uint   `json:"story_user_id"`
+		StoryCreatedAt *string `json:"story_created_at"`
 	}
 
 	query := `
@@ -387,6 +425,7 @@ func (h *Hub) sendRecentMessages(client *Client) {
             m.id, 
             m.sender_id, 
             m.receiver_id,
+            m.story_id,
             m.reply_to_message_id,
             m.encrypted_text as text,
             m.read,
@@ -396,9 +435,15 @@ func (h *Hub) sendRecentMessages(client *Client) {
             reply.encrypted_text as reply_to_message_text,
             reply.sender_id as reply_to_message_sender,
             reply.type as reply_to_message_type,
-            reply.created_at as reply_to_created_at
+            reply.created_at as reply_to_created_at,
+            s.type as story_type,
+            s.media_url as story_media_url,
+            s.content as story_content,
+            s.user_id as story_user_id,
+            s.created_at as story_created_at
         FROM messages m
         LEFT JOIN messages reply ON m.reply_to_message_id = reply.id
+        LEFT JOIN stories s ON m.story_id = s.id
         WHERE (m.sender_id = ? OR m.receiver_id = ?)
         AND (
             CASE 
@@ -427,6 +472,7 @@ func (h *Hub) sendRecentMessages(client *Client) {
 			"id":                  msg.ID,
 			"sender_id":           msg.SenderID,
 			"receiver_id":         msg.ReceiverID,
+			"story_id":            msg.StoryID, // YENİ ALAN
 			"reply_to_message_id": msg.ReplyToMessageID,
 			"text":                decryptedText,
 			"read":                msg.Read,
@@ -436,7 +482,30 @@ func (h *Hub) sendRecentMessages(client *Client) {
 			"is_history":          true,
 		}
 
-		// Reply mesajı varsa ekle
+		// Story bilgisi varsa ekle
+		if msg.StoryID != nil {
+			if msg.StoryType != nil {
+				// Story hala mevcut
+				messageData["story"] = map[string]interface{}{
+					"id":         *msg.StoryID,
+					"type":       *msg.StoryType,
+					"media_url":  msg.StoryMediaURL,
+					"content":    msg.StoryContent,
+					"user_id":    *msg.StoryUserID,
+					"created_at": msg.StoryCreatedAt,
+					"available":  true,
+				}
+			} else {
+				// Story silinmiş veya erişilemiyor
+				messageData["story"] = map[string]interface{}{
+					"id":        *msg.StoryID,
+					"available": false,
+					"message":   "Bu story artık mevcut değil",
+				}
+			}
+		}
+
+		// Reply mesajı varsa ekle (mevcut kod aynı...)
 		if msg.ReplyToMessageID != nil && msg.ReplyToMessageText != nil {
 			replyDecryptedText, err := h.encryptionService.DecryptMessage(*msg.ReplyToMessageText)
 			if err != nil {

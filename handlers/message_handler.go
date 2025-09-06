@@ -4,6 +4,7 @@ import (
 	"beanpon_messenger/database"
 	"beanpon_messenger/models"
 	"beanpon_messenger/utils"
+	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
@@ -185,22 +186,29 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
 	offset := (page - 1) * limit
 
-	// YENİ: LEFT JOIN ile reply mesajını da getir
+	// Story bilgisi de dahil edilmiş struct
 	var messages []struct {
-		ID                   string    `gorm:"column:id"`
-		SenderID             uint      `gorm:"column:sender_id"`
-		ReceiverID           uint      `gorm:"column:receiver_id"`
-		ReplyToMessageID     *string   `gorm:"column:reply_to_message_id"`
-		EncryptedText        string    `gorm:"column:encrypted_text"`
-		Read                 bool      `gorm:"column:read"`
-		SenderReaction       *string   `gorm:"column:sender_reaction"`
-		ReceiverReaction     *string   `gorm:"column:receiver_reaction"`
-		CreatedAt            time.Time `gorm:"column:created_at"`
-		UpdatedAt            time.Time `gorm:"column:updated_at"`
-		ReplyToMessageText   *string   `gorm:"column:reply_to_message_text"`
-		ReplyToMessageSender *uint     `gorm:"column:reply_to_message_sender"`
-		//ReplyToMessageType   *string    `gorm:"column:reply_to_message_type"`
-		ReplyToCreatedAt *time.Time `gorm:"column:reply_to_created_at"`
+		ID                   string     `gorm:"column:id"`
+		SenderID             uint       `gorm:"column:sender_id"`
+		ReceiverID           uint       `gorm:"column:receiver_id"`
+		StoryID              *uint      `gorm:"column:story_id"`       // YENİ ALAN
+		StoryMetadata        *string    `gorm:"column:story_metadata"` // BU SATIRI EKLE
+		ReplyToMessageID     *string    `gorm:"column:reply_to_message_id"`
+		EncryptedText        string     `gorm:"column:encrypted_text"`
+		Read                 bool       `gorm:"column:read"`
+		SenderReaction       *string    `gorm:"column:sender_reaction"`
+		ReceiverReaction     *string    `gorm:"column:receiver_reaction"`
+		CreatedAt            time.Time  `gorm:"column:created_at"`
+		UpdatedAt            time.Time  `gorm:"column:updated_at"`
+		ReplyToMessageText   *string    `gorm:"column:reply_to_message_text"`
+		ReplyToMessageSender *uint      `gorm:"column:reply_to_message_sender"`
+		ReplyToCreatedAt     *time.Time `gorm:"column:reply_to_created_at"`
+		// Story bilgileri
+		StoryType      *string    `gorm:"column:story_type"`
+		StoryMediaURL  *string    `gorm:"column:story_media_url"`
+		StoryContent   *string    `gorm:"column:story_content"`
+		StoryUserID    *uint      `gorm:"column:story_user_id"`
+		StoryCreatedAt *time.Time `gorm:"column:story_created_at"`
 	}
 
 	query := `
@@ -208,10 +216,16 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
             m.*,
             reply.encrypted_text as reply_to_message_text,
             reply.sender_id as reply_to_message_sender,
---             reply.type as reply_to_message_type,
-            reply.created_at as reply_to_created_at
+            reply.created_at as reply_to_created_at,
+            s.type as story_type,
+            s.media_url as story_media_url,
+            s.content as story_content,
+            s.media_metadata as story_metadata,
+            s.user_id as story_user_id,
+            s.created_at as story_created_at
         FROM messages m
         LEFT JOIN messages reply ON m.reply_to_message_id = reply.id
+        LEFT JOIN stories s ON m.story_id = s.id
         WHERE ((m.sender_id = ? AND m.receiver_id = ?) OR (m.sender_id = ? AND m.receiver_id = ?))
         AND (
             CASE 
@@ -246,6 +260,7 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 			"id":                  msg.ID,
 			"sender_id":           msg.SenderID,
 			"receiver_id":         msg.ReceiverID,
+			"story_id":            msg.StoryID, // YENİ ALAN
 			"reply_to_message_id": msg.ReplyToMessageID,
 			"text":                decryptedText,
 			"read":                msg.Read,
@@ -255,7 +270,42 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 			"updated_at":          msg.UpdatedAt,
 		}
 
-		// Reply mesajı varsa ekle
+		// Story bilgisi varsa ekle
+		if msg.StoryID != nil {
+			if msg.StoryType != nil {
+				// Story hala mevcut
+				storyResponse := gin.H{
+					"id":         *msg.StoryID,
+					"type":       *msg.StoryType,
+					"media_url":  utils.PrependBaseURL(msg.StoryMediaURL), // PrependBaseURL ekle
+					"content":    msg.StoryContent,
+					"user_id":    *msg.StoryUserID,
+					"created_at": msg.StoryCreatedAt,
+					"available":  true,
+				}
+
+				// Video ise ve metadata varsa thumbnail kontrolü
+				if *msg.StoryType == "video" && msg.StoryMetadata != nil {
+					var metadata map[string]interface{}
+					if err := json.Unmarshal([]byte(*msg.StoryMetadata), &metadata); err == nil {
+						if thumbnailURL, exists := metadata["thumbnail_url"].(string); exists && thumbnailURL != "" {
+							storyResponse["thumbnail_url"] = utils.PrependBaseURL(&thumbnailURL)
+						}
+					}
+				}
+
+				responseMessage["story"] = storyResponse
+			} else {
+				// Story silinmiş veya erişilemiyor
+				responseMessage["story"] = gin.H{
+					"id":        *msg.StoryID,
+					"available": false,
+					"message":   "Bu story artık mevcut değil",
+				}
+			}
+		}
+
+		// Reply mesajı varsa ekle (mevcut kod aynı...)
 		if msg.ReplyToMessageID != nil && msg.ReplyToMessageText != nil {
 			replyDecryptedText, err := h.encryptionService.DecryptMessage(*msg.ReplyToMessageText)
 			if err != nil {
@@ -275,6 +325,7 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 
 	go h.markReceivedMessagesAsRead(userID.(uint), uint(otherUserID))
 
+	// Count query'yi de güncelle
 	var totalCount int64
 	countQuery := `
         SELECT COUNT(*) 
@@ -289,8 +340,8 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
     `
 
 	err = database.DB.Raw(countQuery,
-		userID, otherUserID, otherUserID, userID, // mesaj filtri
-		userID, // delete filtri
+		userID, otherUserID, otherUserID, userID,
+		userID,
 	).Count(&totalCount).Error
 
 	if err != nil {
