@@ -126,8 +126,8 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 		ReplyToMessageID: req.ReplyToMessageID,
 		StoryID:          req.StoryID,
 		Read:             false,
-		CreatedAt:        time.Now(),
-		UpdatedAt:        time.Now(),
+		CreatedAt:        time.Now().UTC(),
+		UpdatedAt:        time.Now().UTC(),
 	}
 
 	if err := database.DB.Create(&message).Error; err != nil {
@@ -499,7 +499,7 @@ func (h *MessageHandler) MarkAsRead(c *gin.Context) {
 
 	// Okundu olarak işaretle
 	message.Read = true
-	message.UpdatedAt = time.Now()
+	message.UpdatedAt = time.Now().UTC()
 
 	if err := database.DB.Save(&message).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Mesaj güncellenemedi"})
@@ -788,7 +788,7 @@ func (h *MessageHandler) DeleteMessage(c *gin.Context) {
 		return
 	}
 
-	now := time.Now()
+	now := time.Now().UTC()
 
 	// Silmə növünə görə işləmə
 	switch body.DeleteType {
@@ -864,7 +864,7 @@ func (h *MessageHandler) ClearConversation(c *gin.Context) {
 		return
 	}
 
-	now := time.Now()
+	now := time.Now().UTC()
 	tx := database.DB.Begin()
 	if tx.Error != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Transaction açılamadı"})
@@ -972,7 +972,7 @@ func (h *MessageHandler) ClearAllMyMessages(c *gin.Context) {
 		return
 	}
 
-	now := time.Now()
+	now := time.Now().UTC()
 	tx := database.DB.Begin()
 	if tx.Error != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Transaction açılamadı"})

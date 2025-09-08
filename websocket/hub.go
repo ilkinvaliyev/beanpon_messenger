@@ -235,7 +235,7 @@ func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, ms
 		"text":                content,
 		"type":                msgType,
 		"read":                false,
-		"created_at":          createdAt.In(time.Local).Format(time.RFC3339),
+		"created_at":          createdAt.UTC().Format(time.RFC3339),
 		"is_history":          false,
 	}
 
@@ -341,7 +341,7 @@ func (h *Hub) HandleMessageRead(messageID string, senderID, readerID uint) {
 	readData := map[string]interface{}{
 		"message_id": messageID,
 		"reader_id":  readerID,
-		"read_at":    time.Now(),
+		"read_at":    time.Now().UTC(),
 	}
 
 	// Sadece gönderene bildir (alıcı zaten okudu)
@@ -586,9 +586,15 @@ func (c *Client) readPump() {
 	}()
 
 	// Ping/Pong setup
-	c.Conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	err := c.Conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	if err != nil {
+		return
+	}
 	c.Conn.SetPongHandler(func(string) error {
-		c.Conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		err := c.Conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		if err != nil {
+			return err
+		}
 		return nil
 	})
 
@@ -1065,7 +1071,7 @@ func (h *Hub) handleAddReaction(userID uint, messageID, emoji string) {
 		message.ReceiverReaction = &emoji
 	}
 
-	message.UpdatedAt = time.Now()
+	message.UpdatedAt = time.Now().UTC()
 
 	if err := h.db.Save(&message).Error; err != nil {
 		log.Printf("Reaction kaydedilemedi: %v", err)
@@ -1105,7 +1111,7 @@ func (h *Hub) handleRemoveReaction(userID uint, messageID string) {
 		message.ReceiverReaction = nil
 	}
 
-	message.UpdatedAt = time.Now()
+	message.UpdatedAt = time.Now().UTC()
 
 	if err := h.db.Save(&message).Error; err != nil {
 		log.Printf("Reaction kaldırılamadı: %v", err)
