@@ -534,6 +534,7 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 		LastMessageText    string    `json:"last_message_text"`
 		LastMessageTime    time.Time `json:"last_message_time"`
 		IsLastFromMe       bool      `json:"is_last_from_me"`
+		LastMessageRead    *bool     `json:"last_message_read"` // Yeni eklendi
 		UnreadCount        int       `json:"unread_count"`
 		ConversationStatus string    `json:"conversation_status"`
 
@@ -564,6 +565,7 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
             encrypted_text,
             created_at,
             sender_id = ? as is_from_me,
+            read,  -- read durumunu da seçiyoruz
             ROW_NUMBER() OVER (
                 PARTITION BY CASE WHEN sender_id = ? THEN receiver_id ELSE sender_id END 
                 ORDER BY created_at DESC
@@ -592,6 +594,10 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
         lm.encrypted_text as last_message_text,
         lm.created_at as last_message_time,
         lm.is_from_me,
+        CASE 
+            WHEN lm.is_from_me = true THEN lm.read
+            ELSE NULL
+        END as last_message_read,  -- Sadece kendi mesajlarımız için read durumu
         COALESCE(uc.unread_count, 0) as unread_count,
         COALESCE(conv.status, 'active') as conversation_status,
         conv.id as conversation_id,
@@ -703,6 +709,7 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 			"last_message_text":   decryptedText,
 			"last_message_time":   conv.LastMessageTime,
 			"is_last_from_me":     conv.IsLastFromMe,
+			"last_message_read":   conv.LastMessageRead, // Yeni eklendi
 			"unread_count":        conv.UnreadCount,
 			"is_online":           h.wsHub.IsUserOnline(conv.OtherUserID),
 
