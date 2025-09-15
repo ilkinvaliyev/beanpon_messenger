@@ -548,10 +548,11 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 		IsOtherRestricted  *bool `json:"is_other_restricted"`
 		MaxPendingMessages *int  `json:"max_pending_messages"`
 
-		OtherUserName     string  `json:"other_user_name"`
-		OtherUserUsername string  `json:"other_user_username"`
-		AccountTypeID     int     `json:"account_type_id"`
-		ProfileImage      *string `json:"profile_image"`
+		OtherUserName       string  `json:"other_user_name"`
+		OtherUserUsername   string  `json:"other_user_username"`
+		OtherUserIsVerified bool    `json:"other_user_is_verified"`
+		AccountTypeID       int     `json:"account_type_id"`
+		ProfileImage        *string `json:"profile_image"`
 	}
 
 	query := `
@@ -635,6 +636,7 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
         u.name as other_user_name,
         u.username as other_user_username,
         u.account_type_id,
+        u.is_verified as other_user_is_verified,
         p.profile_image
     FROM latest_messages lm
     LEFT JOIN unread_counts uc ON lm.other_user_id = uc.other_user_id
@@ -700,18 +702,19 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 		isMutedByMe := conv.AmIMuted != nil && *conv.AmIMuted
 
 		responseData := gin.H{
-			"other_user_id":       conv.OtherUserID,
-			"other_user_name":     conv.OtherUserName,
-			"other_user_username": conv.OtherUserUsername,
-			"account_type_id":     conv.AccountTypeID,
-			"profile_image":       utils.PrependBaseURL(conv.ProfileImage),
-			"last_message_id":     conv.LastMessageID,
-			"last_message_text":   decryptedText,
-			"last_message_time":   conv.LastMessageTime,
-			"is_last_from_me":     conv.IsLastFromMe,
-			"last_message_read":   conv.LastMessageRead, // Yeni eklendi
-			"unread_count":        conv.UnreadCount,
-			"is_online":           h.wsHub.IsUserOnline(conv.OtherUserID),
+			"other_user_id":          conv.OtherUserID,
+			"other_user_name":        conv.OtherUserName,
+			"other_user_username":    conv.OtherUserUsername,
+			"other_user_is_verified": conv.OtherUserIsVerified,
+			"account_type_id":        conv.AccountTypeID,
+			"profile_image":          utils.PrependBaseURL(conv.ProfileImage),
+			"last_message_id":        conv.LastMessageID,
+			"last_message_text":      decryptedText,
+			"last_message_time":      conv.LastMessageTime,
+			"is_last_from_me":        conv.IsLastFromMe,
+			"last_message_read":      conv.LastMessageRead, // Yeni eklendi
+			"unread_count":           conv.UnreadCount,
+			"is_online":              h.wsHub.IsUserOnline(conv.OtherUserID),
 
 			// Conversation durumu (eski uyumluluk için)
 			"conversation_active": conversationActive,
