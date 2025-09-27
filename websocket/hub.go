@@ -264,7 +264,7 @@ func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, ms
 			storyResponse := map[string]interface{}{
 				"id":         story.ID,
 				"type":       story.Type,
-				"media_url":  utils.PrependBaseURL(&story.MediaURL), // PrependBaseURL ekle
+				"media_url":  utils.PrependS3URL(&story.MediaURL), // PrependBaseURL ekle
 				"content":    story.Content,
 				"user_id":    story.UserID,
 				"created_at": story.CreatedAt,
@@ -276,7 +276,7 @@ func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, ms
 				var metadata map[string]interface{}
 				if err := json.Unmarshal([]byte(*story.MediaMetadata), &metadata); err == nil {
 					if thumbnailURL, exists := metadata["thumbnail_url"].(string); exists && thumbnailURL != "" {
-						storyResponse["thumbnail_url"] = utils.PrependBaseURL(&thumbnailURL)
+						storyResponse["thumbnail_url"] = utils.PrependS3URL(&thumbnailURL)
 					}
 				}
 			}

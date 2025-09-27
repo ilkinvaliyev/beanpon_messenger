@@ -277,7 +277,7 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 				storyResponse := gin.H{
 					"id":         *msg.StoryID,
 					"type":       *msg.StoryType,
-					"media_url":  utils.PrependBaseURL(msg.StoryMediaURL), // PrependBaseURL ekle
+					"media_url":  utils.PrependS3URL(msg.StoryMediaURL), // PrependBaseURL ekle
 					"content":    msg.StoryContent,
 					"user_id":    *msg.StoryUserID,
 					"created_at": msg.StoryCreatedAt,
@@ -289,7 +289,7 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 					var metadata map[string]interface{}
 					if err := json.Unmarshal([]byte(*msg.StoryMetadata), &metadata); err == nil {
 						if thumbnailURL, exists := metadata["thumbnail_url"].(string); exists && thumbnailURL != "" {
-							storyResponse["thumbnail_url"] = utils.PrependBaseURL(&thumbnailURL)
+							storyResponse["thumbnail_url"] = utils.PrependS3URL(&thumbnailURL)
 						}
 					}
 				}
