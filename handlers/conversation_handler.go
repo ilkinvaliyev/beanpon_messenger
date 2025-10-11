@@ -385,7 +385,8 @@ func (h *ConversationHandler) GetConversationDetails(c *gin.Context) {
 
 	// Conversation durumu analizi
 	canSendMessage := true
-	conversationType := "normal" // normal, pending, restricted
+	conversationType := "normal"        // normal, pending, restricted
+	var stopMessageReason *string = nil // 🆕 YENİ ALAN
 
 	switch conversation.Status {
 	case "pending":
@@ -433,12 +434,54 @@ func (h *ConversationHandler) GetConversationDetails(c *gin.Context) {
 		canSendMessage = false
 	}
 
-	c.JSON(http.StatusOK, gin.H{
+	// 🆕 STOP_MESSAGE_REASON KONTROLÜ
+	// Sadece daha önce hiç mesaj atılmamışsa (yeni conversation)
+	totalMessages := conversation.User1MessageCount + conversation.User2MessageCount
+
+	if totalMessages == 0 {
+		// Karşı tarafın ayarlarını kontrol et
+		var otherUserSettings models.UserSettings
+		if err := database.DB.Where("user_id = ?", otherUserID).First(&otherUserSettings).Error; err == nil {
+			// Ayar varsa kontrolü yap
+			if otherUserSettings.MessageRequests == "ONLY_VERIFIED" {
+				// Benim verified durumumu kontrol et
+				var myUser models.User
+				if err := database.DB.Where("id = ?", userID).First(&myUser).Error; err == nil {
+					if !myUser.IsVerified {
+						// Verified değilim ve karşı taraf ONLY_VERIFIED istiyor
+						reason := "ONLY_VERIFIED"
+						stopMessageReason = &reason
+						canSendMessage = false
+					} else {
+						// Verified'im, izin var
+						reason := "ALL"
+						stopMessageReason = &reason
+					}
+				}
+			} else {
+				// MessageRequests = "ALL" ise
+				reason := "ALL"
+				stopMessageReason = &reason
+			}
+		} else {
+			// Ayar yoksa default ALL
+			reason := "ALL"
+			stopMessageReason = &reason
+		}
+	} else {
+		// Daha önce mesaj varsa, artık kısıtlama yok (eski conversation)
+		// stop_message_reason null kalır veya "PREVIOUS_CONVERSATION" diyebiliriz
+		reason := "PREVIOUS_CONVERSATION"
+		stopMessageReason = &reason
+	}
+
+	responseData := gin.H{
 		"conversation": gin.H{
 			"id":                   conversation.ID,
 			"status":               conversation.Status,
 			"type":                 conversationType,
 			"can_send_message":     canSendMessage,
+			"stop_message_reason":  stopMessageReason, // 🆕 YENİ ALAN
 			"is_muted_by_me":       isMutedByMe,
 			"am_i_restricted":      amIRestricted,
 			"is_other_muted":       isOtherMuted,
@@ -447,7 +490,9 @@ func (h *ConversationHandler) GetConversationDetails(c *gin.Context) {
 			"other_message_count":  otherMessageCount,
 			"max_pending_messages": conversation.MaxPendingMessages,
 		},
-	})
+	}
+
+	c.JSON(http.StatusOK, responseData)
 }
 
 // buildConversationResponse kullanıcıya göre response oluştur
