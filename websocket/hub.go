@@ -817,6 +817,12 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 	case "chat_closed":
 		c.Hub.SetActiveChat(c.UserID, nil)
 
+	case "screenshot_protection_changed":
+		// Screenshot protection değişikliği için hiçbir şey yapmaya gerek yok
+		// Bu sadece client'tan gelebilecek bir bildirim olabilir ama
+		// normalde bu backend'den gelir, client'a gider
+		log.Printf("Screenshot protection değişikliği alındı (bu normalde olmamalı)")
+
 	default:
 		log.Printf("Bilinmeyen mesaj tipi: %s", msg.Type)
 	}
@@ -1162,4 +1168,20 @@ func (h *Hub) handleMarkRead(readerID, otherUserID uint) {
 		log.Printf("Mesajlar okundu olarak işaretlendi: %d mesaj, reader: %d, sender: %d",
 			updatedCount, readerID, otherUserID)
 	}
+}
+
+// BroadcastScreenshotProtectionChange screenshot koruma değişikliğini her iki kullanıcıya bildir
+func (h *Hub) BroadcastScreenshotProtectionChange(user1ID, user2ID uint, isDisabled bool, changedByUserID uint) {
+	screenshotData := map[string]interface{}{
+		"is_screenshot_disabled": isDisabled,
+		"changed_by":             changedByUserID,
+		"changed_at":             time.Now().UTC(),
+	}
+
+	// Her iki kullanıcıya da bildir
+	h.SendToUser(user1ID, "screenshot_protection_changed", screenshotData)
+	h.SendToUser(user2ID, "screenshot_protection_changed", screenshotData)
+
+	log.Printf("Screenshot protection değişikliği yayınlandı: User1: %d, User2: %d, Disabled: %t, ChangedBy: %d",
+		user1ID, user2ID, isDisabled, changedByUserID)
 }

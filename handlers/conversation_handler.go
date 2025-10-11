@@ -15,6 +15,7 @@ type ConversationHandler struct {
 	wsHub interface {
 		IsUserOnline(userID uint) bool
 		SendToUser(userID uint, messageType string, data interface{})
+		BroadcastScreenshotProtectionChange(user1ID, user2ID uint, isDisabled bool, changedByUserID uint) // ✅ YENİ
 	}
 	encryptionService interface {
 		EncryptMessage(plainText string) (string, error)
@@ -25,6 +26,7 @@ type ConversationHandler struct {
 func NewConversationHandler(wsHub interface {
 	IsUserOnline(userID uint) bool
 	SendToUser(userID uint, messageType string, data interface{})
+	BroadcastScreenshotProtectionChange(user1ID, user2ID uint, isDisabled bool, changedByUserID uint) // ✅ BURAYI EKLE
 }, encryptionService interface {
 	EncryptMessage(plainText string) (string, error)
 	DecryptMessage(encryptedText string) (string, error)
@@ -762,13 +764,26 @@ func (h *ConversationHandler) ToggleScreenshotProtection(c *gin.Context) {
 	// ✅ Her iki taraftan biri de disable ettiyse true
 	bothDisabled := conversation.User1ScreenshotDisabled || conversation.User2ScreenshotDisabled
 
-	// WebSocket ile karşı tarafa bildir
-	h.wsHub.SendToUser(uint(otherUserID), "screenshot_protection_changed", map[string]interface{}{
-		"conversation_id":        conversation.ID,
-		"changed_by":             userID,
-		"is_screenshot_disabled": bothDisabled,
-		"changed_at":             now,
-	})
+	// ✅ WebSocket üzerinden HER İKİ kullanıcıya da bildir
+	// wsHub interface'ini WebSocketHub'a cast et
+	if wsHubTyped, ok := h.wsHub.(interface {
+		BroadcastScreenshotProtectionChange(user1ID, user2ID uint, isDisabled bool, changedByUserID uint)
+	}); ok {
+		wsHubTyped.BroadcastScreenshotProtectionChange(
+			conversation.User1ID,
+			conversation.User2ID,
+			bothDisabled,
+			userID.(uint),
+		)
+	} else {
+		// Fallback - eski yöntem (sadece karşı tarafa gönder)
+		h.wsHub.SendToUser(uint(otherUserID), "screenshot_protection_changed", map[string]interface{}{
+			"conversation_id":        conversation.ID,
+			"changed_by":             userID,
+			"is_screenshot_disabled": bothDisabled,
+			"changed_at":             now,
+		})
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"message":                "Screenshot ayarı güncellendi",
