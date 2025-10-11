@@ -44,6 +44,12 @@ func NewMessageHandler(encryptionService interface {
 	}
 }
 
+type wsHubForConversation interface {
+	IsUserOnline(userID uint) bool
+	SendToUser(userID uint, messageType string, data interface{})
+	BroadcastScreenshotProtectionChange(user1ID, user2ID uint, isDisabled bool, changedByUserID uint)
+}
+
 // SendMessage mesaj gönder
 func (h *MessageHandler) SendMessage(c *gin.Context) {
 	// JWT'den user ID al
@@ -78,8 +84,10 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 		return
 	}
 
+	wsHubForConv := h.wsHub.(wsHubForConversation)
+
 	// Conversation kontrolü - mesaj gönderebilir mi?
-	conversationHandler := NewConversationHandler(h.wsHub, h.encryptionService)
+	conversationHandler := NewConversationHandler(wsHubForConv, h.encryptionService)
 	canSend, reason, err := conversationHandler.CanSendMessage(senderID.(uint), req.ReceiverID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Conversation kontrolü başarısız"})

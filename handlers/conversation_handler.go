@@ -26,7 +26,7 @@ type ConversationHandler struct {
 func NewConversationHandler(wsHub interface {
 	IsUserOnline(userID uint) bool
 	SendToUser(userID uint, messageType string, data interface{})
-	BroadcastScreenshotProtectionChange(user1ID, user2ID uint, isDisabled bool, changedByUserID uint) // ✅ BURAYI EKLE
+	BroadcastScreenshotProtectionChange(user1ID, user2ID uint, isDisabled bool, changedByUserID uint)
 }, encryptionService interface {
 	EncryptMessage(plainText string) (string, error)
 	DecryptMessage(encryptedText string) (string, error)
