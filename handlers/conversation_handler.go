@@ -3,6 +3,7 @@ package handlers
 import (
 	"beanpon_messenger/database"
 	"beanpon_messenger/models"
+	"errors"
 	"net/http"
 	"strconv"
 	"time"
@@ -110,58 +111,71 @@ func (h *ConversationHandler) updateFollowRelations(conversation *models.Convers
 
 // CanSendMessage kullanıcının mesaj gönderip gönderemeyeceğini kontrol et
 func (h *ConversationHandler) CanSendMessage(senderID, receiverID uint) (bool, string, error) {
-	// Block kontrolü
+	// Önce block kontrolü
 	if models.IsBlocked(database.DB, senderID, receiverID) {
-		return false, "Bu kullanıcıya mesaj gönderemezsiniz", nil
+		return false, "Bu istifadəçiyə mesaj göndərə bilməzsiniz (blokladınız)", nil
 	}
 
-	conversation, err := h.GetOrCreateConversation(senderID, receiverID)
+	// Conversation'ı bul
+	var conversation models.Conversation
+	err := database.DB.Where(
+		"(user1_id = ? AND user2_id = ?) OR (user1_id = ? AND user2_id = ?)",
+		senderID, receiverID, receiverID, senderID,
+	).First(&conversation).Error
+
+	// Conversation yoksa, yeni conversation oluşturulacak - verified kontrolü yap
 	if err != nil {
-		return false, "Conversation kontrolü başarısız", err
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			// 🆕 SADECE YENİ CONVERSATION İÇİN VERIFIED KONTROLÜ
+			var receiverSettings models.UserSettings
+			if err := database.DB.Where("user_id = ?", receiverID).First(&receiverSettings).Error; err == nil {
+				// Eğer ONLY_VERIFIED ise, gönderende verified kontrolü yap
+				if receiverSettings.MessageRequests == "ONLY_VERIFIED" {
+					var sender models.User
+					if err := database.DB.Where("id = ?", senderID).First(&sender).Error; err != nil {
+						return false, "İstifadəçi tapılmadı", err
+					}
+
+					if !sender.IsVerified {
+						return false, "Bu istifadəçiyə mesaj göndərmək üçün təsdiqlənmiş hesab tələb olunur", nil
+					}
+				}
+			}
+			// Eğer user_settings kaydı yoksa veya ALL ise, izin ver
+			return true, "", nil
+		}
+		return false, "Verilənlər bazası xətası", err
 	}
 
-	var senderMessageCount int
-	var senderRestricted bool
+	// 🎯 Conversation VARSA (daha önce mesajlaşmışlarsa), verified kontrolü YOK
+	// Sadece conversation durumunu kontrol et
 
-	// Gönderen user1 mi user2 mi?
-	if senderID == conversation.User1ID {
-		senderMessageCount = conversation.User1MessageCount
-		senderRestricted = conversation.User1Restricted
-	} else {
-		senderMessageCount = conversation.User2MessageCount
-		senderRestricted = conversation.User2Restricted
-	}
-
-	// Restriction kontrolü
-	if senderRestricted {
-		return false, "Mesaj gönderme yetkiniz kısıtlanmış", nil
-	}
-
-	// Status'a göre kontroller
 	switch conversation.Status {
 	case "active":
+		// Active ise her şey tamam
 		return true, "", nil
 
 	case "pending":
-		// Mutual follow varsa direkt gönderilebilir
-		if conversation.MutualFollow {
-			// Status'u active yap
-			h.updateConversationStatus(conversation.ID, "active")
-			return true, "", nil
+		// Pending durumda, gönderen kullanıcının mesaj limitini kontrol et
+		var senderMessageCount int
+		if conversation.User1ID == senderID {
+			senderMessageCount = conversation.User1MessageCount
+		} else {
+			senderMessageCount = conversation.User2MessageCount
 		}
 
-		// Pending durumda maksimum mesaj kontrolü
 		if senderMessageCount >= conversation.MaxPendingMessages {
-			return false, "Maksimum bekleyen mesaj sayısına ulaştınız", nil
+			return false, "Mesaj limiti doldu. Qarşı tərəf cavab verməlidir", nil
 		}
 
 		return true, "", nil
 
 	case "restricted":
-		return false, "Bu konuşma kısıtlanmış", nil
+		// Restricted durumda kimse mesaj gönderemez
+		return false, "Bu söhbət məhdudlaşdırılıb", nil
 
 	default:
-		return false, "Bilinmeyen conversation durumu", nil
+		return false, "Naməlum söhbət statusu", nil
 	}
 }
 

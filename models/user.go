@@ -11,6 +11,7 @@ type User struct {
 	Email         string    `json:"email" gorm:"type:varchar(255);uniqueIndex;not null"`
 	ProfileImage  *string   `json:"profile_image" gorm:"type:text"`
 	AccountTypeID int       `json:"account_type_id" gorm:"default:1"`
+	IsVerified    bool      `json:"is_verified" gorm:"default:false"`
 	CreatedAt     time.Time `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt     time.Time `json:"updated_at" gorm:"autoUpdateTime"`
 }
