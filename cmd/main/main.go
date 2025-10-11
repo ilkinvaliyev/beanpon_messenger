@@ -89,6 +89,8 @@ func main() {
 		api.GET("/conversations/:user_id/details", conversationHandler.GetConversationDetails)
 		api.POST("/conversations/:user_id/mute", conversationHandler.MuteConversation)
 		api.POST("/conversations/:user_id/unmute", conversationHandler.UnmuteConversation)
+		api.POST("/conversations/:user_id/screenshot-protection", conversationHandler.ToggleScreenshotProtection)
+		api.GET("/conversations/:user_id/screenshot-protection", conversationHandler.GetScreenshotProtectionStatus)
 
 		// WebSocket bilgi endpoint'leri
 		api.GET("/online-users", func(c *gin.Context) {

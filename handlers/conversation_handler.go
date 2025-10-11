@@ -439,6 +439,7 @@ func (h *ConversationHandler) buildConversationResponse(conv *models.Conversatio
 	var otherUserID uint
 	var myMessageCount, otherMessageCount int
 	var isMutedByMe, isRestrictedForMe bool
+	var myScreenshotDisabled, otherScreenshotDisabled bool // ✅ YENİ
 
 	if currentUserID == conv.User1ID {
 		otherUserID = conv.User2ID
@@ -446,15 +447,18 @@ func (h *ConversationHandler) buildConversationResponse(conv *models.Conversatio
 		otherMessageCount = conv.User2MessageCount
 		isMutedByMe = conv.User1Muted
 		isRestrictedForMe = conv.User1Restricted
+		myScreenshotDisabled = conv.User1ScreenshotDisabled    // ✅ YENİ
+		otherScreenshotDisabled = conv.User2ScreenshotDisabled // ✅ YENİ
 	} else {
 		otherUserID = conv.User1ID
 		myMessageCount = conv.User2MessageCount
 		otherMessageCount = conv.User1MessageCount
 		isMutedByMe = conv.User2Muted
 		isRestrictedForMe = conv.User2Restricted
+		myScreenshotDisabled = conv.User2ScreenshotDisabled    // ✅ YENİ
+		otherScreenshotDisabled = conv.User1ScreenshotDisabled // ✅ YENİ
 	}
 
-	// Mesaj gönderebilir mi?
 	canSend, _, _ := h.CanSendMessage(currentUserID, otherUserID)
 
 	return models.ConversationResponse{
@@ -470,7 +474,13 @@ func (h *ConversationHandler) buildConversationResponse(conv *models.Conversatio
 		MaxPendingMessages:      conv.MaxPendingMessages,
 		HasPreviousConversation: conv.HasPreviousConversation,
 		LastMessageAt:           conv.LastMessageAt,
-		CreatedAt:               conv.CreatedAt,
+
+		// ✅ YENİ: Screenshot bilgileri
+		IsScreenshotDisabled:    myScreenshotDisabled || otherScreenshotDisabled,
+		MyScreenshotDisabled:    myScreenshotDisabled,
+		OtherScreenshotDisabled: otherScreenshotDisabled,
+
+		CreatedAt: conv.CreatedAt,
 	}
 }
 
@@ -693,5 +703,113 @@ func (h *ConversationHandler) RejectConversationRequest(c *gin.Context) {
 			"status":          conversation.Status,
 			"rejected_at":     now,
 		},
+	})
+}
+
+// ToggleScreenshotProtection - Screenshot korumayı aç/kapat
+func (h *ConversationHandler) ToggleScreenshotProtection(c *gin.Context) {
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	otherUserID, err := strconv.ParseUint(c.Param("user_id"), 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz kullanıcı ID"})
+		return
+	}
+
+	var requestBody struct {
+		Enabled bool `json:"enabled"` // true = screenshot kapalı, false = screenshot açık
+	}
+
+	if err := c.ShouldBindJSON(&requestBody); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz request body"})
+		return
+	}
+
+	conversation, err := h.GetOrCreateConversation(userID.(uint), uint(otherUserID))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Conversation bulunamadı"})
+		return
+	}
+
+	now := time.Now()
+
+	// Hangi kullanıcı değiştiriyor?
+	if userID.(uint) == conversation.User1ID {
+		conversation.User1ScreenshotDisabled = requestBody.Enabled
+		if requestBody.Enabled {
+			conversation.User1ScreenshotDisabledAt = &now
+		} else {
+			conversation.User1ScreenshotDisabledAt = nil
+		}
+	} else {
+		conversation.User2ScreenshotDisabled = requestBody.Enabled
+		if requestBody.Enabled {
+			conversation.User2ScreenshotDisabledAt = &now
+		} else {
+			conversation.User2ScreenshotDisabledAt = nil
+		}
+	}
+
+	if err := database.DB.Save(conversation).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Screenshot ayarı değiştirilemedi"})
+		return
+	}
+
+	// ✅ Her iki taraftan biri de disable ettiyse true
+	bothDisabled := conversation.User1ScreenshotDisabled || conversation.User2ScreenshotDisabled
+
+	// WebSocket ile karşı tarafa bildir
+	h.wsHub.SendToUser(uint(otherUserID), "screenshot_protection_changed", map[string]interface{}{
+		"conversation_id":        conversation.ID,
+		"changed_by":             userID,
+		"is_screenshot_disabled": bothDisabled,
+		"changed_at":             now,
+	})
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":                "Screenshot ayarı güncellendi",
+		"my_screenshot_disabled": requestBody.Enabled,
+		"is_screenshot_disabled": bothDisabled, // Genel durum
+	})
+}
+
+// GetScreenshotProtectionStatus - Screenshot durumunu getir
+func (h *ConversationHandler) GetScreenshotProtectionStatus(c *gin.Context) {
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	otherUserID, err := strconv.ParseUint(c.Param("user_id"), 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz kullanıcı ID"})
+		return
+	}
+
+	conversation, err := h.GetOrCreateConversation(userID.(uint), uint(otherUserID))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Conversation bulunamadı"})
+		return
+	}
+
+	var myDisabled, otherDisabled bool
+
+	if userID.(uint) == conversation.User1ID {
+		myDisabled = conversation.User1ScreenshotDisabled
+		otherDisabled = conversation.User2ScreenshotDisabled
+	} else {
+		myDisabled = conversation.User2ScreenshotDisabled
+		otherDisabled = conversation.User1ScreenshotDisabled
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"my_screenshot_disabled":    myDisabled,
+		"other_screenshot_disabled": otherDisabled,
+		"is_screenshot_disabled":    myDisabled || otherDisabled, // Her iki taraftan biri disable ettiyse true
 	})
 }
