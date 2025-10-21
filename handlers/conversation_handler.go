@@ -50,7 +50,7 @@ func (h *ConversationHandler) GetOrCreateConversation(user1ID, user2ID uint) (*m
 	// Önce mevcut conversation'ı ara
 	err := database.DB.Where("user1_id = ? AND user2_id = ?", user1ID, user2ID).First(&conversation).Error
 
-	if err == gorm.ErrRecordNotFound {
+	if errors.Is(err, gorm.ErrRecordNotFound) {
 		// Yeni conversation oluştur
 		conversation = models.Conversation{
 			User1ID:                 user1ID,
@@ -73,6 +73,27 @@ func (h *ConversationHandler) GetOrCreateConversation(user1ID, user2ID uint) (*m
 
 		// Follow ilişkilerini kontrol et
 		h.updateFollowRelations(&conversation)
+
+		// 🆕 YENİ: Screenshot protection kontrolü
+		// User1'in ayarlarını kontrol et
+		var user1Settings models.UserSettings
+		if err := database.DB.Where("user_id = ?", user1ID).First(&user1Settings).Error; err == nil {
+			if user1Settings.ConversationScreenshotDisabled {
+				conversation.User1ScreenshotDisabled = true
+				now := time.Now()
+				conversation.User1ScreenshotDisabledAt = &now
+			}
+		}
+
+		// User2'nin ayarlarını kontrol et
+		var user2Settings models.UserSettings
+		if err := database.DB.Where("user_id = ?", user2ID).First(&user2Settings).Error; err == nil {
+			if user2Settings.ConversationScreenshotDisabled {
+				conversation.User2ScreenshotDisabled = true
+				now := time.Now()
+				conversation.User2ScreenshotDisabledAt = &now
+			}
+		}
 
 		if err := database.DB.Create(&conversation).Error; err != nil {
 			return nil, err
