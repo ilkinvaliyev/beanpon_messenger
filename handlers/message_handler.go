@@ -22,7 +22,7 @@ type MessageHandler struct {
 		DecryptMessage(encryptedText string) (string, error)
 	}
 	wsHub interface {
-		HandleNewMessage(senderID, receiverID uint, messageID, content, msgType string, createdAt time.Time, replyToMessageID *string, storyID *uint) // Güncellendi
+		HandleNewMessage(senderID, receiverID uint, messageID, content, msgType string, createdAt time.Time, replyToMessageID *string, storyID *uint, conversationStatus string) // conversationStatus eklendi
 		HandleMessageRead(messageID string, senderID, readerID uint)
 		IsUserOnline(userID uint) bool
 		SendToUser(userID uint, messageType string, data interface{})
@@ -33,7 +33,7 @@ func NewMessageHandler(encryptionService interface {
 	EncryptMessage(plainText string) (string, error)
 	DecryptMessage(encryptedText string) (string, error)
 }, wsHub interface {
-	HandleNewMessage(senderID, receiverID uint, messageID, content, msgType string, createdAt time.Time, replyToMessageID *string, storyID *uint) // Güncellendi
+	HandleNewMessage(senderID, receiverID uint, messageID, content, msgType string, createdAt time.Time, replyToMessageID *string, storyID *uint, conversationStatus string) // conversationStatus eklendi
 	HandleMessageRead(messageID string, senderID, readerID uint)
 	IsUserOnline(userID uint) bool
 	SendToUser(userID uint, messageType string, data interface{})
@@ -159,6 +159,7 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 		message.CreatedAt,
 		req.ReplyToMessageID, // YENİ parametre
 		req.StoryID,
+		"active",
 	)
 
 	// API response

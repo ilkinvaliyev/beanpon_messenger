@@ -15,13 +15,7 @@ import (
 )
 
 func main() {
-	// 🕒 Global timezone Asia/Baku olaraq set et
-	//loc, err := time.LoadLocation("Asia/Baku")
-	//if err != nil {
-	//	log.Fatalf("Location yüklenemedi: %v", err)
-	//}
-	//time.Local = loc
-
+	// 🕒 Global timezone UTC olarak set et
 	time.Local = time.UTC
 	log.Printf("✅ Global timezone UTC olarak ayarlandı")
 
@@ -31,15 +25,13 @@ func main() {
 	// GORM ile PostgreSQL'e bağlan
 	database.InitializePostgreSQL(cfg)
 
-	// Auto migration çalıştır
-	//database.AutoMigrate()
-
 	// Servisleri başlat
 	encryptionService := services.NewEncryptionService(cfg.AESKey)
 	wsHub := websocket.NewHub(database.DB, encryptionService, cfg)
 	go wsHub.Run()
 
 	// Handler'ları oluştur
+	// 🎯 Parametreleri düzelttik
 	messageHandler := handlers.NewMessageHandler(encryptionService, wsHub)
 	conversationHandler := handlers.NewConversationHandler(wsHub, encryptionService)
 
@@ -59,6 +51,7 @@ func main() {
 
 		c.Next()
 	})
+
 	// WebSocket endpoint (JWT middleware ile)
 	router.GET("/ws", middleware.JWTMiddlewareForWebSocket(cfg.JWTSecret), wsHub.HandleWebSocket)
 
@@ -72,20 +65,20 @@ func main() {
 		api.PUT("/messages/:message_id/read", messageHandler.MarkAsRead)
 		api.DELETE("/messages/:message_id", messageHandler.DeleteMessage)
 
-		api.DELETE("/conversations/:other_user_id/clear", messageHandler.ClearConversation) // tek bir kullanıcıyla olan konuşmayı temizle
+		api.DELETE("/conversations/:other_user_id/clear", messageHandler.ClearConversation)
 		api.DELETE("/conversations/clear-all", messageHandler.ClearAllMyMessages)
 
 		// Sohbet operasyonları
 		api.GET("/conversations", messageHandler.GetConversations)
 		api.GET("/unread-count", messageHandler.GetUnreadCount)
 
-		// YENİ: Conversation request yönetimi
+		// Conversation request yönetimi
 		api.GET("/conversation-requests", conversationHandler.GetPendingRequests)
 		api.GET("/conversation-requests/count", conversationHandler.GetPendingRequestCount)
 		api.POST("/conversation-requests/:requester_id/accept", conversationHandler.AcceptConversationRequest)
 		api.POST("/conversation-requests/:requester_id/reject", conversationHandler.RejectConversationRequest)
 
-		// Conversation yönetimi (mevcut)
+		// Conversation yönetimi
 		api.GET("/conversations/:user_id/details", conversationHandler.GetConversationDetails)
 		api.POST("/conversations/:user_id/mute", conversationHandler.MuteConversation)
 		api.POST("/conversations/:user_id/unmute", conversationHandler.UnmuteConversation)
@@ -103,7 +96,6 @@ func main() {
 
 		api.GET("/user-online/:user_id", func(c *gin.Context) {
 			userID := c.Param("user_id")
-			// String'i uint'e çevir
 			var targetUserID uint64
 			if parsedID, err := strconv.ParseUint(userID, 10, 32); err != nil {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz kullanıcı ID"})
@@ -120,7 +112,7 @@ func main() {
 		})
 	}
 
-	// Test endpoint (JWT test için)
+	// Test endpoint
 	router.GET("/test-jwt", middleware.JWTMiddleware(cfg.JWTSecret), func(c *gin.Context) {
 		userID, _ := c.Get("user_id")
 		userEmail, _ := c.Get("user_email")
