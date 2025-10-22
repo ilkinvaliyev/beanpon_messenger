@@ -569,9 +569,24 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 
 	// ✅ Status filtresine göre WHERE clause oluştur
 	statusWhereClause := ""
-	if statusFilter != "all" {
-		statusWhereClause = "AND COALESCE(conv.status, 'active') = '" + statusFilter + "'"
+	var extraParams []interface{}
+
+	if statusFilter == "pending" {
+		// Pending: Sadece KARŞI TARAFIN mesaj attığı conversation'lar
+		statusWhereClause = `
+			AND COALESCE(conv.status, 'active') = 'pending'
+			AND CASE 
+				WHEN conv.user1_id = ? THEN conv.user2_message_count > 0 
+				ELSE conv.user1_message_count > 0 
+			END
+		`
+		extraParams = append(extraParams, userID)
+	} else if statusFilter == "active" {
+		statusWhereClause = "AND COALESCE(conv.status, 'active') = 'active'"
+	} else if statusFilter == "restricted" {
+		statusWhereClause = "AND COALESCE(conv.status, 'active') = 'restricted'"
 	}
+	// statusFilter == "all" ise WHERE clause eklenmez
 
 	query := `
     WITH latest_messages AS (
@@ -667,13 +682,17 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
     ORDER BY lm.created_at DESC
     `
 
-	err := database.DB.Raw(query,
+	// ✅ Parametreleri birleştir
+	params := []interface{}{
 		userID, userID, userID, userID, userID, // latest_messages için
 		userID,                                                                                         // delete filter için
 		userID,                                                                                         // unread_counts için
 		userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, // conversation detayları için
 		userID, userID, // conversations JOIN için
-	).Scan(&conversations).Error
+	}
+	params = append(params, extraParams...) // ✅ Pending için ekstra parametre
+
+	err := database.DB.Raw(query, params...).Scan(&conversations).Error
 
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Konuşmalar alınamadı"})
@@ -759,7 +778,7 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"conversations": responseConversations,
 		"total":         len(responseConversations),
-		"status_filter": statusFilter, // ✅ Hangi filtrenin kullanıldığını da döndür
+		"status_filter": statusFilter,
 	})
 }
 
@@ -1085,4 +1104,5 @@ func (h *MessageHandler) ClearAllMyMessages(c *gin.Context) {
 		"message": "Tüm mesaj geçmişin temizlendi",
 		"data":    payload,
 	})
+
 }
