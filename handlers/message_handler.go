@@ -536,6 +536,9 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 		return
 	}
 
+	// ✅ Query parametresinden status filtresi al (default: all)
+	statusFilter := c.DefaultQuery("status", "all") // all, active, pending, restricted
+
 	// En son mesajları getir - silinmiş olanları hariç tut
 	var conversations []struct {
 		OtherUserID        uint      `json:"other_user_id"`
@@ -543,7 +546,7 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 		LastMessageText    string    `json:"last_message_text"`
 		LastMessageTime    time.Time `json:"last_message_time"`
 		IsLastFromMe       bool      `json:"is_last_from_me"`
-		LastMessageRead    *bool     `json:"last_message_read"` // Yeni eklendi
+		LastMessageRead    *bool     `json:"last_message_read"`
 		UnreadCount        int       `json:"unread_count"`
 		ConversationStatus string    `json:"conversation_status"`
 
@@ -564,6 +567,12 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 		ProfileImage        *string `json:"profile_image"`
 	}
 
+	// ✅ Status filtresine göre WHERE clause oluştur
+	statusWhereClause := ""
+	if statusFilter != "all" {
+		statusWhereClause = "AND COALESCE(conv.status, 'active') = '" + statusFilter + "'"
+	}
+
 	query := `
     WITH latest_messages AS (
         SELECT 
@@ -575,7 +584,7 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
             encrypted_text,
             created_at,
             sender_id = ? as is_from_me,
-            read,  -- read durumunu da seçiyoruz
+            read,
             ROW_NUMBER() OVER (
                 PARTITION BY CASE WHEN sender_id = ? THEN receiver_id ELSE sender_id END 
                 ORDER BY created_at DESC
@@ -607,7 +616,7 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
         CASE 
             WHEN lm.is_from_me = true THEN lm.read
             ELSE NULL
-        END as last_message_read,  -- Sadece kendi mesajlarımız için read durumu
+        END as last_message_read,
         COALESCE(uc.unread_count, 0) as unread_count,
         COALESCE(conv.status, 'active') as conversation_status,
         conv.id as conversation_id,
@@ -654,7 +663,7 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
     LEFT JOIN conversations conv ON (
         (conv.user1_id = LEAST(?, lm.other_user_id) AND conv.user2_id = GREATEST(?, lm.other_user_id))
     )
-    WHERE lm.rn = 1
+    WHERE lm.rn = 1 ` + statusWhereClause + ` 
     ORDER BY lm.created_at DESC
     `
 
@@ -721,7 +730,7 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 			"last_message_text":      decryptedText,
 			"last_message_time":      conv.LastMessageTime,
 			"is_last_from_me":        conv.IsLastFromMe,
-			"last_message_read":      conv.LastMessageRead, // Yeni eklendi
+			"last_message_read":      conv.LastMessageRead,
 			"unread_count":           conv.UnreadCount,
 			"is_online":              h.wsHub.IsUserOnline(conv.OtherUserID),
 
@@ -750,6 +759,7 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"conversations": responseConversations,
 		"total":         len(responseConversations),
+		"status_filter": statusFilter, // ✅ Hangi filtrenin kullanıldığını da döndür
 	})
 }
 
