@@ -2,6 +2,7 @@ package websocket
 
 import (
 	"beanpon_messenger/config"
+	"beanpon_messenger/handlers"
 	"beanpon_messenger/models"
 	"beanpon_messenger/utils"
 	"bytes"
@@ -224,13 +225,12 @@ func (h *Hub) SendToMultipleUsers(userIDs []uint, messageType string, data inter
 }
 
 // HandleNewMessage yeni mesajı handle et ve WebSocket üzerinden yayınla
-// HandleNewMessage yeni mesajı handle et ve WebSocket üzerinden yayınla
-func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, msgType string, createdAt time.Time, replyToMessageID *string, storyID *uint) {
+func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, msgType string, createdAt time.Time, replyToMessageID *string, storyID *uint, conversationStatus string) {
 	messageData := map[string]interface{}{
 		"id":                  messageID,
 		"sender_id":           senderID,
 		"receiver_id":         receiverID,
-		"story_id":            storyID, // YENİ ALAN
+		"story_id":            storyID,
 		"reply_to_message_id": replyToMessageID,
 		"text":                content,
 		"type":                msgType,
@@ -239,7 +239,7 @@ func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, ms
 		"is_history":          false,
 	}
 
-	// Reply mesajı kontrolü (mevcut kod aynı...)
+	// Reply mesajı kontrolü
 	if replyToMessageID != nil {
 		var replyMessage models.Message
 		if err := h.db.Where("id = ?", *replyToMessageID).First(&replyMessage).Error; err == nil {
@@ -257,21 +257,20 @@ func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, ms
 		}
 	}
 
-	// Story bilgisi kontrolü kısmını bununla değiştir:
+	// Story bilgisi kontrolü
 	if storyID != nil {
 		var story models.Story
 		if err := h.db.Where("id = ?", *storyID).First(&story).Error; err == nil {
 			storyResponse := map[string]interface{}{
 				"id":         story.ID,
 				"type":       story.Type,
-				"media_url":  utils.PrependS3URL(&story.MediaURL), // PrependBaseURL ekle
+				"media_url":  utils.PrependS3URL(&story.MediaURL),
 				"content":    story.Content,
 				"user_id":    story.UserID,
 				"created_at": story.CreatedAt,
 				"available":  true,
 			}
 
-			// Video ise ve metadata varsa thumbnail kontrolü
 			if story.Type == "video" && story.MediaMetadata != nil {
 				var metadata map[string]interface{}
 				if err := json.Unmarshal([]byte(*story.MediaMetadata), &metadata); err == nil {
@@ -299,13 +298,14 @@ func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, ms
 
 	go h.SendUnreadCountUpdate(receiverID)
 
-	// Push notification kontrolü
-	if !h.IsUserOnline(receiverID) {
-		go h.sendPushNotification(senderID, receiverID, content, msgType)
-	} else if !h.IsUserInChatWith(receiverID, senderID) {
-		go h.sendPushNotification(senderID, receiverID, content, msgType)
+	// 🎯 Sadece active conversation'larda notification gönder
+	if conversationStatus == "active" {
+		if !h.IsUserOnline(receiverID) {
+			go h.sendPushNotification(senderID, receiverID, content, msgType)
+		} else if !h.IsUserInChatWith(receiverID, senderID) {
+			go h.sendPushNotification(senderID, receiverID, content, msgType)
+		}
 	}
-
 }
 
 // Bu yeni fonksiyonu ekle
@@ -694,25 +694,21 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 			log.Printf("Mesaj data parse edilemedi")
 			return
 		}
-
 		receiverIDFloat, ok1 := dataMap["receiver_id"].(float64)
 		content, ok2 := dataMap["text"].(string)
 		if !ok1 || !ok2 {
 			log.Printf("Geçersiz mesaj verisi")
 			return
 		}
-
 		receiverID := uint(receiverIDFloat)
 		var replyToMessageID *string
-		var storyID *uint // YENİ EKLENEN
+		var storyID *uint
 		var msgType string
 
-		// Reply kontrolü
 		if replyID, exists := dataMap["reply_to_message_id"].(string); exists && replyID != "" {
 			replyToMessageID = &replyID
 		}
 
-		// Story ID kontrolü - YENİ EKLENEN
 		if storyIDFloat, exists := dataMap["story_id"].(float64); exists && storyIDFloat > 0 {
 			storyIDUint := uint(storyIDFloat)
 			storyID = &storyIDUint
@@ -728,14 +724,17 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 			return
 		}
 
-		// Block kontrolü
-		if models.IsBlocked(c.Hub.db, c.UserID, receiverID) {
-			log.Printf("Blocked kullanıcı mesaj göndermeye çalışıyor: %d -> %d", c.UserID, receiverID)
+		// 🎯 TEK SEFERDE: Conversation'ı getir + izin kontrolü yap
+		conversationHandler := handlers.NewConversationHandler(c.Hub, c.Hub.encryptionService)
+		conversation, canSend, errorMsg, err := conversationHandler.GetOrCreateConversationWithPermission(c.UserID, receiverID)
+
+		if err != nil || !canSend {
+			log.Printf("Mesaj gönderilemedi: %d -> %d, error: %v, msg: %s", c.UserID, receiverID, err, errorMsg)
 			c.sendMessage(&OutgoingMessage{
 				Type: "message_error",
 				Data: map[string]interface{}{
-					"error": "Bu kullanıcıya mesaj gönderemezsiniz",
-					"code":  "USER_BLOCKED",
+					"error": errorMsg,
+					"code":  "SEND_NOT_ALLOWED",
 				},
 			})
 			return
@@ -744,8 +743,14 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 		messageID := uuid.New().String()
 		createdAt := time.Now()
 
-		// HandleNewMessage'a storyID'yi de ekle
-		c.Hub.HandleNewMessage(c.UserID, receiverID, messageID, content, msgType, createdAt, replyToMessageID, storyID)
+		// Conversation status belirle (nil ise "new", değilse mevcut status)
+		conversationStatus := "new"
+		if conversation != nil {
+			conversationStatus = conversation.Status
+		}
+
+		// HandleNewMessage'a status geç
+		c.Hub.HandleNewMessage(c.UserID, receiverID, messageID, content, msgType, createdAt, replyToMessageID, storyID, conversationStatus)
 
 		// DB yazma
 		go func() {
@@ -759,7 +764,7 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 				ID:               messageID,
 				SenderID:         c.UserID,
 				ReceiverID:       receiverID,
-				StoryID:          storyID, // YENİ EKLENEN
+				StoryID:          storyID,
 				ReplyToMessageID: replyToMessageID,
 				EncryptedText:    encryptedText,
 				Read:             false,

@@ -131,7 +131,7 @@ func (h *ConversationHandler) updateFollowRelations(conversation *models.Convers
 }
 
 // CanSendMessage kullanıcının mesaj gönderip gönderemeyeceğini kontrol et
-func (h *ConversationHandler) CanSendMessage(senderID, receiverID uint) (bool, string, error) {
+func (h *ConversationHandler) CanSendMessageOld(senderID, receiverID uint) (bool, string, error) {
 	// Önce block kontrolü
 	if models.IsBlocked(database.DB, senderID, receiverID) {
 		return false, "Bu istifadəçiyə mesaj göndərə bilməzsiniz (blokladınız)", nil
@@ -197,6 +197,78 @@ func (h *ConversationHandler) CanSendMessage(senderID, receiverID uint) (bool, s
 
 	default:
 		return false, "Naməlum söhbət statusu", nil
+	}
+}
+
+func (h *ConversationHandler) CanSendMessage(senderID, receiverID uint) (bool, string, error) {
+	_, canSend, errorMsg, err := h.GetOrCreateConversationWithPermission(senderID, receiverID)
+	return canSend, errorMsg, err
+}
+
+// GetOrCreateConversationWithPermission conversation'ı getirir veya oluşturur ve izin kontrolü yapar
+func (h *ConversationHandler) GetOrCreateConversationWithPermission(senderID, receiverID uint) (*models.Conversation, bool, string, error) {
+	// Block kontrolü
+	if models.IsBlocked(database.DB, senderID, receiverID) {
+		return nil, false, "Bu istifadəçiyə mesaj göndərə bilməzsiniz (blokladınız)", nil
+	}
+
+	// Conversation'ı bul
+	var conversation models.Conversation
+	err := database.DB.Where(
+		"(user1_id = ? AND user2_id = ?) OR (user1_id = ? AND user2_id = ?)",
+		senderID, receiverID, receiverID, senderID,
+	).First(&conversation).Error
+
+	// Conversation yoksa yeni conversation için verified kontrolü
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			var receiverSettings models.UserSettings
+			if err := database.DB.Where("user_id = ?", receiverID).First(&receiverSettings).Error; err == nil {
+				if receiverSettings.MessageRequests == "ONLY_VERIFIED" {
+					var sender models.User
+					if err := database.DB.Where("id = ?", senderID).First(&sender).Error; err != nil {
+						return nil, false, "İstifadəçi tapılmadı", err
+					}
+
+					if !sender.IsVerified {
+						return nil, false, "Bu istifadəçiyə mesaj göndərmək üçün təsdiqlənmiş hesab tələb olunur", nil
+					}
+				}
+			}
+			// Conversation yok ama izin var - nil conversation döndür
+			return nil, true, "", nil
+		}
+		return nil, false, "Verilənlər bazası xətası", err
+	}
+
+	// Conversation var - izin kontrolü yap
+	canSend, errorMsg := h.checkConversationPermission(&conversation, senderID)
+	return &conversation, canSend, errorMsg, nil
+}
+
+func (h *ConversationHandler) checkConversationPermission(conversation *models.Conversation, senderID uint) (bool, string) {
+	switch conversation.Status {
+	case "active":
+		return true, ""
+
+	case "pending":
+		var senderMessageCount int
+		if conversation.User1ID == senderID {
+			senderMessageCount = conversation.User1MessageCount
+		} else {
+			senderMessageCount = conversation.User2MessageCount
+		}
+
+		if senderMessageCount >= conversation.MaxPendingMessages {
+			return false, "Mesaj limiti doldu. Qarşı tərəf cavab verməlidir"
+		}
+		return true, ""
+
+	case "restricted":
+		return false, "Bu söhbət məhdudlaşdırılıb"
+
+	default:
+		return false, "Naməlum söhbət statusu"
 	}
 }
 
