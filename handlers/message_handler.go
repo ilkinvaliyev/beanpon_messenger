@@ -574,15 +574,28 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 	if statusFilter == "pending" {
 		// Pending: Sadece KARŞI TARAFIN mesaj attığı conversation'lar
 		statusWhereClause = `
-			AND COALESCE(conv.status, 'active') = 'pending'
-			AND CASE 
-				WHEN conv.user1_id = ? THEN conv.user2_message_count > 0 
-				ELSE conv.user1_message_count > 0 
-			END
-		`
+        AND COALESCE(conv.status, 'active') = 'pending'
+        AND CASE 
+            WHEN conv.user1_id = ? THEN conv.user2_message_count > 0 
+            ELSE conv.user1_message_count > 0 
+        END
+    `
 		extraParams = append(extraParams, userID)
 	} else if statusFilter == "active" {
-		statusWhereClause = "AND COALESCE(conv.status, 'active') = 'active'"
+		// ✅ Active: pending OLMAYAN veya BEN mesaj attıysam göster
+		statusWhereClause = `
+        AND (
+            COALESCE(conv.status, 'active') = 'active'
+            OR (
+                COALESCE(conv.status, 'active') = 'pending'
+                AND CASE 
+                    WHEN conv.user1_id = ? THEN conv.user1_message_count > 0
+                    ELSE conv.user2_message_count > 0
+                END
+            )
+        )
+    `
+		extraParams = append(extraParams, userID)
 	} else if statusFilter == "restricted" {
 		statusWhereClause = "AND COALESCE(conv.status, 'active') = 'restricted'"
 	}
