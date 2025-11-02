@@ -804,10 +804,10 @@ func (h *MessageHandler) GetUnreadCount(c *gin.Context) {
 	}
 
 	var count int64
-	err := database.DB.Model(&models.Message{}).Where(
-		"receiver_id = ? AND read = false AND is_deleted_by_receiver = false",
-		userID,
-	).Count(&count).Error
+	err := database.DB.Model(&models.Message{}).
+		Joins("JOIN users ON users.id = messages.sender_id").
+		Where("messages.receiver_id = ? AND messages.read = false AND messages.is_deleted_by_receiver = false AND users.deleted_at IS NULL", userID).
+		Count(&count).Error
 
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Sayım yapılamadı"})
