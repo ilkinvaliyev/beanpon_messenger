@@ -67,34 +67,36 @@ func (h *LiveHub) HandleWebSocket(c *gin.Context) {
 	go client.readPump()
 }
 
-// readPump - Flutter'dan gelen mesajları okur
 func (c *LiveRoomClient) readPump() {
 	defer func() {
 		c.Hub.Unregister <- c
-		err := c.Conn.Close()
-		if err != nil {
-			return
-		}
+		c.Conn.Close()
 	}()
 
 	for {
 		_, message, err := c.Conn.ReadMessage()
 		if err != nil {
+			log.Printf("❌ ReadMessage hatası: %v", err)
 			break
 		}
 
-		log.Printf("📥 [GELEN RAW JSON]: %s", string(message))
+		log.Printf("📥 HAM MESAJ: %s", string(message))
 
 		var event LiveMessageEvent
 		if err := json.Unmarshal(message, &event); err != nil {
-			log.Printf("❌ [JSON PARSE HATASI]: %v", err)
+			log.Printf("❌ JSON PARSE HATASI: %v", err)
 			continue
 		}
+
+		log.Printf("✅ PARSE EDILDI: type=%s, senderID=%d, roomID=%d, data=%s",
+			event.Type, event.SenderID, event.RoomID, string(event.Data))
 
 		event.SenderID = c.UserID
 		event.RoomID = c.RoomID
 
+		log.Printf("📤 BROADCAST'E GONDERILIYOR: type=%s", event.Type)
 		c.Hub.Broadcast <- &event
+		log.Printf("✅ BROADCAST'E GONDERILDI")
 	}
 }
 
