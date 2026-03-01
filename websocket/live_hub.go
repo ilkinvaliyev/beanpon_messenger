@@ -140,6 +140,18 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 			}
 		}
 
+	case "ping":
+		h.mu.RLock()
+		client, exists := roomClients[event.SenderID]
+		h.mu.RUnlock()
+		if exists {
+			pong, _ := json.Marshal(map[string]string{"type": "pong"})
+			select {
+			case client.Send <- pong:
+			default:
+			}
+		}
+
 	case "broadcast_request":
 		for _, client := range roomClients {
 			if client.Role == "host" {
