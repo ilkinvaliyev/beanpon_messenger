@@ -191,5 +191,33 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 				}(targetClient)
 			}
 		}
+
+	case "kick_speaker":
+		var dataMap map[string]interface{}
+		if err := json.Unmarshal(event.Data, &dataMap); err != nil {
+			log.Printf("❌ kick_speaker data parse hatası: %v", err)
+			return
+		}
+
+		targetUserIDFloat, ok := dataMap["target_user_id"].(float64)
+		if !ok {
+			log.Println("⚠️ kick_speaker target_user_id bulunamadı veya geçersiz")
+			return
+		}
+
+		targetUserID := uint(targetUserIDFloat)
+		if targetClient, exists := roomClients[targetUserID]; exists {
+			targetClient.Role = "audience" // Rolünü geri al (Dinleyici yap)
+
+			// Güvenli gönderim (Kanal doluysa/kopmuşsa crash olmaması için)
+			select {
+			case targetClient.Send <- payload:
+			default:
+				close(targetClient.Send)
+				go func(c *LiveRoomClient) {
+					h.Unregister <- c
+				}(targetClient)
+			}
+		}
 	}
 }
