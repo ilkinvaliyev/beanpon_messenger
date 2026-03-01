@@ -421,39 +421,39 @@ func (h *Hub) sendRecentMessages(client *Client) {
 	}
 
 	query := `
-        SELECT 
-            m.id, 
-            m.sender_id, 
-            m.receiver_id,
-            m.story_id,
-            m.reply_to_message_id,
-            m.encrypted_text as text,
-            m.read,
-            m.sender_reaction,
-            m.receiver_reaction,
-            m.created_at,
-            reply.encrypted_text as reply_to_message_text,
-            reply.sender_id as reply_to_message_sender,
-            reply.type as reply_to_message_type,
-            reply.created_at as reply_to_created_at,
-            s.type as story_type,
-            s.media_url as story_media_url,
-            s.content as story_content,
-            s.user_id as story_user_id,
-            s.created_at as story_created_at
-        FROM messages m
-        LEFT JOIN messages reply ON m.reply_to_message_id = reply.id
-        LEFT JOIN stories s ON m.story_id = s.id
-        WHERE (m.sender_id = ? OR m.receiver_id = ?)
-        AND (
-            CASE 
-                WHEN m.sender_id = ? THEN m.is_deleted_by_sender = false
-                ELSE m.is_deleted_by_receiver = false
-            END
-        )
-        ORDER BY m.created_at ASC 
-        LIMIT 30
-    `
+    SELECT 
+        m.id, 
+        m.sender_id, 
+        m.receiver_id,
+        m.story_id,
+        m.reply_to_message_id,
+        m.encrypted_text as text,
+        m.read,
+        m.sender_reaction,
+        m.receiver_reaction,
+        m.created_at,
+        reply.encrypted_text as reply_to_message_text,
+        reply.sender_id as reply_to_message_sender,
+        reply."type" as reply_to_message_type,
+        reply.created_at as reply_to_created_at,
+        s."type" as story_type,
+        s.media_url as story_media_url,
+        s.content as story_content,
+        s.user_id as story_user_id,
+        s.created_at as story_created_at
+    FROM messages m
+    LEFT JOIN messages reply ON m.reply_to_message_id = reply.id
+    LEFT JOIN stories s ON m.story_id = s.id
+    WHERE (m.sender_id = ? OR m.receiver_id = ?)
+    AND (
+        CASE 
+            WHEN m.sender_id = ? THEN m.is_deleted_by_sender = false
+            ELSE m.is_deleted_by_receiver = false
+        END
+    )
+    ORDER BY m.created_at ASC 
+    LIMIT 30
+`
 
 	if err := h.db.Raw(query, client.UserID, client.UserID, client.UserID).Scan(&messages).Error; err != nil {
 		log.Printf("Son mesajlar alınamadı: %v", err)
