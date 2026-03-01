@@ -44,8 +44,9 @@ type LiveRoomMessage struct {
 	ID         uint      `json:"id" gorm:"primaryKey;autoIncrement"`
 	LiveRoomID uint      `json:"live_room_id" gorm:"not null;index"`
 	SenderID   uint      `json:"sender_id" gorm:"not null;index"`
-	Text       string    `json:"text" gorm:"type:text;not null"` // Şifresiz metin
+	Text       string    `json:"text" gorm:"type:text;not null"`
 	CreatedAt  time.Time `json:"created_at" gorm:"autoCreateTime"`
+	UpdatedAt  time.Time `json:"updated_at" gorm:"autoUpdateTime"` // BU SATIR EKLENDİ (Hata buradaydı!)
 
 	// İlişkiler
 	Sender User `json:"sender" gorm:"foreignKey:SenderID"`
