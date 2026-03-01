@@ -68,7 +68,6 @@ func (h *LiveHub) HandleWebSocket(c *gin.Context) {
 }
 
 // readPump - Flutter'dan gelen mesajları okur
-// websocket/live_handler.go içindeki readPump fonksiyonunu bununla değiştir:
 func (c *LiveRoomClient) readPump() {
 	defer func() {
 		c.Hub.Unregister <- c
@@ -84,7 +83,6 @@ func (c *LiveRoomClient) readPump() {
 			break
 		}
 
-		// 1. DEBUG: Flutter'dan ne geldiğini aynen yazdır
 		log.Printf("📥 [GELEN RAW JSON]: %s", string(message))
 
 		var event LiveMessageEvent
@@ -96,38 +94,6 @@ func (c *LiveRoomClient) readPump() {
 		event.SenderID = c.UserID
 		event.RoomID = c.RoomID
 
-		if event.Type == "chat_message" {
-			if dataMap, ok := event.Data.(map[string]interface{}); ok {
-				if textData, exists := dataMap["text"].(string); exists && textData != "" {
-
-					log.Printf("✍️ [DB'YE YAZILIYOR] Room: %d, User: %d, Text: %s", c.RoomID, c.UserID, textData)
-
-					chatMsg := models.LiveRoomMessage{
-						LiveRoomID: c.RoomID,
-						SenderID:   c.UserID,
-						Text:       textData,
-					}
-
-					// 2. DEBUG: Veritabanı hatasını yazdır
-					if err := database.DB.Create(&chatMsg).Error; err != nil {
-						log.Printf("💥 [DB KAYIT HATASI]: %v", err)
-					} else {
-						log.Printf("✅ [DB KAYIT BAŞARILI] Mesaj ID: %d", chatMsg.ID)
-
-						event.Data = gin.H{
-							"id":         chatMsg.ID,
-							"text":       textData,
-							"created_at": chatMsg.CreatedAt,
-						}
-					}
-				} else {
-					log.Println("⚠️ [VERİ HATASI]: 'text' alanı bulunamadı veya boş")
-				}
-			} else {
-				log.Println("⚠️ [VERİ HATASI]: event.Data bir map değil")
-			}
-		}
-
 		c.Hub.Broadcast <- &event
 	}
 }
@@ -137,7 +103,10 @@ func (c *LiveRoomClient) writePump() {
 	ticker := time.NewTicker(54 * time.Second)
 	defer func() {
 		ticker.Stop()
-		c.Conn.Close()
+		err := c.Conn.Close()
+		if err != nil {
+			return
+		}
 	}()
 
 	for {

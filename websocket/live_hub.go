@@ -1,26 +1,25 @@
 package websocket
 
 import (
+	"beanpon_messenger/database"
+	"beanpon_messenger/models"
 	"encoding/json"
 	"log"
 	"sync"
-	// Sadece bu paketi import etmemiz gerekiyordu
+
 	"github.com/gorilla/websocket"
 )
 
-// LiveRoomClient - Canlı yayındaki bir WebSocket bağlantısı
 type LiveRoomClient struct {
 	Hub    *LiveHub
-	Conn   *websocket.Conn // HATA BURADAYDI: *WebSocketConnection yerine *websocket.Conn olmalı
+	Conn   *websocket.Conn
 	UserID uint
 	RoomID uint
-	Role   string // "host", "broadcaster", "audience"
+	Role   string
 	Send   chan []byte
 }
 
-// LiveHub - Tüm canlı yayın odalarını yönetecek merkez
 type LiveHub struct {
-	// rooms: RoomID -> UserID -> Client
 	rooms map[uint]map[uint]*LiveRoomClient
 
 	Register   chan *LiveRoomClient
@@ -29,12 +28,11 @@ type LiveHub struct {
 	mu         sync.RWMutex
 }
 
-// LiveMessageEvent - İstemciler arası gidip gelecek JSON formatı
 type LiveMessageEvent struct {
-	Type     string      `json:"type"` // "chat_message", "broadcast_request", "request_approved"
-	RoomID   uint        `json:"room_id"`
-	SenderID uint        `json:"sender_id"`
-	Data     interface{} `json:"data"`
+	Type     string          `json:"type"`
+	SenderID uint            `json:"sender_id"`
+	RoomID   uint            `json:"room_id"`
+	Data     json.RawMessage `json:"data"`
 }
 
 func NewLiveHub() *LiveHub {
@@ -49,7 +47,6 @@ func NewLiveHub() *LiveHub {
 func (h *LiveHub) Run() {
 	for {
 		select {
-		// Biri odaya katıldığında
 		case client := <-h.Register:
 			h.mu.Lock()
 			if _, ok := h.rooms[client.RoomID]; !ok {
@@ -57,10 +54,8 @@ func (h *LiveHub) Run() {
 			}
 			h.rooms[client.RoomID][client.UserID] = client
 			h.mu.Unlock()
-
 			log.Printf("User %d joined Live Room %d as %s", client.UserID, client.RoomID, client.Role)
 
-		// Biri odadan çıktığında (veya soketi koptuğunda)
 		case client := <-h.Unregister:
 			h.mu.Lock()
 			if room, ok := h.rooms[client.RoomID]; ok {
@@ -69,14 +64,12 @@ func (h *LiveHub) Run() {
 					close(client.Send)
 					log.Printf("User %d left Live Room %d", client.UserID, client.RoomID)
 				}
-				// Oda boşaldıysa memory'den sil
 				if len(room) == 0 {
 					delete(h.rooms, client.RoomID)
 				}
 			}
 			h.mu.Unlock()
 
-		// Bir mesaj/event geldiğinde
 		case event := <-h.Broadcast:
 			h.handleEvent(event)
 		}
@@ -89,7 +82,7 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 	h.mu.RUnlock()
 
 	if !ok {
-		return // Oda aktif değilse bir şey yapma
+		return
 	}
 
 	payload, err := json.Marshal(event)
@@ -98,33 +91,93 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		return
 	}
 
-	// Event tipine göre dağıtım mantığı
 	switch event.Type {
+
 	case "chat_message":
-		// Chat mesajı odadaki HERKESE gider
+		var dataMap map[string]interface{}
+		if err := json.Unmarshal(event.Data, &dataMap); err != nil {
+			log.Printf("❌ chat_message data parse hatası: %v", err)
+			return
+		}
+
+		textData, ok := dataMap["text"].(string)
+		if !ok || textData == "" {
+			log.Println("⚠️ text alanı bulunamadı")
+			return
+		}
+
+		chatMsg := models.LiveRoomMessage{
+			LiveRoomID: event.RoomID,
+			SenderID:   event.SenderID,
+			Text:       textData,
+		}
+
+		if err := database.DB.Create(&chatMsg).Error; err != nil {
+			log.Printf("💥 DB KAYIT HATASI: %v", err)
+			return
+		}
+
+		log.Printf("✅ DB KAYIT BAŞARILI: Mesaj ID %d", chatMsg.ID)
+
+		updatedData, _ := json.Marshal(map[string]interface{}{
+			"id":         chatMsg.ID,
+			"text":       textData,
+			"created_at": chatMsg.CreatedAt,
+			"sender_id":  event.SenderID,
+		})
+		event.Data = json.RawMessage(updatedData)
+
+		payload, _ = json.Marshal(event)
+
 		for _, client := range roomClients {
 			select {
 			case client.Send <- payload:
 			default:
 				close(client.Send)
-				h.Unregister <- client
+				go func(c *LiveRoomClient) {
+					h.Unregister <- c
+				}(client)
 			}
 		}
 
 	case "broadcast_request":
-		// Dinleyici söz istiyor. SADECE HOST'A gider!
 		for _, client := range roomClients {
 			if client.Role == "host" {
-				client.Send <- payload
+				select {
+				case client.Send <- payload:
+				default:
+					close(client.Send)
+					go func(c *LiveRoomClient) {
+						h.Unregister <- c
+					}(client)
+				}
 			}
 		}
 
 	case "request_approved":
-		// Host onayladı. SADECE İSTEĞİ YAPAN KİŞİYE gider (mikrofonunu açsın diye)
-		targetUserID := event.Data.(map[string]interface{})["target_user_id"].(float64)
-		if targetClient, exists := roomClients[uint(targetUserID)]; exists {
+		var dataMap map[string]interface{}
+		if err := json.Unmarshal(event.Data, &dataMap); err != nil {
+			log.Printf("❌ request_approved data parse hatası: %v", err)
+			return
+		}
+
+		targetUserIDFloat, ok := dataMap["target_user_id"].(float64)
+		if !ok {
+			log.Println("⚠️ target_user_id bulunamadı veya geçersiz")
+			return
+		}
+
+		targetUserID := uint(targetUserIDFloat)
+		if targetClient, exists := roomClients[targetUserID]; exists {
 			targetClient.Role = "broadcaster"
-			targetClient.Send <- payload
+			select {
+			case targetClient.Send <- payload:
+			default:
+				close(targetClient.Send)
+				go func(c *LiveRoomClient) {
+					h.Unregister <- c
+				}(targetClient)
+			}
 		}
 	}
 }
