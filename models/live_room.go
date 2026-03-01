@@ -1,0 +1,63 @@
+package models
+
+import (
+	"time"
+)
+
+// LiveRoom - Laravel'deki 'live_rooms' tablosunun Go karşılığı (Sadece okuma amaçlı)
+type LiveRoom struct {
+	ID                 uint       `json:"id" gorm:"primaryKey;autoIncrement"`
+	HostUserID         uint       `json:"host_user_id" gorm:"not null;index"`
+	ChannelName        string     `json:"channel_name" gorm:"unique;not null"`
+	Title              *string    `json:"title"`
+	RoomType           string     `json:"room_type"` // audio, video, both
+	Status             string     `json:"status"`    // waiting, live, ended
+	HasPassword        bool       `json:"has_password"`
+	FilterGender       *string    `json:"filter_gender"`
+	FilterMinAge       *int       `json:"filter_min_age"`
+	FilterMaxAge       *int       `json:"filter_max_age"`
+	FilterVerifiedOnly bool       `json:"filter_verified_only"`
+	MaxBroadcasters    int        `json:"max_broadcasters"`
+	PeakViewerCount    int        `json:"peak_viewer_count"`
+	CreatedAt          time.Time  `json:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at"`
+	DeletedAt          *time.Time `json:"deleted_at" gorm:"index"`
+}
+
+// LiveRoomParticipant - Laravel'deki 'live_room_participants' (Sadece okuma amaçlı)
+type LiveRoomParticipant struct {
+	ID          uint       `json:"id" gorm:"primaryKey;autoIncrement"`
+	LiveRoomID  uint       `json:"live_room_id" gorm:"not null;index"`
+	UserID      uint       `json:"user_id" gorm:"not null;index"`
+	Role        string     `json:"role"`   // host, broadcaster, audience
+	Status      string     `json:"status"` // pending, active, rejected, left, kicked
+	AgoraUID    *uint      `json:"agora_uid"`
+	RequestedAt *time.Time `json:"requested_at"`
+	JoinedAt    *time.Time `json:"joined_at"`
+	LeftAt      *time.Time `json:"left_at"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
+}
+
+// LiveRoomMessage - BİZİM GOLANG'DA YÖNETECEĞİMİZ CHAT TABLOSU
+type LiveRoomMessage struct {
+	ID         uint      `json:"id" gorm:"primaryKey;autoIncrement"`
+	LiveRoomID uint      `json:"live_room_id" gorm:"not null;index"`
+	SenderID   uint      `json:"sender_id" gorm:"not null;index"`
+	Text       string    `json:"text" gorm:"type:text;not null"` // Şifresiz metin
+	CreatedAt  time.Time `json:"created_at" gorm:"autoCreateTime"`
+
+	// İlişkiler
+	Sender User `json:"sender" gorm:"foreignKey:SenderID"`
+}
+
+// Tablo isimlerini GORM için belirtiyoruz (Laravel ile uyumlu olsun diye)
+func (LiveRoom) TableName() string {
+	return "live_rooms"
+}
+func (LiveRoomParticipant) TableName() string {
+	return "live_room_participants"
+}
+func (LiveRoomMessage) TableName() string {
+	return "live_room_messages"
+}

@@ -27,11 +27,16 @@ func main() {
 
 	// Servisleri başlat
 	encryptionService := services.NewEncryptionService(cfg.AESKey)
+
+	// 1. MEVCUT SİSTEM: Özel Mesajlaşma (Chat) Hub'ı
 	wsHub := websocket.NewHub(database.DB, encryptionService, cfg)
 	go wsHub.Run()
 
+	// 2. YENİ SİSTEM: Canlı Yayın Odaları (Live) Hub'ı
+	liveHub := websocket.NewLiveHub()
+	go liveHub.Run()
+
 	// Handler'ları oluştur
-	// 🎯 Parametreleri düzelttik
 	messageHandler := handlers.NewMessageHandler(encryptionService, wsHub)
 	conversationHandler := handlers.NewConversationHandler(wsHub, encryptionService)
 
@@ -52,8 +57,12 @@ func main() {
 		c.Next()
 	})
 
-	// WebSocket endpoint (JWT middleware ile)
+	// 🔌 WEBSOCKET ENDPOINT'LERİ
+	// Özel mesajlaşma soketi
 	router.GET("/ws", middleware.JWTMiddlewareForWebSocket(cfg.JWTSecret), wsHub.HandleWebSocket)
+
+	// Canlı yayın odaları soketi (DÜZELTİLDİ: Artık doğrudan liveHub kullanılıyor)
+	router.GET("/ws/live", middleware.JWTMiddlewareForWebSocket(cfg.JWTSecret), liveHub.HandleWebSocket)
 
 	// Mesajlaşma API route'ları (JWT korumalı)
 	api := router.Group("/api/v1")
@@ -135,6 +144,7 @@ func main() {
 			"online_user_ids": onlineUsers,
 			"status":          "running",
 			"websocket_url":   "/ws",
+			"live_websocket":  "/ws/live",
 			"supported_message_types": []string{
 				"ping",
 				"typing",
@@ -166,8 +176,9 @@ func main() {
 	log.Println("  GET  /api/v1/unread-count - Okunmamış mesaj sayısı")
 	log.Println("  GET  /api/v1/online-users - Online kullanıcılar")
 	log.Println()
-	log.Println("🔌 WebSocket:")
-	log.Println("  GET  /ws?token=JWT_TOKEN - WebSocket bağlantısı")
+	log.Println("🔌 WebSocket Bağlantıları:")
+	log.Println("  GET  /ws?token=JWT_TOKEN - Özel Chat WebSocket'i")
+	log.Println("  GET  /ws/live?room_id=ID&token=JWT_TOKEN - Canlı Yayın WebSocket'i")
 	log.Println("  GET  /ws-status - WebSocket durumu")
 	log.Println()
 	log.Println("📚 Dokümantasyon:")
