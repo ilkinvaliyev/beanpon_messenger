@@ -434,7 +434,6 @@ func (h *Hub) sendRecentMessages(client *Client) {
         m.created_at,
         reply.encrypted_text as reply_to_message_text,
         reply.sender_id as reply_to_message_sender,
-        reply."type" as reply_to_message_type,
         reply.created_at as reply_to_created_at,
         s."type" as story_type,
         s.media_url as story_media_url,
