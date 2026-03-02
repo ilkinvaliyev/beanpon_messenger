@@ -123,10 +123,10 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		return
 	}
 
-	// Sadece chat_message DEĞİLSE önceden payload'ı marshal ediyoruz.
-	// chat_message kendi payload'ını zenginleştirecek.
+	// Sadece chat_message ve broadcast_request DEĞİLSE önceden payload'ı marshal ediyoruz.
+	// Çünkü bu ikisi kendi payload'larını (isim/resim ekleyerek) zenginleştirecek.
 	var payload []byte
-	if event.Type != "chat_message" {
+	if event.Type != "chat_message" && event.Type != "broadcast_request" {
 		payload, _ = json.Marshal(event)
 	}
 
@@ -146,7 +146,7 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 
 		// 1. PERFORMANS: DB sorgusu yok! Göndericinin bilgilerini RAM'den çekiyoruz.
 		h.mu.RLock()
-		senderClient, senderExists := h.rooms[event.RoomID][event.SenderID]
+		senderClient, senderExists := roomClients[event.SenderID]
 		h.mu.RUnlock()
 
 		senderName := "User"
@@ -155,15 +155,13 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		if senderExists {
 			senderName = senderClient.Name
 			if senderClient.Avatar != nil {
-				avatar := *senderClient.Avatar // pointer dereference
+				avatar := *senderClient.Avatar
 				senderAvatar = &avatar
 			}
 		}
 
 		// 2. Mesaj Datasini Zenginleştirme
 		updatedData, _ := json.Marshal(map[string]interface{}{
-			// id'yi simdilik bos veya random verebilirsin cunku flutter tarafi id'yi genelde listelemede kullanir.
-			// DB id'si anlik onemsizdir (UI guncellemesi icin).
 			"text":          textData,
 			"sender_id":     event.SenderID,
 			"sender_name":   senderName,
@@ -173,7 +171,7 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 
 		chatPayload, _ := json.Marshal(event)
 
-		// 3. ANINDA BROADCAST (Bekleme yok!)
+		// 3. ANINDA BROADCAST
 		for _, client := range roomClients {
 			select {
 			case client.Send <- chatPayload:
@@ -185,7 +183,7 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 			}
 		}
 
-		// 4. PERFORMANS: DB KAYDINI ASENKRON YAP (Arka planda çalışır, kimseyi bekletmez)
+		// 4. PERFORMANS: DB KAYDINI ASENKRON YAP
 		go func(roomID uint, senderID uint, text string) {
 			chatMsg := models.LiveRoomMessage{
 				LiveRoomID: roomID,
@@ -196,6 +194,48 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 				log.Printf("💥 DB ASYNC KAYIT HATASI: %v", err)
 			}
 		}(event.RoomID, event.SenderID, textData)
+
+	// --- YENİ DÜZENLENEN KISIM: İSTEK GÖNDERENİN BİLGİLERİNİ EKLE ---
+	case "broadcast_request":
+		h.mu.RLock()
+		senderClient, senderExists := roomClients[event.SenderID]
+		h.mu.RUnlock()
+
+		senderName := "User"
+		var senderAvatar *string = nil
+
+		if senderExists {
+			senderName = senderClient.Name
+			if senderClient.Avatar != nil {
+				avatar := *senderClient.Avatar
+				senderAvatar = &avatar
+			}
+		}
+
+		// Sadece isim ve resmi içeren yeni bir data oluşturuyoruz
+		updatedData, _ := json.Marshal(map[string]interface{}{
+			"sender_id":     event.SenderID,
+			"sender_name":   senderName,
+			"sender_avatar": utils.PrependBaseURL(senderAvatar),
+		})
+		event.Data = updatedData
+
+		requestPayload, _ := json.Marshal(event)
+
+		// Sadece host olanlara bu detaylı bilgiyi yolla
+		for _, client := range roomClients {
+			if client.Role == "host" {
+				select {
+				case client.Send <- requestPayload:
+				default:
+					close(client.Send)
+					go func(c *LiveRoomClient) {
+						h.Unregister <- c
+					}(client)
+				}
+			}
+		}
+	// -----------------------------------------------------------------
 
 	case "ping":
 		h.mu.RLock()
@@ -218,20 +258,6 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 				go func(c *LiveRoomClient) {
 					h.Unregister <- c
 				}(client)
-			}
-		}
-
-	case "broadcast_request":
-		for _, client := range roomClients {
-			if client.Role == "host" {
-				select {
-				case client.Send <- payload:
-				default:
-					close(client.Send)
-					go func(c *LiveRoomClient) {
-						h.Unregister <- c
-					}(client)
-				}
 			}
 		}
 
