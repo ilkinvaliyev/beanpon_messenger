@@ -53,15 +53,22 @@ func (h *LiveHub) Run() {
 				h.rooms[client.RoomID] = make(map[uint]*LiveRoomClient)
 			}
 			h.rooms[client.RoomID][client.UserID] = client
-
-			// Odadaki güncel kişi sayısını al
-			count := len(h.rooms[client.RoomID])
+			count := len(h.rooms[client.RoomID]) // Güncel sayıyı al
 			h.mu.Unlock()
 
-			log.Printf("User %d joined Live Room %d as %s. Total in room: %d", client.UserID, client.RoomID, client.Role, count)
+			log.Printf("User %d joined Live Room %d as %s", client.UserID, client.RoomID, client.Role)
 
-			// YENİ: Herkese güncel sayıyı gönder
-			h.broadcastViewerCount(client.RoomID, count)
+			// ÇÖZÜM: Eventi standart Broadcast kanalına asenkron olarak yolluyoruz.
+			eventData, _ := json.Marshal(map[string]interface{}{"count": count})
+			event := &LiveMessageEvent{
+				Type:     "viewer_count_update",
+				SenderID: 0,
+				RoomID:   client.RoomID,
+				Data:     json.RawMessage(eventData),
+			}
+			go func(e *LiveMessageEvent) {
+				h.Broadcast <- e
+			}(event)
 
 		case client := <-h.Unregister:
 			h.mu.Lock()
@@ -83,9 +90,18 @@ func (h *LiveHub) Run() {
 			}
 			h.mu.Unlock()
 
-			// YENİ: Eğer oda hala varsa, kalanlara güncel sayıyı gönder
+			// Odada kalan varsa, güncel sayıyı Broadcast'e yolla
 			if roomExists {
-				h.broadcastViewerCount(client.RoomID, count)
+				eventData, _ := json.Marshal(map[string]interface{}{"count": count})
+				event := &LiveMessageEvent{
+					Type:     "viewer_count_update",
+					SenderID: 0,
+					RoomID:   client.RoomID,
+					Data:     json.RawMessage(eventData),
+				}
+				go func(e *LiveMessageEvent) {
+					h.Broadcast <- e
+				}(event)
 			}
 
 		case event := <-h.Broadcast:
@@ -206,6 +222,18 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 			select {
 			case client.Send <- pong:
 			default:
+			}
+		}
+
+	case "viewer_count_update":
+		for _, client := range roomClients {
+			select {
+			case client.Send <- payload:
+			default:
+				close(client.Send)
+				go func(c *LiveRoomClient) {
+					h.Unregister <- c
+				}(client)
 			}
 		}
 
