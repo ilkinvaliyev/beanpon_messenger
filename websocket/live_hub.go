@@ -311,5 +311,54 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 				}(targetClient)
 			}
 		}
+	case "trigger_block_kick":
+		var dataMap map[string]interface{}
+		if err := json.Unmarshal(event.Data, &dataMap); err != nil {
+			log.Printf("❌ trigger_block_kick data parse hatası: %v", err)
+			return
+		}
+
+		targetUserIDFloat, ok := dataMap["target_user_id"].(float64)
+		if !ok {
+			return
+		}
+
+		// Sinyali gönderen (SenderID) bloklayan kişidir. Hedef ise bloklanandır.
+		// Hızla odadan şutla!
+		h.EnforceBlock(event.SenderID, uint(targetUserIDFloat))
+	}
+}
+
+// EnforceBlock - Bloklanan kullanıcıyı anında yayından atar (RAM üzerinden yüksek performans)
+func (h *LiveHub) EnforceBlock(blockerID, blockedID uint) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	// Tüm aktif canlı yayın odalarını gez
+	for _, clients := range h.rooms {
+		// Eğer bloklayan kişi bu odadaysa
+		if _, blockerExists := clients[blockerID]; blockerExists {
+			// Ve bloklanan kişi de BU ODADAYSA
+			if blockedClient, blockedExists := clients[blockedID]; blockedExists {
+
+				// Bloklanan kişiye "odadan atıldın" mesajı gönder
+				kickEvent, _ := json.Marshal(map[string]interface{}{
+					"type": "kicked_by_block",
+					"data": map[string]string{
+						"message": "Bu yayından kənarlaşdırıldınız.",
+					},
+				})
+
+				select {
+				case blockedClient.Send <- kickEvent:
+				default:
+				}
+
+				// Kullanıcının bağlantısını koparmak için Unregister kanalına yolla
+				go func(c *LiveRoomClient) {
+					h.Unregister <- c
+				}(blockedClient)
+			}
+		}
 	}
 }

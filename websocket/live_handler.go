@@ -45,6 +45,21 @@ func (h *LiveHub) HandleWebSocket(c *gin.Context) {
 		return
 	}
 
+	// --- YENİ EKLENEN BLOK KONTROLÜ BAŞLANGICI ---
+	// Odanın Host'unu (Yayıncısını) buluyoruz
+	var room models.LiveRoom
+	if err := database.DB.Select("host_user_id").First(&room, roomID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Oda tapılmadı"})
+		return
+	}
+
+	// Eğer Host beni bloklamışsa VEYA ben Host'u bloklamışsam giremem
+	if models.IsBlocked(database.DB, room.HostUserID, userID) || models.IsBlocked(database.DB, userID, room.HostUserID) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Bu yayına qoşula bilməzsiniz (Bloklanıb)"})
+		return
+	}
+	// --- YENİ EKLENEN BLOK KONTROLÜ BİTİŞİ ---
+
 	// liveUpgrader kullanıyoruz
 	conn, err := liveUpgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
@@ -52,7 +67,6 @@ func (h *LiveHub) HandleWebSocket(c *gin.Context) {
 		return
 	}
 
-	// --- YÜKSEK PERFORMANS İÇİN EKLENEN KISIM BAŞLANGICI ---
 	// Kullanıcının ismini ve resmini SADECE ODAYA GİRERKEN DB'den 1 kez çekiyoruz
 	type SenderInfo struct {
 		Name         string
@@ -64,7 +78,6 @@ func (h *LiveHub) HandleWebSocket(c *gin.Context) {
 		Joins("left join profiles on profiles.user_id = users.id").
 		Where("users.id = ?", userID).
 		Scan(&senderInfo)
-	// --- YÜKSEK PERFORMANS İÇİN EKLENEN KISIM BİTİŞİ ---
 
 	client := &LiveRoomClient{
 		Hub:    h,
@@ -72,8 +85,8 @@ func (h *LiveHub) HandleWebSocket(c *gin.Context) {
 		UserID: userID,
 		RoomID: uint(roomID),
 		Role:   participant.Role,
-		Name:   senderInfo.Name,         // YENİ: RAM'e yazıldı
-		Avatar: senderInfo.ProfileImage, // YENİ: RAM'e yazıldı
+		Name:   senderInfo.Name,         // RAM'e yazıldı
+		Avatar: senderInfo.ProfileImage, // RAM'e yazıldı
 		Send:   make(chan []byte, 256),
 	}
 
