@@ -53,82 +53,25 @@ func (h *LiveHub) Run() {
 				h.rooms[client.RoomID] = make(map[uint]*LiveRoomClient)
 			}
 			h.rooms[client.RoomID][client.UserID] = client
-
-			// Odadaki güncel kişi sayısını al
-			count := len(h.rooms[client.RoomID])
 			h.mu.Unlock()
-
-			log.Printf("User %d joined Live Room %d as %s. Total in room: %d", client.UserID, client.RoomID, client.Role, count)
-
-			// YENİ: Herkese güncel sayıyı gönder
-			h.broadcastViewerCount(client.RoomID, count)
+			log.Printf("User %d joined Live Room %d as %s", client.UserID, client.RoomID, client.Role)
 
 		case client := <-h.Unregister:
 			h.mu.Lock()
-			var count int
-			roomExists := false
-
 			if room, ok := h.rooms[client.RoomID]; ok {
 				if _, ok := room[client.UserID]; ok {
 					delete(room, client.UserID)
 					close(client.Send)
 					log.Printf("User %d left Live Room %d", client.UserID, client.RoomID)
 				}
-				count = len(room)
-				roomExists = true
-				if count == 0 {
+				if len(room) == 0 {
 					delete(h.rooms, client.RoomID)
-					roomExists = false
 				}
 			}
 			h.mu.Unlock()
 
-			// YENİ: Eğer oda hala varsa, kalanlara güncel sayıyı gönder
-			if roomExists {
-				h.broadcastViewerCount(client.RoomID, count)
-			}
-
 		case event := <-h.Broadcast:
 			h.handleEvent(event)
-		}
-	}
-}
-
-// YENİ YARDIMCI FONKSİYON: Odadaki herkese izleyici sayısını fırlatır
-func (h *LiveHub) broadcastViewerCount(roomID uint, count int) {
-	h.mu.RLock()
-	roomClients, ok := h.rooms[roomID]
-	h.mu.RUnlock()
-
-	if !ok {
-		return
-	}
-
-	// 'viewer_count_update' tipinde bir event oluşturuyoruz
-	eventData, _ := json.Marshal(map[string]interface{}{
-		"count": count,
-	})
-
-	event := &LiveMessageEvent{
-		Type:   "viewer_count_update",
-		RoomID: roomID,
-		Data:   json.RawMessage(eventData),
-	}
-
-	payload, err := json.Marshal(event)
-	if err != nil {
-		log.Println("Viewer count marshal error:", err)
-		return
-	}
-
-	for _, client := range roomClients {
-		select {
-		case client.Send <- payload:
-		default:
-			close(client.Send)
-			go func(c *LiveRoomClient) {
-				h.Unregister <- c
-			}(client)
 		}
 	}
 }
