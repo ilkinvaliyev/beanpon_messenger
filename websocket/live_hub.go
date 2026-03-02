@@ -3,6 +3,7 @@ package websocket
 import (
 	"beanpon_messenger/database"
 	"beanpon_messenger/models"
+	"beanpon_messenger/utils"
 	"encoding/json"
 	"log"
 	"sync"
@@ -10,12 +11,15 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// YENİ: Name ve Avatar eklendi. (HandleWebSocket tarafında doldurulmalı)
 type LiveRoomClient struct {
 	Hub    *LiveHub
 	Conn   *websocket.Conn
 	UserID uint
 	RoomID uint
 	Role   string
+	Name   string  // RAM'de tutulacak isim
+	Avatar *string // RAM'de tutulacak avatar URL
 	Send   chan []byte
 }
 
@@ -58,7 +62,7 @@ func (h *LiveHub) Run() {
 
 			log.Printf("User %d joined Live Room %d as %s", client.UserID, client.RoomID, client.Role)
 
-			// ÇÖZÜM: Eventi standart Broadcast kanalına asenkron olarak yolluyoruz.
+			// Eventi standart Broadcast kanalına asenkron olarak yolluyoruz.
 			eventData, _ := json.Marshal(map[string]interface{}{"count": count})
 			event := &LiveMessageEvent{
 				Type:     "viewer_count_update",
@@ -110,45 +114,6 @@ func (h *LiveHub) Run() {
 	}
 }
 
-// YENİ YARDIMCI FONKSİYON: Odadaki herkese izleyici sayısını fırlatır
-func (h *LiveHub) broadcastViewerCount(roomID uint, count int) {
-	h.mu.RLock()
-	roomClients, ok := h.rooms[roomID]
-	h.mu.RUnlock()
-
-	if !ok {
-		return
-	}
-
-	// 'viewer_count_update' tipinde bir event oluşturuyoruz
-	eventData, _ := json.Marshal(map[string]interface{}{
-		"count": count,
-	})
-
-	event := &LiveMessageEvent{
-		Type:   "viewer_count_update",
-		RoomID: roomID,
-		Data:   json.RawMessage(eventData),
-	}
-
-	payload, err := json.Marshal(event)
-	if err != nil {
-		log.Println("Viewer count marshal error:", err)
-		return
-	}
-
-	for _, client := range roomClients {
-		select {
-		case client.Send <- payload:
-		default:
-			close(client.Send)
-			go func(c *LiveRoomClient) {
-				h.Unregister <- c
-			}(client)
-		}
-	}
-}
-
 func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 	h.mu.RLock()
 	roomClients, ok := h.rooms[event.RoomID]
@@ -158,10 +123,11 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		return
 	}
 
-	payload, err := json.Marshal(event)
-	if err != nil {
-		log.Println("LiveHub marshal error:", err)
-		return
+	// Sadece chat_message DEĞİLSE önceden payload'ı marshal ediyoruz.
+	// chat_message kendi payload'ını zenginleştirecek.
+	var payload []byte
+	if event.Type != "chat_message" {
+		payload, _ = json.Marshal(event)
 	}
 
 	switch event.Type {
@@ -175,36 +141,42 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 
 		textData, ok := dataMap["text"].(string)
 		if !ok || textData == "" {
-			log.Println("⚠️ text alanı bulunamadı")
 			return
 		}
 
-		chatMsg := models.LiveRoomMessage{
-			LiveRoomID: event.RoomID,
-			SenderID:   event.SenderID,
-			Text:       textData,
+		// 1. PERFORMANS: DB sorgusu yok! Göndericinin bilgilerini RAM'den çekiyoruz.
+		h.mu.RLock()
+		senderClient, senderExists := h.rooms[event.RoomID][event.SenderID]
+		h.mu.RUnlock()
+
+		senderName := "User"
+		var senderAvatar *string = nil
+
+		if senderExists {
+			senderName = senderClient.Name
+			if senderClient.Avatar != nil {
+				avatar := *senderClient.Avatar // pointer dereference
+				senderAvatar = &avatar
+			}
 		}
 
-		if err := database.DB.Create(&chatMsg).Error; err != nil {
-			log.Printf("💥 DB KAYIT HATASI: %v", err)
-			return
-		}
-
-		log.Printf("✅ DB KAYIT BAŞARILI: Mesaj ID %d", chatMsg.ID)
-
+		// 2. Mesaj Datasini Zenginleştirme
 		updatedData, _ := json.Marshal(map[string]interface{}{
-			"id":         chatMsg.ID,
-			"text":       textData,
-			"created_at": chatMsg.CreatedAt,
-			"sender_id":  event.SenderID,
+			// id'yi simdilik bos veya random verebilirsin cunku flutter tarafi id'yi genelde listelemede kullanir.
+			// DB id'si anlik onemsizdir (UI guncellemesi icin).
+			"text":          textData,
+			"sender_id":     event.SenderID,
+			"sender_name":   senderName,
+			"sender_avatar": utils.PrependBaseURL(senderAvatar),
 		})
-		event.Data = json.RawMessage(updatedData)
+		event.Data = updatedData
 
-		payload, _ = json.Marshal(event)
+		chatPayload, _ := json.Marshal(event)
 
+		// 3. ANINDA BROADCAST (Bekleme yok!)
 		for _, client := range roomClients {
 			select {
-			case client.Send <- payload:
+			case client.Send <- chatPayload:
 			default:
 				close(client.Send)
 				go func(c *LiveRoomClient) {
@@ -212,6 +184,18 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 				}(client)
 			}
 		}
+
+		// 4. PERFORMANS: DB KAYDINI ASENKRON YAP (Arka planda çalışır, kimseyi bekletmez)
+		go func(roomID uint, senderID uint, text string) {
+			chatMsg := models.LiveRoomMessage{
+				LiveRoomID: roomID,
+				SenderID:   senderID,
+				Text:       text,
+			}
+			if err := database.DB.Create(&chatMsg).Error; err != nil {
+				log.Printf("💥 DB ASYNC KAYIT HATASI: %v", err)
+			}
+		}(event.RoomID, event.SenderID, textData)
 
 	case "ping":
 		h.mu.RLock()
@@ -260,7 +244,6 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 
 		targetUserIDFloat, ok := dataMap["target_user_id"].(float64)
 		if !ok {
-			log.Println("⚠️ target_user_id bulunamadı veya geçersiz")
 			return
 		}
 
@@ -286,7 +269,6 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 
 		targetUserIDFloat, ok := dataMap["target_user_id"].(float64)
 		if !ok {
-			log.Println("⚠️ kick_speaker target_user_id bulunamadı veya geçersiz")
 			return
 		}
 
@@ -294,7 +276,6 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		if targetClient, exists := roomClients[targetUserID]; exists {
 			targetClient.Role = "audience" // Rolünü geri al (Dinleyici yap)
 
-			// Güvenli gönderim (Kanal doluysa/kopmuşsa crash olmaması için)
 			select {
 			case targetClient.Send <- payload:
 			default:

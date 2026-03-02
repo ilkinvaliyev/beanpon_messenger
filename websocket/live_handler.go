@@ -52,12 +52,28 @@ func (h *LiveHub) HandleWebSocket(c *gin.Context) {
 		return
 	}
 
+	// --- YÜKSEK PERFORMANS İÇİN EKLENEN KISIM BAŞLANGICI ---
+	// Kullanıcının ismini ve resmini SADECE ODAYA GİRERKEN DB'den 1 kez çekiyoruz
+	type SenderInfo struct {
+		Name         string
+		ProfileImage *string
+	}
+	var senderInfo SenderInfo
+	database.DB.Table("users").
+		Select("users.name, profiles.profile_image").
+		Joins("left join profiles on profiles.user_id = users.id").
+		Where("users.id = ?", userID).
+		Scan(&senderInfo)
+	// --- YÜKSEK PERFORMANS İÇİN EKLENEN KISIM BİTİŞİ ---
+
 	client := &LiveRoomClient{
 		Hub:    h,
 		Conn:   conn,
 		UserID: userID,
 		RoomID: uint(roomID),
 		Role:   participant.Role,
+		Name:   senderInfo.Name,         // YENİ: RAM'e yazıldı
+		Avatar: senderInfo.ProfileImage, // YENİ: RAM'e yazıldı
 		Send:   make(chan []byte, 256),
 	}
 
@@ -70,7 +86,10 @@ func (h *LiveHub) HandleWebSocket(c *gin.Context) {
 func (c *LiveRoomClient) readPump() {
 	defer func() {
 		c.Hub.Unregister <- c
-		c.Conn.Close()
+		err := c.Conn.Close()
+		if err != nil {
+			return
+		}
 	}()
 
 	for {
@@ -115,7 +134,10 @@ func (c *LiveRoomClient) writePump() {
 		select {
 		case message, ok := <-c.Send:
 			if !ok {
-				c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
+				err := c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
+				if err != nil {
+					return
+				}
 				return
 			}
 
