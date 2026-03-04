@@ -736,18 +736,26 @@ func (h *ConversationHandler) GetPendingRequestCount(c *gin.Context) {
 
 	var count int64
 
+	// Karşıdaki kullanıcının durumunu kontrol etmek için users tablosunu JOIN ediyoruz.
 	query := `
-        SELECT COUNT(*) 
+        SELECT COUNT(c.id) 
         FROM conversations c
+        INNER JOIN users u ON u.id = CASE 
+            WHEN c.user1_id = ? THEN c.user2_id 
+            ELSE c.user1_id 
+        END
         WHERE (c.user1_id = ? OR c.user2_id = ?)
         AND c.status = 'pending'
         AND CASE 
             WHEN c.user1_id = ? THEN c.user2_message_count > 0 
             ELSE c.user1_message_count > 0 
         END
+        AND u.deleted_at IS NULL 
+        AND u.deactivated_at IS NULL
     `
 
-	database.DB.Raw(query, userID, userID, userID).Scan(&count)
+	// Sorguda 4 adet '?' kullandığımız için userID'yi 4 kez gönderiyoruz.
+	database.DB.Raw(query, userID, userID, userID, userID).Scan(&count)
 
 	c.JSON(http.StatusOK, gin.H{
 		"pending_requests_count": count,
