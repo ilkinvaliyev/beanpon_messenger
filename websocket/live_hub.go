@@ -71,16 +71,36 @@ func (h *LiveHub) Run() {
 
 			log.Printf("User %d joined Live Room %d as %s", client.UserID, client.RoomID, client.Role)
 
+			// Viewer count
 			eventData, _ := json.Marshal(map[string]interface{}{"count": count})
-			event := &LiveMessageEvent{
-				Type:     "viewer_count_update",
-				SenderID: 0,
-				RoomID:   client.RoomID,
-				Data:     json.RawMessage(eventData),
-			}
-			go func(e *LiveMessageEvent) {
-				h.Broadcast <- e
-			}(event)
+			go func(e *LiveMessageEvent) { h.Broadcast <- e }(&LiveMessageEvent{
+				Type: "viewer_count_update", RoomID: client.RoomID,
+				Data: eventData,
+			})
+
+			// YENİ: user_joined — özünə göndərmə
+			joinData, _ := json.Marshal(map[string]interface{}{
+				"user_id":   client.UserID,
+				"user_name": client.Name,
+			})
+			go func(roomID uint, senderID uint, data json.RawMessage) {
+				h.mu.RLock()
+				clients := h.rooms[roomID]
+				h.mu.RUnlock()
+				payload, _ := json.Marshal(map[string]interface{}{
+					"type":      "user_joined",
+					"sender_id": senderID,
+					"room_id":   roomID,
+					"data":      data,
+				})
+				for _, c := range clients {
+					// if uid == senderID { continue } ← SİL
+					select {
+					case c.Send <- payload:
+					default:
+					}
+				}
+			}(client.RoomID, client.UserID, joinData)
 
 		case client := <-h.Unregister:
 			h.mu.Lock()
@@ -105,15 +125,28 @@ func (h *LiveHub) Run() {
 
 			if roomExists {
 				eventData, _ := json.Marshal(map[string]interface{}{"count": count})
-				event := &LiveMessageEvent{
-					Type:     "viewer_count_update",
-					SenderID: 0,
-					RoomID:   client.RoomID,
-					Data:     json.RawMessage(eventData),
+				go func(e *LiveMessageEvent) { h.Broadcast <- e }(&LiveMessageEvent{
+					Type: "viewer_count_update", RoomID: client.RoomID,
+					Data: eventData,
+				})
+			}
+
+			// Host ayrıldısa bütün odaya "live_ended" göndər
+			if client.Role == "host" {
+				endedPayload, _ := json.Marshal(map[string]interface{}{
+					"type": "ended",
+					"data": map[string]interface{}{},
+				})
+				h.mu.RLock()
+				if roomClients, ok := h.rooms[client.RoomID]; ok {
+					for _, c := range roomClients {
+						select {
+						case c.Send <- endedPayload:
+						default:
+						}
+					}
 				}
-				go func(e *LiveMessageEvent) {
-					h.Broadcast <- e
-				}(event)
+				h.mu.RUnlock()
 			}
 
 		case event := <-h.Broadcast:
