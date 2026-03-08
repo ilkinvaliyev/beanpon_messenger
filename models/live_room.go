@@ -51,6 +51,14 @@ type LiveRoomMessage struct {
 	// İlişkiler
 	Sender User `json:"sender" gorm:"foreignKey:SenderID"`
 }
+type LiveRoomReaction struct {
+	ID           uint      `json:"id" gorm:"primaryKey;autoIncrement"`
+	LiveRoomID   uint      `json:"live_room_id" gorm:"not null;index"`
+	ReactionName string    `json:"reaction_name" gorm:"not null"`
+	Count        uint64    `json:"count" gorm:"default:0"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
 
 // Tablo isimlerini GORM için belirtiyoruz (Laravel ile uyumlu olsun diye)
 func (LiveRoom) TableName() string {
@@ -61,4 +69,8 @@ func (LiveRoomParticipant) TableName() string {
 }
 func (LiveRoomMessage) TableName() string {
 	return "live_room_messages"
+}
+
+func (LiveRoomReaction) TableName() string {
+	return "live_room_reactions"
 }

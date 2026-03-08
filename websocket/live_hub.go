@@ -7,24 +7,28 @@ import (
 	"encoding/json"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
 
-// YENİ: Name ve Avatar eklendi. (HandleWebSocket tarafında doldurulmalı)
 type LiveRoomClient struct {
 	Hub    *LiveHub
 	Conn   *websocket.Conn
 	UserID uint
 	RoomID uint
 	Role   string
-	Name   string  // RAM'de tutulacak isim
-	Avatar *string // RAM'de tutulacak avatar URL
+	Name   string
+	Avatar *string
 	Send   chan []byte
 }
 
 type LiveHub struct {
 	rooms map[uint]map[uint]*LiveRoomClient
+
+	// reactionBuffer[roomID][reactionName] = toplam sayı
+	// Her 1.5 saniyede bir flush edilir
+	reactionBuffer map[uint]map[string]uint64
 
 	Register   chan *LiveRoomClient
 	Unregister chan *LiveRoomClient
@@ -41,14 +45,19 @@ type LiveMessageEvent struct {
 
 func NewLiveHub() *LiveHub {
 	return &LiveHub{
-		rooms:      make(map[uint]map[uint]*LiveRoomClient),
-		Register:   make(chan *LiveRoomClient),
-		Unregister: make(chan *LiveRoomClient),
-		Broadcast:  make(chan *LiveMessageEvent),
+		rooms:          make(map[uint]map[uint]*LiveRoomClient),
+		reactionBuffer: make(map[uint]map[string]uint64),
+		Register:       make(chan *LiveRoomClient),
+		Unregister:     make(chan *LiveRoomClient),
+		Broadcast:      make(chan *LiveMessageEvent),
 	}
 }
 
 func (h *LiveHub) Run() {
+	// Her 1.5 saniyede bir reactionBuffer'ı flush et
+	reactionTicker := time.NewTicker(1500 * time.Millisecond)
+	defer reactionTicker.Stop()
+
 	for {
 		select {
 		case client := <-h.Register:
@@ -57,12 +66,11 @@ func (h *LiveHub) Run() {
 				h.rooms[client.RoomID] = make(map[uint]*LiveRoomClient)
 			}
 			h.rooms[client.RoomID][client.UserID] = client
-			count := len(h.rooms[client.RoomID]) // Güncel sayıyı al
+			count := len(h.rooms[client.RoomID])
 			h.mu.Unlock()
 
 			log.Printf("User %d joined Live Room %d as %s", client.UserID, client.RoomID, client.Role)
 
-			// Eventi standart Broadcast kanalına asenkron olarak yolluyoruz.
 			eventData, _ := json.Marshal(map[string]interface{}{"count": count})
 			event := &LiveMessageEvent{
 				Type:     "viewer_count_update",
@@ -89,12 +97,12 @@ func (h *LiveHub) Run() {
 				roomExists = true
 				if count == 0 {
 					delete(h.rooms, client.RoomID)
+					delete(h.reactionBuffer, client.RoomID) // Buffer-ı da temizle
 					roomExists = false
 				}
 			}
 			h.mu.Unlock()
 
-			// Odada kalan varsa, güncel sayıyı Broadcast'e yolla
 			if roomExists {
 				eventData, _ := json.Marshal(map[string]interface{}{"count": count})
 				event := &LiveMessageEvent{
@@ -110,7 +118,89 @@ func (h *LiveHub) Run() {
 
 		case event := <-h.Broadcast:
 			h.handleEvent(event)
+
+		case <-reactionTicker.C:
+			h.flushReactions()
 		}
+	}
+}
+
+// flushReactions - Buffer'daki reaksiyonları toplu olarak broadcast eder ve DB'ye yazar
+func (h *LiveHub) flushReactions() {
+	h.mu.Lock()
+
+	// Göndermek için snapshot al, sonra buffer'ı sıfırla
+	type reactionSnapshot struct {
+		roomID    uint
+		reactions map[string]uint64
+	}
+
+	var snapshots []reactionSnapshot
+
+	for roomID, reactions := range h.reactionBuffer {
+		if len(reactions) == 0 {
+			continue
+		}
+		snapshot := reactionSnapshot{
+			roomID:    roomID,
+			reactions: make(map[string]uint64),
+		}
+		for reactionName, count := range reactions {
+			snapshot.reactions[reactionName] = count
+		}
+		snapshots = append(snapshots, snapshot)
+	}
+
+	// Buffer'ı sıfırla
+	h.reactionBuffer = make(map[uint]map[string]uint64)
+
+	h.mu.Unlock()
+
+	// Snapshot'ları broadcast et ve DB'ye yaz
+	for _, snapshot := range snapshots {
+		h.mu.RLock()
+		roomClients, ok := h.rooms[snapshot.roomID]
+		h.mu.RUnlock()
+
+		if !ok {
+			continue
+		}
+
+		// Flutter'a gönderilecek payload
+		// {"type": "reaction_update", "data": {"heart": 5, "like": 2}}
+		eventData, _ := json.Marshal(map[string]interface{}{
+			"reactions": snapshot.reactions,
+		})
+		payload, _ := json.Marshal(map[string]interface{}{
+			"type":    "reaction_update",
+			"room_id": snapshot.roomID,
+			"data":    json.RawMessage(eventData),
+		})
+
+		for _, client := range roomClients {
+			select {
+			case client.Send <- payload:
+			default:
+				close(client.Send)
+				go func(c *LiveRoomClient) {
+					h.Unregister <- c
+				}(client)
+			}
+		}
+
+		// DB'ye async upsert — her emoji için count'u artır
+		go func(roomID uint, reactions map[string]uint64) {
+			for reactionName, count := range reactions {
+				err := database.DB.Exec(`
+					INSERT INTO live_room_reactions (live_room_id, reaction_name, count, created_at, updated_at)
+					VALUES (?, ?, ?, NOW(), NOW())
+					ON DUPLICATE KEY UPDATE count = count + ?, updated_at = NOW()
+				`, roomID, reactionName, count, count).Error
+				if err != nil {
+					log.Printf("💥 Reaction DB upsert hatası: %v", err)
+				}
+			}
+		}(snapshot.roomID, snapshot.reactions)
 	}
 }
 
@@ -123,14 +213,42 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		return
 	}
 
-	// Sadece chat_message ve broadcast_request DEĞİLSE önceden payload'ı marshal ediyoruz.
-	// Çünkü bu ikisi kendi payload'larını (isim/resim ekleyerek) zenginleştirecek.
 	var payload []byte
-	if event.Type != "chat_message" && event.Type != "broadcast_request" {
+	if event.Type != "chat_message" && event.Type != "broadcast_request" && event.Type != "reaction" {
 		payload, _ = json.Marshal(event)
 	}
 
 	switch event.Type {
+
+	case "reaction":
+		// Flutter'dan gelen: {"type": "reaction", "data": {"name": "heart"}}
+		var dataMap map[string]interface{}
+		if err := json.Unmarshal(event.Data, &dataMap); err != nil {
+			log.Printf("❌ reaction data parse hatası: %v", err)
+			return
+		}
+
+		reactionName, ok := dataMap["name"].(string)
+		if !ok || reactionName == "" {
+			return
+		}
+
+		// Geçerli emoji adı kontrolü
+		validReactions := map[string]bool{
+			"heart": true, "like": true, "laugh": true,
+			"withyou": true, "cry": true, "angry": true, "dislike": true,
+		}
+		if !validReactions[reactionName] {
+			return
+		}
+
+		// Buffer'a ekle (DB'ye veya broadcast'e gitmez, ticker bekler)
+		h.mu.Lock()
+		if h.reactionBuffer[event.RoomID] == nil {
+			h.reactionBuffer[event.RoomID] = make(map[string]uint64)
+		}
+		h.reactionBuffer[event.RoomID][reactionName]++
+		h.mu.Unlock()
 
 	case "chat_message":
 		var dataMap map[string]interface{}
@@ -144,7 +262,6 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 			return
 		}
 
-		// 1. PERFORMANS: DB sorgusu yok! Göndericinin bilgilerini RAM'den çekiyoruz.
 		h.mu.RLock()
 		senderClient, senderExists := roomClients[event.SenderID]
 		h.mu.RUnlock()
@@ -160,7 +277,6 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 			}
 		}
 
-		// 2. Mesaj Datasini Zenginleştirme
 		updatedData, _ := json.Marshal(map[string]interface{}{
 			"text":          textData,
 			"sender_id":     event.SenderID,
@@ -171,7 +287,6 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 
 		chatPayload, _ := json.Marshal(event)
 
-		// 3. ANINDA BROADCAST
 		for _, client := range roomClients {
 			select {
 			case client.Send <- chatPayload:
@@ -183,7 +298,6 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 			}
 		}
 
-		// 4. PERFORMANS: DB KAYDINI ASENKRON YAP
 		go func(roomID uint, senderID uint, text string) {
 			chatMsg := models.LiveRoomMessage{
 				LiveRoomID: roomID,
@@ -195,7 +309,6 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 			}
 		}(event.RoomID, event.SenderID, textData)
 
-	// --- YENİ DÜZENLENEN KISIM: İSTEK GÖNDERENİN BİLGİLERİNİ EKLE ---
 	case "broadcast_request":
 		h.mu.RLock()
 		senderClient, senderExists := roomClients[event.SenderID]
@@ -212,7 +325,6 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 			}
 		}
 
-		// Sadece isim ve resmi içeren yeni bir data oluşturuyoruz
 		updatedData, _ := json.Marshal(map[string]interface{}{
 			"sender_id":     event.SenderID,
 			"sender_name":   senderName,
@@ -222,7 +334,6 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 
 		requestPayload, _ := json.Marshal(event)
 
-		// Sadece host olanlara bu detaylı bilgiyi yolla
 		for _, client := range roomClients {
 			if client.Role == "host" {
 				select {
@@ -235,7 +346,6 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 				}
 			}
 		}
-	// -----------------------------------------------------------------
 
 	case "ping":
 		h.mu.RLock()
@@ -300,8 +410,7 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 
 		targetUserID := uint(targetUserIDFloat)
 		if targetClient, exists := roomClients[targetUserID]; exists {
-			targetClient.Role = "audience" // Rolünü geri al (Dinleyici yap)
-
+			targetClient.Role = "audience"
 			select {
 			case targetClient.Send <- payload:
 			default:
@@ -311,6 +420,7 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 				}(targetClient)
 			}
 		}
+
 	case "trigger_block_kick":
 		var dataMap map[string]interface{}
 		if err := json.Unmarshal(event.Data, &dataMap); err != nil {
@@ -323,25 +433,17 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 			return
 		}
 
-		// Sinyali gönderen (SenderID) bloklayan kişidir. Hedef ise bloklanandır.
-		// Hızla odadan şutla!
 		h.EnforceBlock(event.SenderID, uint(targetUserIDFloat))
 	}
 }
 
-// EnforceBlock - Bloklanan kullanıcıyı anında yayından atar (RAM üzerinden yüksek performans)
 func (h *LiveHub) EnforceBlock(blockerID, blockedID uint) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
-	// Tüm aktif canlı yayın odalarını gez
 	for _, clients := range h.rooms {
-		// Eğer bloklayan kişi bu odadaysa
 		if _, blockerExists := clients[blockerID]; blockerExists {
-			// Ve bloklanan kişi de BU ODADAYSA
 			if blockedClient, blockedExists := clients[blockedID]; blockedExists {
-
-				// Bloklanan kişiye "odadan atıldın" mesajı gönder
 				kickEvent, _ := json.Marshal(map[string]interface{}{
 					"type": "kicked_by_block",
 					"data": map[string]string{
@@ -354,7 +456,6 @@ func (h *LiveHub) EnforceBlock(blockerID, blockedID uint) {
 				default:
 				}
 
-				// Kullanıcının bağlantısını koparmak için Unregister kanalına yolla
 				go func(c *LiveRoomClient) {
 					h.Unregister <- c
 				}(blockedClient)
