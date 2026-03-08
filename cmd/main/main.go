@@ -94,6 +94,10 @@ func main() {
 		api.POST("/conversations/:user_id/screenshot-protection", conversationHandler.ToggleScreenshotProtection)
 		api.GET("/conversations/:user_id/screenshot-protection", conversationHandler.GetScreenshotProtectionStatus)
 
+		// Canlı yayın API route-ları
+		api.GET("/live-rooms/:room_id/messages", liveHub.GetLiveRoomMessages)
+		api.GET("/live-rooms/:room_id/reactions", liveHub.GetLiveRoomReactions)
+
 		// WebSocket bilgi endpoint'leri
 		api.GET("/online-users", func(c *gin.Context) {
 			onlineUsers := wsHub.GetConnectedUsers()

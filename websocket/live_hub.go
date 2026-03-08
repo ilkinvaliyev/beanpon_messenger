@@ -28,7 +28,7 @@ type LiveHub struct {
 
 	// reactionBuffer[roomID][reactionName] = toplam sayı
 	// Her 1.5 saniyede bir flush edilir
-	reactionBuffer map[uint]map[string]uint64
+	reactionBuffer map[uint]map[uint]map[string]uint64
 
 	Register   chan *LiveRoomClient
 	Unregister chan *LiveRoomClient
@@ -46,7 +46,7 @@ type LiveMessageEvent struct {
 func NewLiveHub() *LiveHub {
 	return &LiveHub{
 		rooms:          make(map[uint]map[uint]*LiveRoomClient),
-		reactionBuffer: make(map[uint]map[string]uint64),
+		reactionBuffer: make(map[uint]map[uint]map[string]uint64),
 		Register:       make(chan *LiveRoomClient),
 		Unregister:     make(chan *LiveRoomClient),
 		Broadcast:      make(chan *LiveMessageEvent),
@@ -129,55 +129,71 @@ func (h *LiveHub) Run() {
 func (h *LiveHub) flushReactions() {
 	h.mu.Lock()
 
-	// Göndermek için snapshot al, sonra buffer'ı sıfırla
-	type reactionSnapshot struct {
-		roomID    uint
-		reactions map[string]uint64
-	}
-
-	var snapshots []reactionSnapshot
-
-	for roomID, reactions := range h.reactionBuffer {
-		if len(reactions) == 0 {
-			continue
-		}
-		snapshot := reactionSnapshot{
-			roomID:    roomID,
-			reactions: make(map[string]uint64),
-		}
-		for reactionName, count := range reactions {
-			snapshot.reactions[reactionName] = count
-		}
-		snapshots = append(snapshots, snapshot)
-	}
-
-	// Buffer'ı sıfırla
-	h.reactionBuffer = make(map[uint]map[string]uint64)
-
+	// Buffer'ı snapshot olarak al ve anında sıfırla (Thread-safe)
+	snapshots := h.reactionBuffer
+	h.reactionBuffer = make(map[uint]map[uint]map[string]uint64)
 	h.mu.Unlock()
 
-	// Snapshot'ları broadcast et ve DB'ye yaz
-	for _, snapshot := range snapshots {
+	for roomID, usersReactions := range snapshots {
 		h.mu.RLock()
-		roomClients, ok := h.rooms[snapshot.roomID]
+		roomClients, ok := h.rooms[roomID]
 		h.mu.RUnlock()
 
 		if !ok {
 			continue
 		}
 
-		// Flutter'a gönderilecek payload
-		// {"type": "reaction_update", "data": {"heart": 5, "like": 2}}
-		eventData, _ := json.Marshal(map[string]interface{}{
-			"reactions": snapshot.reactions,
-		})
-		payload, _ := json.Marshal(map[string]interface{}{
-			"type":    "reaction_update",
-			"room_id": snapshot.roomID,
-			"data":    json.RawMessage(eventData),
-		})
+		// 1. ADIM: DB'ye yazmak için odadaki TÜM reaksiyonların toplamını hesapla
+		roomTotals := make(map[string]uint64)
+		for _, reactions := range usersReactions {
+			for name, count := range reactions {
+				roomTotals[name] += count
+			}
+		}
 
-		for _, client := range roomClients {
+		// DB'ye async upsert
+		go func(rID uint, totals map[string]uint64) {
+			for reactionName, count := range totals {
+				err := database.DB.Exec(`
+                INSERT INTO live_room_reactions (live_room_id, reaction_name, count, created_at, updated_at)
+                VALUES (?, ?, ?, NOW(), NOW())
+                ON DUPLICATE KEY UPDATE count = count + ?, updated_at = NOW()
+             `, rID, reactionName, count, count).Error
+				if err != nil {
+					log.Printf("💥 Reaction DB upsert hatası: %v", err)
+				}
+			}
+		}(roomID, roomTotals)
+
+		// 2. ADIM: Her kullanıcıya KENDİ GÖNDERDİĞİ HARİÇ olan sayıyı yolla
+		for clientID, client := range roomClients {
+			personalizedTotals := make(map[string]uint64)
+
+			// Diğer tüm kullanıcıların gönderdiklerini topla
+			for senderID, reactions := range usersReactions {
+				if senderID == clientID {
+					continue // ÇÖZÜM BURADA: Kendi gönderdiklerini es geç!
+				}
+				for name, count := range reactions {
+					personalizedTotals[name] += count
+				}
+			}
+
+			// Eğer başkalarından gelen reaksiyon yoksa (Sadece kendisi tıklamışsa),
+			// bu kullanıcıya boşuna socket mesajı atıp Flutter'ı yorma
+			if len(personalizedTotals) == 0 {
+				continue
+			}
+
+			eventData, _ := json.Marshal(map[string]interface{}{
+				"reactions": personalizedTotals,
+			})
+			payload, _ := json.Marshal(map[string]interface{}{
+				"type":    "reaction_update",
+				"room_id": roomID,
+				"data":    json.RawMessage(eventData),
+			})
+
 			select {
 			case client.Send <- payload:
 			default:
@@ -187,20 +203,6 @@ func (h *LiveHub) flushReactions() {
 				}(client)
 			}
 		}
-
-		// DB'ye async upsert — her emoji için count'u artır
-		go func(roomID uint, reactions map[string]uint64) {
-			for reactionName, count := range reactions {
-				err := database.DB.Exec(`
-					INSERT INTO live_room_reactions (live_room_id, reaction_name, count, created_at, updated_at)
-					VALUES (?, ?, ?, NOW(), NOW())
-					ON DUPLICATE KEY UPDATE count = count + ?, updated_at = NOW()
-				`, roomID, reactionName, count, count).Error
-				if err != nil {
-					log.Printf("💥 Reaction DB upsert hatası: %v", err)
-				}
-			}
-		}(snapshot.roomID, snapshot.reactions)
 	}
 }
 
@@ -221,7 +223,6 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 	switch event.Type {
 
 	case "reaction":
-		// Flutter'dan gelen: {"type": "reaction", "data": {"name": "heart"}}
 		var dataMap map[string]interface{}
 		if err := json.Unmarshal(event.Data, &dataMap); err != nil {
 			log.Printf("❌ reaction data parse hatası: %v", err)
@@ -233,7 +234,6 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 			return
 		}
 
-		// Geçerli emoji adı kontrolü
 		validReactions := map[string]bool{
 			"heart": true, "like": true, "laugh": true,
 			"withyou": true, "cry": true, "angry": true, "dislike": true,
@@ -242,12 +242,17 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 			return
 		}
 
-		// Buffer'a ekle (DB'ye veya broadcast'e gitmez, ticker bekler)
 		h.mu.Lock()
+		// YENİ: Oda yoksa oluştur
 		if h.reactionBuffer[event.RoomID] == nil {
-			h.reactionBuffer[event.RoomID] = make(map[string]uint64)
+			h.reactionBuffer[event.RoomID] = make(map[uint]map[string]uint64)
 		}
-		h.reactionBuffer[event.RoomID][reactionName]++
+		// YENİ: Kullanıcı yoksa oluştur
+		if h.reactionBuffer[event.RoomID][event.SenderID] == nil {
+			h.reactionBuffer[event.RoomID][event.SenderID] = make(map[string]uint64)
+		}
+		// O kullanıcının attığı emojiyi 1 artır
+		h.reactionBuffer[event.RoomID][event.SenderID][reactionName]++
 		h.mu.Unlock()
 
 	case "chat_message":
