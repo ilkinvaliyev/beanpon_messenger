@@ -327,6 +327,13 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		chatPayload, _ := json.Marshal(event)
 
 		for _, client := range roomClients {
+			// Block kontrolü: gönderen ile bu client arasında block varsa mesajı gösterme
+			if client.UserID != event.SenderID {
+				if models.IsBlocked(database.DB, event.SenderID, client.UserID) {
+					continue // Bu client'a gönderme
+				}
+			}
+
 			select {
 			case client.Send <- chatPayload:
 			default:
@@ -336,6 +343,17 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 				}(client)
 			}
 		}
+
+		//for _, client := range roomClients {
+		//	select {
+		//	case client.Send <- chatPayload:
+		//	default:
+		//		close(client.Send)
+		//		go func(c *LiveRoomClient) {
+		//			h.Unregister <- c
+		//		}(client)
+		//	}
+		//}
 
 		go func(roomID uint, senderID uint, text string) {
 			chatMsg := models.LiveRoomMessage{
