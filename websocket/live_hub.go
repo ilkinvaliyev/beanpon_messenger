@@ -155,10 +155,11 @@ func (h *LiveHub) flushReactions() {
 		go func(rID uint, totals map[string]uint64) {
 			for reactionName, count := range totals {
 				err := database.DB.Exec(`
-                INSERT INTO live_room_reactions (live_room_id, reaction_name, count, created_at, updated_at)
-                VALUES (?, ?, ?, NOW(), NOW())
-                ON DUPLICATE KEY UPDATE count = count + ?, updated_at = NOW()
-             `, rID, reactionName, count, count).Error
+						INSERT INTO live_room_reactions (live_room_id, reaction_name, count, created_at, updated_at)
+						VALUES (?, ?, ?, NOW(), NOW())
+						ON CONFLICT (live_room_id, reaction_name)
+						DO UPDATE SET count = live_room_reactions.count + EXCLUDED.count, updated_at = NOW()
+					`, rID, reactionName, count).Error
 				if err != nil {
 					log.Printf("💥 Reaction DB upsert hatası: %v", err)
 				}
