@@ -131,12 +131,23 @@ func (h *LiveHub) Run() {
 				})
 			}
 
-			// Host ayrıldısa bütün odaya "live_ended" göndər
+			// Host ayrıldısa bütün odaya "ended" göndər və Veritabanını GÜNCELLE!
 			if client.Role == "host" {
+				// 1. Veritabanında odayı 'ended' yap
+				err := database.DB.Exec("UPDATE live_rooms SET status = 'ended', ended_at = NOW() WHERE id = ?", client.RoomID).Error
+				if err != nil {
+					log.Printf("❌ DB Update Error (Room Ended): %v", err)
+				}
+
+				// 2. Tüm aktif katılımcıları 'left' yap
+				database.DB.Exec("UPDATE live_room_participants SET status = 'left', left_at = NOW() WHERE live_room_id = ?", client.RoomID)
+
+				// 3. WS üzerinden odada kalanlara yayının bittiğini haber ver
 				endedPayload, _ := json.Marshal(map[string]interface{}{
 					"type": "ended",
 					"data": map[string]interface{}{},
 				})
+
 				h.mu.RLock()
 				if roomClients, ok := h.rooms[client.RoomID]; ok {
 					for _, c := range roomClients {
