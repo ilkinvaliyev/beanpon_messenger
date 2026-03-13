@@ -312,13 +312,21 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 			return
 		}
 
+		// Reply to ID (optional)
+		var replyToID *uint
+		if replyVal, exists := dataMap["reply_to_id"]; exists && replyVal != nil {
+			if replyFloat, ok := replyVal.(float64); ok {
+				id := uint(replyFloat)
+				replyToID = &id
+			}
+		}
+
 		h.mu.RLock()
 		senderClient, senderExists := roomClients[event.SenderID]
 		h.mu.RUnlock()
 
 		senderName := "User"
 		var senderAvatar *string = nil
-
 		if senderExists {
 			senderName = senderClient.Name
 			if senderClient.Avatar != nil {
@@ -327,55 +335,72 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 			}
 		}
 
+		// Reply preview-ni DB-dən çək (yalnız reply varsa)
+		var replyPreview *models.LiveRoomReplyPreview
+		if replyToID != nil {
+			type replyRow struct {
+				ID           uint
+				Text         string
+				SenderID     uint
+				SenderName   string
+				SenderAvatar *string
+			}
+			var rr replyRow
+			err := database.DB.Table("live_room_messages lm").
+				Select("lm.id, lm.text, lm.sender_id, u.name as sender_name, p.profile_image as sender_avatar").
+				Joins("LEFT JOIN users u ON u.id = lm.sender_id").
+				Joins("LEFT JOIN profiles p ON p.user_id = lm.sender_id").
+				Where("lm.id = ?", *replyToID).
+				Scan(&rr).Error
+			if err == nil && rr.ID != 0 {
+				preview := utils.PrependBaseURL(rr.SenderAvatar)
+				replyPreview = &models.LiveRoomReplyPreview{
+					ID:           rr.ID,
+					Text:         rr.Text,
+					SenderID:     rr.SenderID,
+					SenderName:   rr.SenderName,
+					SenderAvatar: preview,
+				}
+			}
+		}
+
 		updatedData, _ := json.Marshal(map[string]interface{}{
 			"text":          textData,
 			"sender_id":     event.SenderID,
 			"sender_name":   senderName,
 			"sender_avatar": utils.PrependBaseURL(senderAvatar),
+			"reply_to":      replyPreview, // nil olarsa JSON-da null gəlir
 		})
 		event.Data = updatedData
 
 		chatPayload, _ := json.Marshal(event)
 
 		for _, client := range roomClients {
-			// Block kontrolü: gönderen ile bu client arasında block varsa mesajı gösterme
 			if client.UserID != event.SenderID {
 				if models.IsBlocked(database.DB, event.SenderID, client.UserID) {
-					continue // Bu client'a gönderme
+					continue
 				}
 			}
-
 			select {
 			case client.Send <- chatPayload:
 			default:
 				close(client.Send)
-				go func(c *LiveRoomClient) {
-					h.Unregister <- c
-				}(client)
+				go func(c *LiveRoomClient) { h.Unregister <- c }(client)
 			}
 		}
 
-		//for _, client := range roomClients {
-		//	select {
-		//	case client.Send <- chatPayload:
-		//	default:
-		//		close(client.Send)
-		//		go func(c *LiveRoomClient) {
-		//			h.Unregister <- c
-		//		}(client)
-		//	}
-		//}
-
-		go func(roomID uint, senderID uint, text string) {
+		// Async DB save — reply_to_id ilə
+		go func(roomID uint, senderID uint, text string, replyID *uint) {
 			chatMsg := models.LiveRoomMessage{
 				LiveRoomID: roomID,
 				SenderID:   senderID,
 				Text:       text,
+				ReplyToID:  replyID,
 			}
 			if err := database.DB.Create(&chatMsg).Error; err != nil {
 				log.Printf("💥 DB ASYNC KAYIT HATASI: %v", err)
 			}
-		}(event.RoomID, event.SenderID, textData)
+		}(event.RoomID, event.SenderID, textData, replyToID)
 
 	case "broadcast_request":
 		h.mu.RLock()

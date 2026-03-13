@@ -44,6 +44,7 @@ type LiveRoomMessage struct {
 	ID         uint      `json:"id" gorm:"primaryKey;autoIncrement"`
 	LiveRoomID uint      `json:"live_room_id" gorm:"not null;index"`
 	SenderID   uint      `json:"sender_id" gorm:"not null;index"`
+	ReplyToID  *uint     `json:"reply_to_id" gorm:"index"`
 	Text       string    `json:"text" gorm:"type:text;not null"`
 	CreatedAt  time.Time `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt  time.Time `json:"updated_at" gorm:"autoUpdateTime"` // BU SATIR EKLENDİ (Hata buradaydı!)
@@ -58,6 +59,15 @@ type LiveRoomReaction struct {
 	Count        uint64    `json:"count" gorm:"default:0"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+// Reply preview üçün ayrı struct (JOIN-siz istifadə olunur)
+type LiveRoomReplyPreview struct {
+	ID           uint    `json:"id"`
+	Text         string  `json:"text"`
+	SenderID     uint    `json:"sender_id"`
+	SenderName   string  `json:"sender_name"`
+	SenderAvatar *string `json:"sender_avatar"`
 }
 
 // Tablo isimlerini GORM için belirtiyoruz (Laravel ile uyumlu olsun diye)

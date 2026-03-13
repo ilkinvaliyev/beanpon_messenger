@@ -218,17 +218,31 @@ func (h *LiveHub) GetLiveRoomMessages(c *gin.Context) {
 		SenderName   string    `json:"sender_name"`
 		SenderAvatar *string   `json:"sender_avatar"`
 		CreatedAt    time.Time `json:"created_at"`
+
+		// Reply fields (nullable)
+		ReplyToID         *uint   `json:"reply_to_id"`
+		ReplyText         *string `json:"reply_text"`
+		ReplySenderID     *uint   `json:"reply_sender_id"`
+		ReplySenderName   *string `json:"reply_sender_name"`
+		ReplySenderAvatar *string `json:"reply_sender_avatar"`
 	}
 
 	query := database.DB.Table("live_room_messages lm").
-		Select(`lm.id, lm.text, lm.sender_id, lm.created_at,
-			u.name as sender_name,
-			p.profile_image as sender_avatar`).
+		Select(`lm.id, lm.text, lm.sender_id, lm.created_at, lm.reply_to_id,
+        u.name as sender_name,
+        p.profile_image as sender_avatar,
+        rm.text as reply_text,
+        rm.sender_id as reply_sender_id,
+        ru.name as reply_sender_name,
+        rp.profile_image as reply_sender_avatar`).
 		Joins("LEFT JOIN users u ON u.id = lm.sender_id").
 		Joins("LEFT JOIN profiles p ON p.user_id = lm.sender_id").
+		Joins("LEFT JOIN live_room_messages rm ON rm.id = lm.reply_to_id").
+		Joins("LEFT JOIN users ru ON ru.id = rm.sender_id").
+		Joins("LEFT JOIN profiles rp ON rp.user_id = rm.sender_id").
 		Where("lm.live_room_id = ?", roomID).
 		Order("lm.id DESC").
-		Limit(limit + 1) // +1 ile "has_more" anlayırıq
+		Limit(limit + 1)
 
 	if cursorStr != "" {
 		cursor, err := strconv.ParseUint(cursorStr, 10, 64)
@@ -251,8 +265,10 @@ func (h *LiveHub) GetLiveRoomMessages(c *gin.Context) {
 	// Avatar URL-lərini düzəlt
 	for i := range messages {
 		if messages[i].SenderAvatar != nil {
-			url := utils.PrependBaseURL(messages[i].SenderAvatar)
-			messages[i].SenderAvatar = url
+			messages[i].SenderAvatar = utils.PrependBaseURL(messages[i].SenderAvatar)
+		}
+		if messages[i].ReplySenderAvatar != nil {
+			messages[i].ReplySenderAvatar = utils.PrependBaseURL(messages[i].ReplySenderAvatar)
 		}
 	}
 
