@@ -312,7 +312,7 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 			return
 		}
 
-		// Reply to ID (optional)
+		// Reply to ID
 		var replyToID *uint
 		if replyVal, exists := dataMap["reply_to_id"]; exists && replyVal != nil {
 			if replyFloat, ok := replyVal.(float64); ok {
@@ -335,8 +335,8 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 			}
 		}
 
-		// Reply preview-ni DB-dən çək (yalnız reply varsa)
-		var replyPreview *models.LiveRoomReplyPreview
+		// Reply preview
+		var replyPreview interface{} = nil
 		if replyToID != nil {
 			type replyRow struct {
 				ID           uint
@@ -353,23 +353,34 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 				Where("lm.id = ?", *replyToID).
 				Scan(&rr).Error
 			if err == nil && rr.ID != 0 {
-				preview := utils.PrependBaseURL(rr.SenderAvatar)
-				replyPreview = &models.LiveRoomReplyPreview{
-					ID:           rr.ID,
-					Text:         rr.Text,
-					SenderID:     rr.SenderID,
-					SenderName:   rr.SenderName,
-					SenderAvatar: preview,
+				replyPreview = map[string]interface{}{
+					"id":            rr.ID,
+					"text":          rr.Text,
+					"sender_id":     rr.SenderID,
+					"sender_name":   rr.SenderName,
+					"sender_avatar": utils.PrependBaseURL(rr.SenderAvatar),
 				}
 			}
 		}
 
+		// ✅ Sinxron DB write — ID əldə etmək üçün
+		chatMsg := models.LiveRoomMessage{
+			LiveRoomID: event.RoomID,
+			SenderID:   event.SenderID,
+			Text:       textData,
+			ReplyToID:  replyToID,
+		}
+		if err := database.DB.Create(&chatMsg).Error; err != nil {
+			log.Printf("💥 DB KAYIT HATASI: %v", err)
+		}
+
 		updatedData, _ := json.Marshal(map[string]interface{}{
+			"id":            chatMsg.ID,
 			"text":          textData,
 			"sender_id":     event.SenderID,
 			"sender_name":   senderName,
 			"sender_avatar": utils.PrependBaseURL(senderAvatar),
-			"reply_to":      replyPreview, // nil olarsa JSON-da null gəlir
+			"reply_to":      replyPreview,
 		})
 		event.Data = updatedData
 
@@ -388,19 +399,6 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 				go func(c *LiveRoomClient) { h.Unregister <- c }(client)
 			}
 		}
-
-		// Async DB save — reply_to_id ilə
-		go func(roomID uint, senderID uint, text string, replyID *uint) {
-			chatMsg := models.LiveRoomMessage{
-				LiveRoomID: roomID,
-				SenderID:   senderID,
-				Text:       text,
-				ReplyToID:  replyID,
-			}
-			if err := database.DB.Create(&chatMsg).Error; err != nil {
-				log.Printf("💥 DB ASYNC KAYIT HATASI: %v", err)
-			}
-		}(event.RoomID, event.SenderID, textData, replyToID)
 
 	case "broadcast_request":
 		h.mu.RLock()
