@@ -105,6 +105,8 @@ func main() {
 
 		api.GET("/groups/:conversation_id", groupHandler.GetGroupDetail)
 		api.POST("/groups/:conversation_id/members", groupHandler.AddMembers)
+		api.POST("/groups/:conversation_id/mute", groupHandler.MuteGroup)
+		api.POST("/groups/:conversation_id/unmute", groupHandler.UnmuteGroup)
 		api.PUT("/groups/:conversation_id", groupHandler.UpdateGroup)
 
 		// ── GROUP: Mesajlar ──────────────────────────────────────────────

@@ -275,6 +275,65 @@ func (h *GroupHandler) LeaveGroup(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Gruptan ayrıldınız"})
 }
 
+func (h *GroupHandler) MuteGroup(c *gin.Context) {
+	userID := c.MustGet("user_id").(uint)
+	convID, err := strconv.ParseUint(c.Param("conversation_id"), 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz conversation_id"})
+		return
+	}
+	conversationID := uint(convID)
+
+	var requestBody struct {
+		MuteDuration int `json:"muteDuration"` // dakika cinsinden
+	}
+	if err := c.ShouldBindJSON(&requestBody); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz request body"})
+		return
+	}
+
+	now := time.Now()
+	updates := map[string]interface{}{
+		"is_muted": true,
+	}
+
+	if requestBody.MuteDuration > 0 {
+		mutedUntil := now.Add(time.Duration(requestBody.MuteDuration) * time.Minute)
+		updates["muted_until"] = mutedUntil
+	} else {
+		updates["muted_until"] = nil
+	}
+
+	database.DB.Model(&models.ConversationParticipant{}).
+		Where("conversation_id = ? AND user_id = ?", conversationID, userID).
+		Updates(updates)
+
+	response := gin.H{
+		"message":  "Grup sessize alındı",
+		"muted_at": now,
+	}
+	if requestBody.MuteDuration > 0 {
+		response["muted_until"] = now.Add(time.Duration(requestBody.MuteDuration) * time.Minute)
+	}
+
+	c.JSON(http.StatusOK, response)
+}
+
+func (h *GroupHandler) UnmuteGroup(c *gin.Context) {
+	userID := c.MustGet("user_id").(uint)
+	convID, _ := strconv.ParseUint(c.Param("conversation_id"), 10, 32)
+	conversationID := uint(convID)
+
+	database.DB.Model(&models.ConversationParticipant{}).
+		Where("conversation_id = ? AND user_id = ?", conversationID, userID).
+		Updates(map[string]interface{}{
+			"is_muted":    false,
+			"muted_until": nil,
+		})
+
+	c.JSON(http.StatusOK, gin.H{"message": "Grup sesi açıldı"})
+}
+
 // POST /api/v1/groups/:conversation_id/kick/:user_id
 func (h *GroupHandler) KickMember(c *gin.Context) {
 	requesterID := c.MustGet("user_id").(uint)
