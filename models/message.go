@@ -33,8 +33,7 @@ type Message struct {
 	Receiver       User     `json:"receiver" gorm:"foreignKey:ReceiverID"`
 	ReplyToMessage *Message `json:"reply_to_message,omitempty" gorm:"foreignKey:ReplyToMessageID"`
 
-	ConversationID *uint  `json:"conversation_id" gorm:"index"`
-	ChatType       string `json:"chat_type" gorm:"type:varchar(10);default:'direct'"`
+	ConversationID *uint `json:"conversation_id" gorm:"index"`
 }
 
 // MessageEdit mesaj düzenleme geçmişi
