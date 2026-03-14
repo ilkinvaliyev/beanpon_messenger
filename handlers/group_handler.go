@@ -598,7 +598,6 @@ func (h *GroupHandler) GetGroupDetail(c *gin.Context) {
 	}
 	conversationID := uint(convID)
 
-	// Üye mi?
 	var me models.ConversationParticipant
 	err = database.DB.Where(
 		"conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL",
@@ -609,7 +608,6 @@ func (h *GroupHandler) GetGroupDetail(c *gin.Context) {
 		return
 	}
 
-	// Grup detayı
 	var conv models.Conversation
 	if err := database.DB.Where("id = ? AND chat_type = 'group' AND deleted_at IS NULL", conversationID).
 		First(&conv).Error; err != nil {
@@ -617,13 +615,11 @@ func (h *GroupHandler) GetGroupDetail(c *gin.Context) {
 		return
 	}
 
-	// Üye sayısı
 	var memberCount int64
 	database.DB.Model(&models.ConversationParticipant{}).
 		Where("conversation_id = ? AND left_at IS NULL AND deleted_at IS NULL", conversationID).
 		Count(&memberCount)
 
-	// Son 3 üye kullanıcı adı (People altında gösterim için)
 	var memberPreviews []struct {
 		Username string `gorm:"column:username"`
 	}
@@ -644,7 +640,6 @@ func (h *GroupHandler) GetGroupDetail(c *gin.Context) {
 		previews = append(previews, m.Username)
 	}
 
-	// Invite token sadece admin/owner görür
 	var inviteToken *string
 	if me.Role == "owner" || me.Role == "admin" {
 		inviteToken = conv.InviteToken
@@ -657,6 +652,7 @@ func (h *GroupHandler) GetGroupDetail(c *gin.Context) {
 		"description":     conv.GroupDesc,
 		"member_count":    memberCount,
 		"my_role":         me.Role,
+		"is_muted":        me.IsMuted,
 		"invite_token":    inviteToken,
 		"member_previews": previews,
 		"created_at":      conv.CreatedAt,
