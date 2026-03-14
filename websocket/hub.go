@@ -762,7 +762,7 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 			message := models.Message{
 				ID:               messageID,
 				SenderID:         c.UserID,
-				ReceiverID:       receiverID,
+				ReceiverID:       &receiverID,
 				StoryID:          storyID,
 				ReplyToMessageID: replyToMessageID,
 				EncryptedText:    encryptedText,
@@ -1069,7 +1069,7 @@ func (h *Hub) handleAddReaction(userID uint, messageID, emoji string) {
 	}
 
 	// Kullanıcının bu mesaja reaction verebilir mi kontrol et
-	if userID != message.SenderID && userID != message.ReceiverID {
+	if userID != message.SenderID && (message.ReceiverID == nil || userID != *message.ReceiverID) {
 		log.Printf("Kullanıcı %d bu mesaja reaction veremez", userID)
 		return
 	}
@@ -1097,7 +1097,9 @@ func (h *Hub) handleAddReaction(userID uint, messageID, emoji string) {
 	}
 
 	h.SendToUser(message.SenderID, "reaction_updated", reactionData)
-	h.SendToUser(message.ReceiverID, "reaction_updated", reactionData)
+	if message.ReceiverID != nil {
+		h.SendToUser(*message.ReceiverID, "reaction_updated", reactionData)
+	}
 
 	log.Printf("Reaction eklendi: User %d, Message %s, Emoji %s", userID, messageID, emoji)
 }
@@ -1110,7 +1112,7 @@ func (h *Hub) handleRemoveReaction(userID uint, messageID string) {
 		return
 	}
 
-	if userID != message.SenderID && userID != message.ReceiverID {
+	if userID != message.SenderID && (message.ReceiverID == nil || userID != *message.ReceiverID) {
 		return
 	}
 
@@ -1136,7 +1138,9 @@ func (h *Hub) handleRemoveReaction(userID uint, messageID string) {
 	}
 
 	h.SendToUser(message.SenderID, "reaction_updated", reactionData)
-	h.SendToUser(message.ReceiverID, "reaction_updated", reactionData)
+	if message.ReceiverID != nil {
+		h.SendToUser(*message.ReceiverID, "reaction_updated", reactionData)
+	}
 
 	log.Printf("Reaction kaldırıldı: User %d, Message %s", userID, messageID)
 }

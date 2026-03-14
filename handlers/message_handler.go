@@ -129,7 +129,7 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 	message := models.Message{
 		ID:               uuid.New().String(),
 		SenderID:         senderID.(uint),
-		ReceiverID:       req.ReceiverID,
+		ReceiverID:       &req.ReceiverID,
 		EncryptedText:    encryptedText,
 		ReplyToMessageID: req.ReplyToMessageID,
 		StoryID:          req.StoryID,
@@ -152,7 +152,7 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 	// WebSocket üzerinden real-time yayınla (hem gönderen hem alıcıya)
 	h.wsHub.HandleNewMessage(
 		message.SenderID,
-		message.ReceiverID,
+		*message.ReceiverID,
 		message.ID,
 		req.Text,
 		req.Type,
@@ -495,7 +495,7 @@ func (h *MessageHandler) MarkAsRead(c *gin.Context) {
 	}
 
 	// Sadece alıcı mesajı okundu olarak işaretleyebilir
-	if message.ReceiverID != userID.(uint) {
+	if message.ReceiverID == nil || *message.ReceiverID != userID.(uint) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Bu mesajı okundu olarak işaretleme yetkiniz yok"})
 		return
 	}
@@ -856,7 +856,7 @@ func (h *MessageHandler) DeleteMessage(c *gin.Context) {
 	case "me":
 		if userID == message.SenderID {
 			message.IsDeletedBySender = true
-		} else if userID == message.ReceiverID {
+		} else if message.ReceiverID != nil && userID == *message.ReceiverID {
 			message.IsDeletedByReceiver = true
 		} else {
 			c.JSON(http.StatusForbidden, gin.H{"error": "Bu mesajı silmək icazən yoxdur"})
@@ -892,7 +892,9 @@ func (h *MessageHandler) DeleteMessage(c *gin.Context) {
 	}
 
 	h.wsHub.SendToUser(message.SenderID, "message_deleted", deletePayload)
-	h.wsHub.SendToUser(message.ReceiverID, "message_deleted", deletePayload)
+	if message.ReceiverID != nil {
+		h.wsHub.SendToUser(*message.ReceiverID, "message_deleted", deletePayload)
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Mesaj silindi",
