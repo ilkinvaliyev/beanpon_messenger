@@ -88,7 +88,6 @@ func (h *GroupMessageHandler) SendGroupMessage(c *gin.Context) {
 		ID:               messageID,
 		SenderID:         senderID,
 		ConversationID:   &conversationID,
-		ChatType:         "group",
 		ReplyToMessageID: req.ReplyToMessageID,
 		EncryptedText:    encryptedText,
 		CreatedAt:        now,
