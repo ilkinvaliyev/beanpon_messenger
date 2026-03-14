@@ -428,14 +428,16 @@ func (h *GroupHandler) GetMyGroups(c *gin.Context) {
 	userID := c.MustGet("user_id").(uint)
 
 	var groups []struct {
-		ConversationID uint       `json:"conversation_id"`
-		GroupName      *string    `json:"group_name"`
-		GroupAvatar    *string    `json:"group_avatar"`
-		MyRole         string     `json:"my_role"`
-		IsMuted        bool       `json:"is_muted"`
-		MemberCount    int        `json:"member_count"`
-		LastMessageAt  *time.Time `json:"last_message_at"`
-		UnreadCount    int        `json:"unread_count"`
+		ConversationID     uint       `json:"conversation_id"`
+		GroupName          *string    `json:"group_name"`
+		GroupAvatar        *string    `json:"group_avatar"`
+		MyRole             string     `json:"my_role"`
+		IsMuted            bool       `json:"is_muted"`
+		MemberCount        int        `json:"member_count"`
+		LastMessageAt      *time.Time `json:"last_message_at"`
+		UnreadCount        int        `json:"unread_count"`
+		LastMessageText    *string    `json:"last_message_text"`
+		LastSenderUsername *string    `json:"last_sender_username"`
 	}
 
 	database.DB.Raw(`
