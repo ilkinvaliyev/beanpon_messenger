@@ -3,6 +3,7 @@ package handlers
 import (
 	"beanpon_messenger/database"
 	"beanpon_messenger/models"
+	"beanpon_messenger/utils"
 	"net/http"
 	"strconv"
 	"time"
@@ -155,7 +156,7 @@ func (h *GroupMessageHandler) SendGroupMessage(c *gin.Context) {
 		"sender_id":           senderID,
 		"sender_name":         senderInfo.Name,
 		"sender_username":     senderInfo.Username,
-		"sender_avatar":       senderInfo.ProfileImage,
+		"sender_avatar":       utils.PrependBaseURL(senderInfo.ProfileImage),
 		"text":                req.Text,
 		"reply_to_message_id": req.ReplyToMessageID,
 		"reply_to_message":    replyData,
