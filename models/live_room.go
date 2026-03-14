@@ -1,27 +1,29 @@
 package models
 
 import (
+	"encoding/json"
 	"time"
 )
 
 // LiveRoom - Laravel'deki 'live_rooms' tablosunun Go karşılığı (Sadece okuma amaçlı)
 type LiveRoom struct {
-	ID                 uint       `json:"id" gorm:"primaryKey;autoIncrement"`
-	HostUserID         uint       `json:"host_user_id" gorm:"not null;index"`
-	ChannelName        string     `json:"channel_name" gorm:"unique;not null"`
-	Title              *string    `json:"title"`
-	RoomType           string     `json:"room_type"` // audio, video, both
-	Status             string     `json:"status"`    // waiting, live, ended
-	HasPassword        bool       `json:"has_password"`
-	FilterGender       *string    `json:"filter_gender"`
-	FilterMinAge       *int       `json:"filter_min_age"`
-	FilterMaxAge       *int       `json:"filter_max_age"`
-	FilterVerifiedOnly bool       `json:"filter_verified_only"`
-	MaxBroadcasters    int        `json:"max_broadcasters"`
-	PeakViewerCount    int        `json:"peak_viewer_count"`
-	CreatedAt          time.Time  `json:"created_at"`
-	UpdatedAt          time.Time  `json:"updated_at"`
-	DeletedAt          *time.Time `json:"deleted_at" gorm:"index"`
+	ID                 uint             `json:"id" gorm:"primaryKey;autoIncrement"`
+	HostUserID         uint             `json:"host_user_id" gorm:"not null;index"`
+	ChannelName        string           `json:"channel_name" gorm:"unique;not null"`
+	Title              *string          `json:"title"`
+	RoomType           string           `json:"room_type"` // audio, video, both
+	Status             string           `json:"status"`    // waiting, live, ended
+	HasPassword        bool             `json:"has_password"`
+	FilterGender       *string          `json:"filter_gender"`
+	FilterMinAge       *int             `json:"filter_min_age"`
+	FilterMaxAge       *int             `json:"filter_max_age"`
+	FilterVerifiedOnly bool             `json:"filter_verified_only"`
+	MaxBroadcasters    int              `json:"max_broadcasters"`
+	PeakViewerCount    int              `json:"peak_viewer_count"`
+	ActiveGame         *json.RawMessage `json:"active_game" gorm:"type:jsonb"`
+	CreatedAt          time.Time        `json:"created_at"`
+	UpdatedAt          time.Time        `json:"updated_at"`
+	DeletedAt          *time.Time       `json:"deleted_at" gorm:"index"`
 }
 
 // LiveRoomParticipant - Laravel'deki 'live_room_participants' (Sadece okuma amaçlı)

@@ -24,16 +24,12 @@ type LiveRoomClient struct {
 }
 
 type LiveHub struct {
-	rooms map[uint]map[uint]*LiveRoomClient
-
-	// reactionBuffer[roomID][reactionName] = toplam sayı
-	// Her 1.5 saniyede bir flush edilir
+	rooms          map[uint]map[uint]*LiveRoomClient
 	reactionBuffer map[uint]map[uint]map[string]uint64
-
-	Register   chan *LiveRoomClient
-	Unregister chan *LiveRoomClient
-	Broadcast  chan *LiveMessageEvent
-	mu         sync.RWMutex
+	Register       chan *LiveRoomClient
+	Unregister     chan *LiveRoomClient
+	Broadcast      chan *LiveMessageEvent
+	mu             sync.RWMutex
 }
 
 type LiveMessageEvent struct {
@@ -54,7 +50,6 @@ func NewLiveHub() *LiveHub {
 }
 
 func (h *LiveHub) Run() {
-	// Her 1.5 saniyede bir reactionBuffer'ı flush et
 	reactionTicker := time.NewTicker(1500 * time.Millisecond)
 	defer reactionTicker.Stop()
 
@@ -71,14 +66,12 @@ func (h *LiveHub) Run() {
 
 			log.Printf("User %d joined Live Room %d as %s", client.UserID, client.RoomID, client.Role)
 
-			// Viewer count
 			eventData, _ := json.Marshal(map[string]interface{}{"count": count})
 			go func(e *LiveMessageEvent) { h.Broadcast <- e }(&LiveMessageEvent{
 				Type: "viewer_count_update", RoomID: client.RoomID,
 				Data: eventData,
 			})
 
-			// YENİ: user_joined — özünə göndərmə
 			joinData, _ := json.Marshal(map[string]interface{}{
 				"user_id":   client.UserID,
 				"user_name": client.Name,
@@ -94,7 +87,6 @@ func (h *LiveHub) Run() {
 					"data":      data,
 				})
 				for _, c := range clients {
-					// if uid == senderID { continue } ← SİL
 					select {
 					case c.Send <- payload:
 					default:
@@ -117,7 +109,7 @@ func (h *LiveHub) Run() {
 				roomExists = true
 				if count == 0 {
 					delete(h.rooms, client.RoomID)
-					delete(h.reactionBuffer, client.RoomID) // Buffer-ı da temizle
+					delete(h.reactionBuffer, client.RoomID)
 					roomExists = false
 				}
 			}
@@ -131,18 +123,14 @@ func (h *LiveHub) Run() {
 				})
 			}
 
-			// Host ayrıldısa bütün odaya "ended" göndər və Veritabanını GÜNCELLE!
 			if client.Role == "host" {
-				// 1. Veritabanında odayı 'ended' yap
 				err := database.DB.Exec("UPDATE live_rooms SET status = 'ended', ended_at = NOW() WHERE id = ?", client.RoomID).Error
 				if err != nil {
 					log.Printf("❌ DB Update Error (Room Ended): %v", err)
 				}
 
-				// 2. Tüm aktif katılımcıları 'left' yap
 				database.DB.Exec("UPDATE live_room_participants SET status = 'left', left_at = NOW() WHERE live_room_id = ?", client.RoomID)
 
-				// 3. WS üzerinden odada kalanlara yayının bittiğini haber ver
 				endedPayload, _ := json.Marshal(map[string]interface{}{
 					"type": "ended",
 					"data": map[string]interface{}{},
@@ -169,11 +157,8 @@ func (h *LiveHub) Run() {
 	}
 }
 
-// flushReactions - Buffer'daki reaksiyonları toplu olarak broadcast eder ve DB'ye yazar
 func (h *LiveHub) flushReactions() {
 	h.mu.Lock()
-
-	// Buffer'ı snapshot olarak al ve anında sıfırla (Thread-safe)
 	snapshots := h.reactionBuffer
 	h.reactionBuffer = make(map[uint]map[uint]map[string]uint64)
 	h.mu.Unlock()
@@ -187,7 +172,6 @@ func (h *LiveHub) flushReactions() {
 			continue
 		}
 
-		// 1. ADIM: DB'ye yazmak için odadaki TÜM reaksiyonların toplamını hesapla
 		roomTotals := make(map[string]uint64)
 		for _, reactions := range usersReactions {
 			for name, count := range reactions {
@@ -195,37 +179,32 @@ func (h *LiveHub) flushReactions() {
 			}
 		}
 
-		// DB'ye async upsert
 		go func(rID uint, totals map[string]uint64) {
 			for reactionName, count := range totals {
 				err := database.DB.Exec(`
-						INSERT INTO live_room_reactions (live_room_id, reaction_name, count, created_at, updated_at)
-						VALUES (?, ?, ?, NOW(), NOW())
-						ON CONFLICT (live_room_id, reaction_name)
-						DO UPDATE SET count = live_room_reactions.count + EXCLUDED.count, updated_at = NOW()
-					`, rID, reactionName, count).Error
+					INSERT INTO live_room_reactions (live_room_id, reaction_name, count, created_at, updated_at)
+					VALUES (?, ?, ?, NOW(), NOW())
+					ON CONFLICT (live_room_id, reaction_name)
+					DO UPDATE SET count = live_room_reactions.count + EXCLUDED.count, updated_at = NOW()
+				`, rID, reactionName, count).Error
 				if err != nil {
 					log.Printf("💥 Reaction DB upsert hatası: %v", err)
 				}
 			}
 		}(roomID, roomTotals)
 
-		// 2. ADIM: Her kullanıcıya KENDİ GÖNDERDİĞİ HARİÇ olan sayıyı yolla
 		for clientID, client := range roomClients {
 			personalizedTotals := make(map[string]uint64)
 
-			// Diğer tüm kullanıcıların gönderdiklerini topla
 			for senderID, reactions := range usersReactions {
 				if senderID == clientID {
-					continue // ÇÖZÜM BURADA: Kendi gönderdiklerini es geç!
+					continue
 				}
 				for name, count := range reactions {
 					personalizedTotals[name] += count
 				}
 			}
 
-			// Eğer başkalarından gelen reaksiyon yoksa (Sadece kendisi tıklamışsa),
-			// bu kullanıcıya boşuna socket mesajı atıp Flutter'ı yorma
 			if len(personalizedTotals) == 0 {
 				continue
 			}
@@ -288,15 +267,12 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		}
 
 		h.mu.Lock()
-		// YENİ: Oda yoksa oluştur
 		if h.reactionBuffer[event.RoomID] == nil {
 			h.reactionBuffer[event.RoomID] = make(map[uint]map[string]uint64)
 		}
-		// YENİ: Kullanıcı yoksa oluştur
 		if h.reactionBuffer[event.RoomID][event.SenderID] == nil {
 			h.reactionBuffer[event.RoomID][event.SenderID] = make(map[string]uint64)
 		}
-		// O kullanıcının attığı emojiyi 1 artır
 		h.reactionBuffer[event.RoomID][event.SenderID][reactionName]++
 		h.mu.Unlock()
 
@@ -312,7 +288,6 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 			return
 		}
 
-		// Reply to ID
 		var replyToID *uint
 		if replyVal, exists := dataMap["reply_to_id"]; exists && replyVal != nil {
 			if replyFloat, ok := replyVal.(float64); ok {
@@ -335,7 +310,6 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 			}
 		}
 
-		// Reply preview
 		var replyPreview interface{} = nil
 		if replyToID != nil {
 			type replyRow struct {
@@ -363,7 +337,6 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 			}
 		}
 
-		// ✅ Sinxron DB write — ID əldə etmək üçün
 		chatMsg := models.LiveRoomMessage{
 			LiveRoomID: event.RoomID,
 			SenderID:   event.SenderID,
@@ -511,6 +484,97 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 				}(targetClient)
 			}
 		}
+
+	case "game_spin":
+		h.mu.RLock()
+		sender, exists := roomClients[event.SenderID]
+		h.mu.RUnlock()
+		if !exists || sender.Role != "host" {
+			return
+		}
+
+		h.mu.RLock()
+		var eligible []map[string]interface{}
+		for _, c := range roomClients {
+			if c.Role == "host" || c.Role == "broadcaster" {
+				eligible = append(eligible, map[string]interface{}{
+					"user_id": c.UserID,
+					"name":    c.Name,
+					"avatar":  utils.PrependBaseURL(c.Avatar),
+					"role":    c.Role,
+				})
+			}
+		}
+		h.mu.RUnlock()
+
+		if len(eligible) == 0 {
+			return
+		}
+
+		selected := eligible[time.Now().UnixNano()%int64(len(eligible))]
+		targetAngle := float64(1440) + float64(time.Now().UnixNano()%360)
+		durationMs := 4000
+
+		gameState := map[string]interface{}{
+			"type": "bottle",
+			"state": map[string]interface{}{
+				"selected_user": selected,
+				"target_angle":  targetAngle,
+				"duration_ms":   durationMs,
+			},
+			"started_at": time.Now().UTC(),
+		}
+		gameStateJSON, _ := json.Marshal(gameState)
+
+		database.DB.Exec(
+			"UPDATE live_rooms SET active_game = ? WHERE id = ?",
+			string(gameStateJSON), event.RoomID,
+		)
+
+		resultData, _ := json.Marshal(map[string]interface{}{
+			"type":  "bottle",
+			"state": gameState["state"],
+		})
+
+		spinPayload, _ := json.Marshal(map[string]interface{}{
+			"type":    "game_spin_result",
+			"room_id": event.RoomID,
+			"data":    json.RawMessage(resultData),
+		})
+
+		h.mu.RLock()
+		for _, c := range roomClients {
+			select {
+			case c.Send <- spinPayload:
+			default:
+			}
+		}
+		h.mu.RUnlock()
+
+	case "game_stop":
+		h.mu.RLock()
+		sender, exists := roomClients[event.SenderID]
+		h.mu.RUnlock()
+		if !exists || sender.Role != "host" {
+			return
+		}
+
+		database.DB.Exec("UPDATE live_rooms SET active_game = NULL WHERE id = ?", event.RoomID)
+
+		stopPayload, _ := json.Marshal(map[string]interface{}{
+			"type":    "game_stopped",
+			"room_id": event.RoomID,
+			"data":    map[string]interface{}{},
+		})
+
+		h.mu.RLock()
+		for _, c := range roomClients {
+			select {
+			case c.Send <- stopPayload:
+			default:
+			}
+		}
+		h.mu.RUnlock()
 
 	case "trigger_block_kick":
 		var dataMap map[string]interface{}

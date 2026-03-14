@@ -15,16 +15,14 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// Diğer upgrader ile çakışmaması için ismini değiştirdik
 var liveUpgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
 	CheckOrigin: func(r *http.Request) bool {
-		return true // CORS izinleri
+		return true
 	},
 }
 
-// HandleWebSocket - /ws/live endpoint'ini doğrudan Hub üzerinden karşılar
 func (h *LiveHub) HandleWebSocket(c *gin.Context) {
 	userIDVal, exists := c.Get("user_id")
 	if !exists {
@@ -46,29 +44,23 @@ func (h *LiveHub) HandleWebSocket(c *gin.Context) {
 		return
 	}
 
-	// --- YENİ EKLENEN BLOK KONTROLÜ BAŞLANGICI ---
-	// Odanın Host'unu (Yayıncısını) buluyoruz
 	var room models.LiveRoom
 	if err := database.DB.Select("host_user_id").First(&room, roomID).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Oda tapılmadı"})
 		return
 	}
 
-	// Eğer Host beni bloklamışsa VEYA ben Host'u bloklamışsam giremem
 	if models.IsBlocked(database.DB, room.HostUserID, userID) || models.IsBlocked(database.DB, userID, room.HostUserID) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Bu yayına qoşula bilməzsiniz (Bloklanıb)"})
 		return
 	}
-	// --- YENİ EKLENEN BLOK KONTROLÜ BİTİŞİ ---
 
-	// liveUpgrader kullanıyoruz
 	conn, err := liveUpgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		log.Println("Live WebSocket Upgrade Error:", err)
 		return
 	}
 
-	// Kullanıcının ismini ve resmini SADECE ODAYA GİRERKEN DB'den 1 kez çekiyoruz
 	type SenderInfo struct {
 		Name         string
 		ProfileImage *string
@@ -86,12 +78,32 @@ func (h *LiveHub) HandleWebSocket(c *gin.Context) {
 		UserID: userID,
 		RoomID: uint(roomID),
 		Role:   participant.Role,
-		Name:   senderInfo.Name,         // RAM'e yazıldı
-		Avatar: senderInfo.ProfileImage, // RAM'e yazıldı
+		Name:   senderInfo.Name,
+		Avatar: senderInfo.ProfileImage,
 		Send:   make(chan []byte, 256),
 	}
 
 	client.Hub.Register <- client
+
+	// Aktif oyun varsa sadece bu client'a gönder
+	var activeGame json.RawMessage
+	dbErr := database.DB.
+		Table("live_rooms").
+		Select("active_game").
+		Where("id = ?", uint(roomID)).
+		Scan(&activeGame).Error
+
+	if dbErr == nil && len(activeGame) > 0 && string(activeGame) != "null" {
+		joinGamePayload, _ := json.Marshal(map[string]interface{}{
+			"type":    "game_current_state",
+			"room_id": uint(roomID),
+			"data":    json.RawMessage(activeGame),
+		})
+		select {
+		case client.Send <- joinGamePayload:
+		default:
+		}
+	}
 
 	go client.writePump()
 	go client.readPump()
@@ -133,7 +145,6 @@ func (c *LiveRoomClient) readPump() {
 	}
 }
 
-// writePump - Flutter'a mesaj gönderir
 func (c *LiveRoomClient) writePump() {
 	ticker := time.NewTicker(54 * time.Second)
 	defer func() {
@@ -179,7 +190,6 @@ func (c *LiveRoomClient) writePump() {
 	}
 }
 
-// GetLiveRoomMessages - Canlı yayın mesaj tarixçəsi (pagination ilə)
 func (h *LiveHub) GetLiveRoomMessages(c *gin.Context) {
 	userIDVal, exists := c.Get("user_id")
 	if !exists {
@@ -195,16 +205,14 @@ func (h *LiveHub) GetLiveRoomMessages(c *gin.Context) {
 		return
 	}
 
-	// İstifadəçi bu odaya aid olmalıdır
 	var participant models.LiveRoomParticipant
 	if err := database.DB.Where("live_room_id = ? AND user_id = ?", roomID, userID).First(&participant).Error; err != nil {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Bu odaya girişiniz yoxdur"})
 		return
 	}
 
-	// Pagination
 	limitStr := c.DefaultQuery("limit", "20")
-	cursorStr := c.Query("cursor") // Son mesajın ID-si (növbəti səhifə üçün)
+	cursorStr := c.Query("cursor")
 
 	limit, err := strconv.Atoi(limitStr)
 	if err != nil || limit <= 0 || limit > 50 {
@@ -219,7 +227,6 @@ func (h *LiveHub) GetLiveRoomMessages(c *gin.Context) {
 		SenderAvatar *string   `json:"sender_avatar"`
 		CreatedAt    time.Time `json:"created_at"`
 
-		// Reply fields (nullable)
 		ReplyToID         *uint   `json:"reply_to_id"`
 		ReplyText         *string `json:"reply_text"`
 		ReplySenderID     *uint   `json:"reply_sender_id"`
@@ -262,7 +269,6 @@ func (h *LiveHub) GetLiveRoomMessages(c *gin.Context) {
 		messages = messages[:limit]
 	}
 
-	// Avatar URL-lərini düzəlt
 	for i := range messages {
 		if messages[i].SenderAvatar != nil {
 			messages[i].SenderAvatar = utils.PrependBaseURL(messages[i].SenderAvatar)
@@ -285,7 +291,6 @@ func (h *LiveHub) GetLiveRoomMessages(c *gin.Context) {
 	})
 }
 
-// GetLiveRoomReactions - Odanın reaksiya statistikası
 func (h *LiveHub) GetLiveRoomReactions(c *gin.Context) {
 	roomIDStr := c.Param("room_id")
 	roomID, err := strconv.ParseUint(roomIDStr, 10, 32)
@@ -309,13 +314,11 @@ func (h *LiveHub) GetLiveRoomReactions(c *gin.Context) {
 		return
 	}
 
-	// Toplam say
 	var total uint64
 	for _, r := range reactions {
 		total += r.Count
 	}
 
-	// Top 2
 	top := reactions
 	if len(top) > 2 {
 		top = top[:2]
