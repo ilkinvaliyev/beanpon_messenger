@@ -180,7 +180,6 @@ func (h *GroupMessageHandler) GetGroupMessages(c *gin.Context) {
 	}
 	conversationID := uint(convID)
 
-	// Üye mi?
 	var me models.ConversationParticipant
 	err = database.DB.Where(
 		"conversation_id = ? AND user_id = ? AND deleted_at IS NULL",
@@ -228,14 +227,17 @@ func (h *GroupMessageHandler) GetGroupMessages(c *gin.Context) {
 		LEFT JOIN messages reply ON reply.id = m.reply_to_message_id
 		WHERE m.conversation_id = ?
 		  AND m.deleted_at IS NULL
+		  AND NOT EXISTS (
+		      SELECT 1 FROM user_blocks ub
+		      WHERE (ub.blocker_id = ? AND ub.blocked_id = m.sender_id)
+		         OR (ub.blocker_id = m.sender_id AND ub.blocked_id = ?)
+		  )
 		ORDER BY m.created_at DESC
 		LIMIT ? OFFSET ?
-	`, conversationID, limit, offset).Scan(&messages)
+	`, conversationID, userID, userID, limit, offset).Scan(&messages)
 
-	// Bulk read: bu kullanıcının henüz okumadığı mesajları işaretle
 	go h.markGroupMessagesRead(userID, conversationID)
 
-	// Decrypt ve response hazırla
 	var result []gin.H
 	for _, msg := range messages {
 		text, _ := h.encryptionService.DecryptMessage(msg.EncryptedText)

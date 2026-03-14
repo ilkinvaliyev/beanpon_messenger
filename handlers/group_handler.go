@@ -440,7 +440,6 @@ func (h *GroupHandler) GetMembers(c *gin.Context) {
 	convID, _ := strconv.ParseUint(c.Param("conversation_id"), 10, 32)
 	conversationID := uint(convID)
 
-	// Üye mi kontrol et
 	var me models.ConversationParticipant
 	err := database.DB.Where("conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL",
 		conversationID, userID).First(&me).Error
@@ -473,12 +472,16 @@ func (h *GroupHandler) GetMembers(c *gin.Context) {
 		WHERE cp.conversation_id = ?
 		  AND cp.left_at IS NULL
 		  AND cp.deleted_at IS NULL
+		  AND NOT EXISTS (
+		      SELECT 1 FROM user_blocks ub
+		      WHERE (ub.blocker_id = ? AND ub.blocked_id = cp.user_id)
+		         OR (ub.blocker_id = cp.user_id AND ub.blocked_id = ?)
+		  )
 		ORDER BY 
 			CASE cp.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END,
 			cp.joined_at ASC
-	`, conversationID).Scan(&members)
+	`, conversationID, userID, userID).Scan(&members)
 
-	// Online durumlarını ekle
 	for i := range members {
 		members[i].IsOnline = h.wsHub.IsUserOnline(members[i].UserID)
 	}
@@ -521,7 +524,12 @@ func (h *GroupHandler) GetMyGroups(c *gin.Context) {
 			 WHERE m.conversation_id = c.id
 			   AND m.sender_id != ?
 			   AND mr.id IS NULL
-			   AND m.deleted_at IS NULL) as unread_count,
+			   AND m.deleted_at IS NULL
+			   AND NOT EXISTS (
+			       SELECT 1 FROM user_blocks ub
+			       WHERE (ub.blocker_id = ? AND ub.blocked_id = m.sender_id)
+			          OR (ub.blocker_id = m.sender_id AND ub.blocked_id = ?)
+			   )) as unread_count,
 			last_msg.encrypted_text as last_message_text,
 			last_msg_user.username as last_sender_username
 		FROM conversations c
@@ -539,9 +547,8 @@ func (h *GroupHandler) GetMyGroups(c *gin.Context) {
 		  AND c.chat_type = 'group'
 		  AND c.deleted_at IS NULL
 		ORDER BY c.last_message_at DESC NULLS LAST
-	`, userID, userID, userID).Scan(&groups)
+	`, userID, userID, userID, userID, userID).Scan(&groups)
 
-	// Son mesajları decrypt et
 	for i := range groups {
 		if groups[i].LastMessageText != nil {
 			decrypted, err := h.encryptionService.DecryptMessage(*groups[i].LastMessageText)
