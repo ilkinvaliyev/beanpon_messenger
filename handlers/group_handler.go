@@ -18,14 +18,21 @@ type GroupHandler struct {
 		SendToUser(userID uint, messageType string, data interface{})
 		SendToMultipleUsers(userIDs []uint, messageType string, data interface{})
 	}
+	encryptionService interface {
+		EncryptMessage(plainText string) (string, error)
+		DecryptMessage(encryptedText string) (string, error)
+	}
 }
 
 func NewGroupHandler(wsHub interface {
 	IsUserOnline(userID uint) bool
 	SendToUser(userID uint, messageType string, data interface{})
 	SendToMultipleUsers(userIDs []uint, messageType string, data interface{})
+}, encryptionService interface {
+	EncryptMessage(plainText string) (string, error)
+	DecryptMessage(encryptedText string) (string, error)
 }) *GroupHandler {
-	return &GroupHandler{wsHub: wsHub}
+	return &GroupHandler{wsHub: wsHub, encryptionService: encryptionService}
 }
 
 // generateInviteToken 32 karakter random hex token üret
@@ -441,39 +448,52 @@ func (h *GroupHandler) GetMyGroups(c *gin.Context) {
 	}
 
 	database.DB.Raw(`
-			SELECT 
-				c.id as conversation_id,
-				c.group_name,
-				c.group_avatar,
-				cp.role as my_role,
-				cp.is_muted,
-				(SELECT COUNT(*) FROM conversation_participants cp2 
-				 WHERE cp2.conversation_id = c.id AND cp2.left_at IS NULL AND cp2.deleted_at IS NULL) as member_count,
-				c.last_message_at,
-				(SELECT COUNT(*) FROM messages m
-				 LEFT JOIN message_reads mr ON mr.message_id = m.id AND mr.user_id = ?
-				 WHERE m.conversation_id = c.id
-				   AND m.sender_id != ?
-				   AND mr.id IS NULL
-				   AND m.deleted_at IS NULL) as unread_count,
-				last_msg.encrypted_text as last_message_text,
-				last_msg_user.username as last_sender_username
-			FROM conversations c
-			JOIN conversation_participants cp ON cp.conversation_id = c.id
-			LEFT JOIN LATERAL (
-				SELECT m.encrypted_text, m.sender_id
-				FROM messages m
-				WHERE m.conversation_id = c.id AND m.deleted_at IS NULL
-				ORDER BY m.created_at DESC LIMIT 1
-			) last_msg ON true
-			LEFT JOIN users last_msg_user ON last_msg_user.id = last_msg.sender_id
-			WHERE cp.user_id = ?
-			  AND cp.left_at IS NULL
-			  AND cp.deleted_at IS NULL
-			  AND c.chat_type = 'group'
-			  AND c.deleted_at IS NULL
-			ORDER BY c.last_message_at DESC NULLS LAST
-		`, userID, userID, userID).Scan(&groups)
+		SELECT 
+			c.id as conversation_id,
+			c.group_name,
+			c.group_avatar,
+			cp.role as my_role,
+			cp.is_muted,
+			(SELECT COUNT(*) FROM conversation_participants cp2 
+			 WHERE cp2.conversation_id = c.id AND cp2.left_at IS NULL AND cp2.deleted_at IS NULL) as member_count,
+			c.last_message_at,
+			(SELECT COUNT(*) FROM messages m
+			 LEFT JOIN message_reads mr ON mr.message_id = m.id AND mr.user_id = ?
+			 WHERE m.conversation_id = c.id
+			   AND m.sender_id != ?
+			   AND mr.id IS NULL
+			   AND m.deleted_at IS NULL) as unread_count,
+			last_msg.encrypted_text as last_message_text,
+			last_msg_user.username as last_sender_username
+		FROM conversations c
+		JOIN conversation_participants cp ON cp.conversation_id = c.id
+		LEFT JOIN LATERAL (
+			SELECT m.encrypted_text, m.sender_id
+			FROM messages m
+			WHERE m.conversation_id = c.id AND m.deleted_at IS NULL
+			ORDER BY m.created_at DESC LIMIT 1
+		) last_msg ON true
+		LEFT JOIN users last_msg_user ON last_msg_user.id = last_msg.sender_id
+		WHERE cp.user_id = ?
+		  AND cp.left_at IS NULL
+		  AND cp.deleted_at IS NULL
+		  AND c.chat_type = 'group'
+		  AND c.deleted_at IS NULL
+		ORDER BY c.last_message_at DESC NULLS LAST
+	`, userID, userID, userID).Scan(&groups)
+
+	// Son mesajları decrypt et
+	for i := range groups {
+		if groups[i].LastMessageText != nil {
+			decrypted, err := h.encryptionService.DecryptMessage(*groups[i].LastMessageText)
+			if err == nil {
+				groups[i].LastMessageText = &decrypted
+			} else {
+				empty := ""
+				groups[i].LastMessageText = &empty
+			}
+		}
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"groups": groups,

@@ -39,7 +39,7 @@ func main() {
 	// Handler'ları oluştur
 	messageHandler := handlers.NewMessageHandler(encryptionService, wsHub)
 	conversationHandler := handlers.NewConversationHandler(wsHub, encryptionService)
-	groupHandler := handlers.NewGroupHandler(wsHub)
+	groupHandler := handlers.NewGroupHandler(wsHub, encryptionService)
 	groupMsgHandler := handlers.NewGroupMessageHandler(encryptionService, wsHub)
 
 	// Gin router'ını oluştur
