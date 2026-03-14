@@ -246,7 +246,7 @@ func (h *GroupMessageHandler) GetGroupMessages(c *gin.Context) {
 			"sender_id":           msg.SenderID,
 			"sender_name":         msg.SenderName,
 			"sender_username":     msg.SenderUsername,
-			"sender_avatar":       msg.SenderAvatar,
+			"sender_avatar":       utils.PrependBaseURL(msg.SenderAvatar),
 			"text":                text,
 			"reply_to_message_id": msg.ReplyToMessageID,
 			"read_count":          msg.ReadCount,
