@@ -512,8 +512,8 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		}
 
 		selected := eligible[time.Now().UnixNano()%int64(len(eligible))]
-		targetAngle := float64(1440) + float64(time.Now().UnixNano()%360)
-		durationMs := 4000
+		targetAngle := float64(2520) + float64(time.Now().UnixNano()%720) // 7-9 tur
+		durationMs := 5000 + int(time.Now().UnixNano()%4000)              // 5-9 saniye arası random
 
 		gameState := map[string]interface{}{
 			"type": "bottle",
