@@ -45,6 +45,15 @@ type Conversation struct {
 
 	User1 User `json:"user1" gorm:"foreignKey:User1ID"`
 	User2 User `json:"user2" gorm:"foreignKey:User2ID"`
+
+	ChatType             string     `json:"chat_type" gorm:"type:varchar(10);default:'direct'"`
+	GroupName            *string    `json:"group_name" gorm:"type:varchar(255)"`
+	GroupAvatar          *string    `json:"group_avatar" gorm:"type:varchar(255)"`
+	GroupDesc            *string    `json:"group_desc" gorm:"type:text"`
+	CreatedBy            *uint      `json:"created_by"`
+	InviteToken          *string    `json:"invite_token" gorm:"type:varchar(32);uniqueIndex"`
+	InviteTokenExpiresAt *time.Time `json:"invite_token_expires_at"`
+	MaxMembers           int        `json:"max_members" gorm:"default:256"`
 }
 
 type ConversationResponse struct {

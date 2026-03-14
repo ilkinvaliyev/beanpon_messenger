@@ -39,6 +39,8 @@ func main() {
 	// Handler'ları oluştur
 	messageHandler := handlers.NewMessageHandler(encryptionService, wsHub)
 	conversationHandler := handlers.NewConversationHandler(wsHub, encryptionService)
+	groupHandler := handlers.NewGroupHandler(wsHub)
+	groupMsgHandler := handlers.NewGroupMessageHandler(encryptionService, wsHub)
 
 	// Gin router'ını oluştur
 	router := gin.Default()
@@ -58,17 +60,14 @@ func main() {
 	})
 
 	// 🔌 WEBSOCKET ENDPOINT'LERİ
-	// Özel mesajlaşma soketi
 	router.GET("/ws", middleware.JWTMiddlewareForWebSocket(cfg.JWTSecret), wsHub.HandleWebSocket)
-
-	// Canlı yayın odaları soketi (DÜZELTİLDİ: Artık doğrudan liveHub kullanılıyor)
 	router.GET("/ws/live", middleware.JWTMiddlewareForWebSocket(cfg.JWTSecret), liveHub.HandleWebSocket)
 
 	// Mesajlaşma API route'ları (JWT korumalı)
 	api := router.Group("/api/v1")
 	api.Use(middleware.JWTMiddleware(cfg.JWTSecret))
 	{
-		// Mesaj operasyonları
+		// ── DM: Mesaj operasyonları ──────────────────────────────────────
 		api.POST("/messages", messageHandler.SendMessage)
 		api.GET("/messages/:user_id", messageHandler.GetMessages)
 		api.PUT("/messages/:message_id/read", messageHandler.MarkAsRead)
@@ -77,28 +76,43 @@ func main() {
 		api.DELETE("/conversations/:other_user_id/clear", messageHandler.ClearConversation)
 		api.DELETE("/conversations/clear-all", messageHandler.ClearAllMyMessages)
 
-		// Sohbet operasyonları
+		// ── DM: Sohbet operasyonları ─────────────────────────────────────
 		api.GET("/conversations", messageHandler.GetConversations)
 		api.GET("/unread-count", messageHandler.GetUnreadCount)
 
-		// Conversation request yönetimi
+		// ── DM: Conversation request yönetimi ───────────────────────────
 		api.GET("/conversation-requests", conversationHandler.GetPendingRequests)
 		api.GET("/conversation-requests/count", conversationHandler.GetPendingRequestCount)
 		api.POST("/conversation-requests/:requester_id/accept", conversationHandler.AcceptConversationRequest)
 		api.POST("/conversation-requests/:requester_id/reject", conversationHandler.RejectConversationRequest)
 
-		// Conversation yönetimi
+		// ── DM: Conversation yönetimi ────────────────────────────────────
 		api.GET("/conversations/:user_id/details", conversationHandler.GetConversationDetails)
 		api.POST("/conversations/:user_id/mute", conversationHandler.MuteConversation)
 		api.POST("/conversations/:user_id/unmute", conversationHandler.UnmuteConversation)
 		api.POST("/conversations/:user_id/screenshot-protection", conversationHandler.ToggleScreenshotProtection)
 		api.GET("/conversations/:user_id/screenshot-protection", conversationHandler.GetScreenshotProtectionStatus)
 
-		// Canlı yayın API route-ları
+		// ── GROUP: Grup yönetimi ─────────────────────────────────────────
+		api.POST("/groups", groupHandler.CreateGroup)
+		api.GET("/groups", groupHandler.GetMyGroups)
+		api.POST("/groups/join/:token", groupHandler.JoinByToken)
+		api.POST("/groups/:conversation_id/leave", groupHandler.LeaveGroup)
+		api.POST("/groups/:conversation_id/kick/:user_id", groupHandler.KickMember)
+		api.PUT("/groups/:conversation_id/role/:user_id", groupHandler.ChangeRole)
+		api.GET("/groups/:conversation_id/members", groupHandler.GetMembers)
+		api.POST("/groups/:conversation_id/invite-token/refresh", groupHandler.RefreshInviteToken)
+
+		// ── GROUP: Mesajlar ──────────────────────────────────────────────
+		api.POST("/groups/:conversation_id/messages", groupMsgHandler.SendGroupMessage)
+		api.GET("/groups/:conversation_id/messages", groupMsgHandler.GetGroupMessages)
+		api.GET("/groups/messages/:message_id/reads", groupMsgHandler.GetMessageReads)
+
+		// ── Live yayın ───────────────────────────────────────────────────
 		api.GET("/live-rooms/:room_id/messages", liveHub.GetLiveRoomMessages)
 		api.GET("/live-rooms/:room_id/reactions", liveHub.GetLiveRoomReactions)
 
-		// WebSocket bilgi endpoint'leri
+		// ── WebSocket bilgi endpoint'leri ────────────────────────────────
 		api.GET("/online-users", func(c *gin.Context) {
 			onlineUsers := wsHub.GetConnectedUsers()
 			c.JSON(http.StatusOK, gin.H{
@@ -127,9 +141,7 @@ func main() {
 
 	// Public routes
 	router.GET("/ping", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{
-			"message": "pong running",
-		})
+		c.JSON(http.StatusOK, gin.H{"message": "pong running"})
 	})
 
 	router.GET("/health", func(c *gin.Context) {
@@ -140,7 +152,6 @@ func main() {
 		})
 	})
 
-	// WebSocket status endpoint
 	router.GET("/ws-status", func(c *gin.Context) {
 		onlineUsers := wsHub.GetConnectedUsers()
 		c.JSON(http.StatusOK, gin.H{
@@ -164,30 +175,42 @@ func main() {
 				"history_message",
 				"history_loaded",
 				"online_users",
+				"new_group_message",
+				"group_message_read",
+				"group_member_joined",
+				"group_member_left",
+				"group_member_kicked",
+				"group_kicked",
+				"group_added",
+				"group_role_changed",
 				"pong",
 			},
 		})
 	})
 
-	// HTTP sunucusunu başlat
 	log.Printf("Sunucu %s portunda başlatılıyor...", cfg.Port)
 	log.Println("🚀 API Endpoints:")
-	log.Println("  POST /api/v1/messages - Mesaj gönder")
-	log.Println("  GET  /api/v1/messages/:user_id - Mesajları getir")
-	log.Println("  PUT  /api/v1/messages/:message_id/read - Okundu işaretle")
-	log.Println("  DELETE /api/v1/messages/:message_id - Mesajı sil")
-	log.Println("  GET  /api/v1/conversations - Sohbet listesi")
-	log.Println("  GET  /api/v1/unread-count - Okunmamış mesaj sayısı")
-	log.Println("  GET  /api/v1/online-users - Online kullanıcılar")
+	log.Println("  POST   /api/v1/messages                              - DM mesaj gönder")
+	log.Println("  GET    /api/v1/messages/:user_id                     - DM mesajları getir")
+	log.Println("  PUT    /api/v1/messages/:message_id/read             - Okundu işaretle")
+	log.Println("  DELETE /api/v1/messages/:message_id                  - Mesajı sil")
+	log.Println("  GET    /api/v1/conversations                         - DM sohbet listesi")
+	log.Println("  GET    /api/v1/unread-count                          - Okunmamış sayısı")
+	log.Println("  POST   /api/v1/groups                                - Grup oluştur")
+	log.Println("  GET    /api/v1/groups                                - Gruplarım")
+	log.Println("  POST   /api/v1/groups/join/:token                    - Token ile katıl")
+	log.Println("  POST   /api/v1/groups/:id/leave                      - Gruptan ayrıl")
+	log.Println("  POST   /api/v1/groups/:id/kick/:user_id              - Üye çıkar")
+	log.Println("  PUT    /api/v1/groups/:id/role/:user_id              - Rol değiştir")
+	log.Println("  GET    /api/v1/groups/:id/members                    - Üye listesi")
+	log.Println("  POST   /api/v1/groups/:id/invite-token/refresh       - Token yenile")
+	log.Println("  POST   /api/v1/groups/:id/messages                   - Grup mesaj gönder")
+	log.Println("  GET    /api/v1/groups/:id/messages                   - Grup mesajları")
+	log.Println("  GET    /api/v1/groups/messages/:message_id/reads     - Kimler gördü")
 	log.Println()
-	log.Println("🔌 WebSocket Bağlantıları:")
-	log.Println("  GET  /ws?token=JWT_TOKEN - Özel Chat WebSocket'i")
-	log.Println("  GET  /ws/live?room_id=ID&token=JWT_TOKEN - Canlı Yayın WebSocket'i")
-	log.Println("  GET  /ws-status - WebSocket durumu")
-	log.Println()
-	log.Println("📚 Dokümantasyon:")
-	log.Println("  GET  /api-docs - API dokümantasyonu")
-	log.Println("  GET  /health - Sistem durumu")
+	log.Println("🔌 WebSocket:")
+	log.Println("  GET  /ws?token=JWT_TOKEN")
+	log.Println("  GET  /ws/live?room_id=ID&token=JWT_TOKEN")
 
 	if err := router.Run(":" + cfg.Port); err != nil {
 		log.Fatalf("Sunucu başlatma hatası: %v", err)
