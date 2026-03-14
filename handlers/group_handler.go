@@ -497,3 +497,241 @@ func (h *GroupHandler) RefreshInviteToken(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{"invite_token": token})
 }
+
+// GET /api/v1/groups/:conversation_id
+func (h *GroupHandler) GetGroupDetail(c *gin.Context) {
+	userID := c.MustGet("user_id").(uint)
+	convID, err := strconv.ParseUint(c.Param("conversation_id"), 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz conversation_id"})
+		return
+	}
+	conversationID := uint(convID)
+
+	// Üye mi?
+	var me models.ConversationParticipant
+	err = database.DB.Where(
+		"conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL",
+		conversationID, userID,
+	).First(&me).Error
+	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Bu grubun üyesi değilsiniz"})
+		return
+	}
+
+	// Grup detayı
+	var conv models.Conversation
+	if err := database.DB.Where("id = ? AND chat_type = 'group' AND deleted_at IS NULL", conversationID).
+		First(&conv).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Grup bulunamadı"})
+		return
+	}
+
+	// Üye sayısı
+	var memberCount int64
+	database.DB.Model(&models.ConversationParticipant{}).
+		Where("conversation_id = ? AND left_at IS NULL AND deleted_at IS NULL", conversationID).
+		Count(&memberCount)
+
+	// Son 3 üye kullanıcı adı (People altında gösterim için)
+	var memberPreviews []struct {
+		Username string `gorm:"column:username"`
+	}
+	database.DB.Raw(`
+		SELECT u.username
+		FROM conversation_participants cp
+		JOIN users u ON u.id = cp.user_id
+		WHERE cp.conversation_id = ?
+		  AND cp.left_at IS NULL
+		  AND cp.deleted_at IS NULL
+		  AND cp.user_id != ?
+		ORDER BY cp.joined_at ASC
+		LIMIT 3
+	`, conversationID, userID).Scan(&memberPreviews)
+
+	previews := make([]string, 0, len(memberPreviews))
+	for _, m := range memberPreviews {
+		previews = append(previews, m.Username)
+	}
+
+	// Invite token sadece admin/owner görür
+	var inviteToken *string
+	if me.Role == "owner" || me.Role == "admin" {
+		inviteToken = conv.InviteToken
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"id":              conv.ID,
+		"name":            conv.GroupName,
+		"avatar":          conv.GroupAvatar,
+		"description":     conv.GroupDesc,
+		"member_count":    memberCount,
+		"my_role":         me.Role,
+		"invite_token":    inviteToken,
+		"member_previews": previews,
+		"created_at":      conv.CreatedAt,
+	})
+}
+
+// POST /api/v1/groups/:conversation_id/members
+func (h *GroupHandler) AddMembers(c *gin.Context) {
+	requesterID := c.MustGet("user_id").(uint)
+	convID, err := strconv.ParseUint(c.Param("conversation_id"), 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz conversation_id"})
+		return
+	}
+	conversationID := uint(convID)
+
+	var body struct {
+		UserIDs []uint `json:"user_ids" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || len(body.UserIDs) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "user_ids gerekli"})
+		return
+	}
+
+	// Requester üye mi?
+	var me models.ConversationParticipant
+	err = database.DB.Where(
+		"conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL",
+		conversationID, requesterID,
+	).First(&me).Error
+	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Bu grubun üyesi değilsiniz"})
+		return
+	}
+
+	// Üye sayısı kontrolü
+	var conv models.Conversation
+	database.DB.Where("id = ?", conversationID).First(&conv)
+
+	var currentCount int64
+	database.DB.Model(&models.ConversationParticipant{}).
+		Where("conversation_id = ? AND left_at IS NULL AND deleted_at IS NULL", conversationID).
+		Count(&currentCount)
+
+	if int(currentCount)+len(body.UserIDs) > conv.MaxMembers {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Grup kapasitesi aşılıyor"})
+		return
+	}
+
+	now := time.Now()
+	added := []uint{}
+
+	for _, uid := range body.UserIDs {
+		if uid == requesterID {
+			continue
+		}
+
+		// Zaten üye mi?
+		var existing models.ConversationParticipant
+		err := database.DB.Where(
+			"conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL",
+			conversationID, uid,
+		).First(&existing).Error
+		if err == nil {
+			continue // zaten üye
+		}
+
+		// Daha önce ayrılmış mı?
+		var old models.ConversationParticipant
+		err = database.DB.Unscoped().Where(
+			"conversation_id = ? AND user_id = ?", conversationID, uid,
+		).First(&old).Error
+		if err == nil {
+			database.DB.Model(&old).Updates(map[string]interface{}{
+				"left_at":    nil,
+				"kicked_by":  nil,
+				"deleted_at": nil,
+				"joined_at":  now,
+			})
+		} else {
+			participant := models.ConversationParticipant{
+				ConversationID: conversationID,
+				UserID:         uid,
+				Role:           "member",
+				JoinedAt:       &now,
+			}
+			database.DB.Create(&participant)
+		}
+
+		added = append(added, uid)
+
+		// Bildirim gönder
+		h.wsHub.SendToUser(uid, "group_added", gin.H{
+			"conversation_id": conversationID,
+			"group_name":      conv.GroupName,
+			"added_by":        requesterID,
+		})
+	}
+
+	// Mevcut üyelere bildir
+	memberIDs := getGroupParticipantIDs(conversationID)
+	h.wsHub.SendToMultipleUsers(memberIDs, "group_members_added", gin.H{
+		"conversation_id": conversationID,
+		"added_user_ids":  added,
+		"added_by":        requesterID,
+	})
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Üyeler eklendi",
+		"added":   added,
+	})
+}
+
+// PUT /api/v1/groups/:conversation_id
+func (h *GroupHandler) UpdateGroup(c *gin.Context) {
+	requesterID := c.MustGet("user_id").(uint)
+	convID, err := strconv.ParseUint(c.Param("conversation_id"), 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz conversation_id"})
+		return
+	}
+	conversationID := uint(convID)
+
+	// Admin/owner kontrolü
+	var me models.ConversationParticipant
+	err = database.DB.Where(
+		"conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL",
+		conversationID, requesterID,
+	).First(&me).Error
+	if err != nil || me.Role == "member" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Yetkiniz yok"})
+		return
+	}
+
+	var body struct {
+		Name        *string `json:"name"`
+		Description *string `json:"description"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	updates := map[string]interface{}{}
+	if body.Name != nil && *body.Name != "" {
+		updates["group_name"] = *body.Name
+	}
+	if body.Description != nil {
+		updates["group_desc"] = *body.Description
+	}
+
+	if len(updates) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Güncellenecek alan yok"})
+		return
+	}
+
+	database.DB.Table("conversations").Where("id = ?", conversationID).Updates(updates)
+
+	// Üyelere bildir
+	memberIDs := getGroupParticipantIDs(conversationID)
+	h.wsHub.SendToMultipleUsers(memberIDs, "group_updated", gin.H{
+		"conversation_id": conversationID,
+		"updates":         updates,
+		"updated_by":      requesterID,
+	})
+
+	c.JSON(http.StatusOK, gin.H{"message": "Grup güncellendi"})
+}

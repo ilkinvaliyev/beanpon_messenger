@@ -103,6 +103,10 @@ func main() {
 		api.GET("/groups/:conversation_id/members", groupHandler.GetMembers)
 		api.POST("/groups/:conversation_id/invite-token/refresh", groupHandler.RefreshInviteToken)
 
+		api.GET("/groups/:conversation_id", groupHandler.GetGroupDetail)
+		api.POST("/groups/:conversation_id/members", groupHandler.AddMembers)
+		api.PUT("/groups/:conversation_id", groupHandler.UpdateGroup)
+
 		// ── GROUP: Mesajlar ──────────────────────────────────────────────
 		api.POST("/groups/:conversation_id/messages", groupMsgHandler.SendGroupMessage)
 		api.GET("/groups/:conversation_id/messages", groupMsgHandler.GetGroupMessages)
