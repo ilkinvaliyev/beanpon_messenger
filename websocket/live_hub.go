@@ -6,6 +6,7 @@ import (
 	"beanpon_messenger/utils"
 	"encoding/json"
 	"log"
+	"sort"
 	"sync"
 	"time"
 
@@ -511,16 +512,24 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 			return
 		}
 
+		// user_id'ye göre sırala — tüm cihazlarda aynı pozisyon
+		sort.Slice(eligible, func(i, j int) bool {
+			iID := eligible[i]["user_id"].(uint)
+			jID := eligible[j]["user_id"].(uint)
+			return iID < jID
+		})
+
 		selected := eligible[time.Now().UnixNano()%int64(len(eligible))]
-		targetAngle := float64(2520) + float64(time.Now().UnixNano()%720) // 7-9 tur
-		durationMs := 5000 + int(time.Now().UnixNano()%4000)              // 5-9 saniye arası random
+		durationMs := 5000 + int(time.Now().UnixNano()%4000)
+		targetAngle := float64(durationMs) * 0.8
 
 		gameState := map[string]interface{}{
 			"type": "bottle",
 			"state": map[string]interface{}{
-				"selected_user": selected,
-				"target_angle":  targetAngle,
-				"duration_ms":   durationMs,
+				"selected_user":   selected,
+				"target_angle":    targetAngle,
+				"duration_ms":     durationMs,
+				"ordered_players": eligible,
 			},
 			"started_at": time.Now().UTC(),
 		}
@@ -571,6 +580,63 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		for _, c := range roomClients {
 			select {
 			case c.Send <- stopPayload:
+			default:
+			}
+		}
+		h.mu.RUnlock()
+
+	case "transfer_host":
+		h.mu.RLock()
+		sender, exists := roomClients[event.SenderID]
+		h.mu.RUnlock()
+		if !exists || sender.Role != "host" {
+			return
+		}
+
+		var dataMap map[string]interface{}
+		if err := json.Unmarshal(event.Data, &dataMap); err != nil {
+			return
+		}
+		targetUserIDFloat, ok := dataMap["target_user_id"].(float64)
+		if !ok {
+			return
+		}
+		targetUserID := uint(targetUserIDFloat)
+
+		h.mu.Lock()
+		if targetClient, exists := roomClients[targetUserID]; exists {
+			targetClient.Role = "host"
+			sender.Role = "audience"
+
+			// DB'yi güncelle
+			go database.DB.Exec(
+				"UPDATE live_rooms SET host_user_id = ? WHERE id = ?",
+				targetUserID, event.RoomID,
+			)
+			go database.DB.Exec(
+				"UPDATE live_room_participants SET role = 'host' WHERE live_room_id = ? AND user_id = ?",
+				event.RoomID, targetUserID,
+			)
+			go database.DB.Exec(
+				"UPDATE live_room_participants SET role = 'audience' WHERE live_room_id = ? AND user_id = ?",
+				event.RoomID, event.SenderID,
+			)
+		}
+		h.mu.Unlock()
+
+		transferPayload, _ := json.Marshal(map[string]interface{}{
+			"type":    "host_transferred",
+			"room_id": event.RoomID,
+			"data": map[string]interface{}{
+				"new_host_id": targetUserID,
+				"old_host_id": event.SenderID,
+			},
+		})
+
+		h.mu.RLock()
+		for _, c := range roomClients {
+			select {
+			case c.Send <- transferPayload:
 			default:
 			}
 		}
