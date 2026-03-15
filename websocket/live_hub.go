@@ -606,23 +606,22 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		h.mu.Lock()
 		if targetClient, exists := roomClients[targetUserID]; exists {
 			targetClient.Role = "host"
-			sender.Role = "audience"
-
-			// DB'yi güncelle
-			go database.DB.Exec(
-				"UPDATE live_rooms SET host_user_id = ? WHERE id = ?",
-				targetUserID, event.RoomID,
-			)
-			go database.DB.Exec(
-				"UPDATE live_room_participants SET role = 'host' WHERE live_room_id = ? AND user_id = ?",
-				event.RoomID, targetUserID,
-			)
-			go database.DB.Exec(
-				"UPDATE live_room_participants SET role = 'audience' WHERE live_room_id = ? AND user_id = ?",
-				event.RoomID, event.SenderID,
-			)
+			sender.Role = "broadcaster" // ← audience deyil
 		}
 		h.mu.Unlock()
+
+		go database.DB.Exec(
+			"UPDATE live_rooms SET host_user_id = ? WHERE id = ?",
+			targetUserID, event.RoomID,
+		)
+		go database.DB.Exec(
+			"UPDATE live_room_participants SET role = 'host' WHERE live_room_id = ? AND user_id = ?",
+			event.RoomID, targetUserID,
+		)
+		go database.DB.Exec(
+			"UPDATE live_room_participants SET role = 'broadcaster' WHERE live_room_id = ? AND user_id = ?", // ← audience deyil
+			event.RoomID, event.SenderID,
+		)
 
 		transferPayload, _ := json.Marshal(map[string]interface{}{
 			"type":    "host_transferred",
