@@ -45,6 +45,13 @@ func main() {
 	// Gin router'ını oluştur
 	router := gin.Default()
 
+	p := ginprom.New(
+		ginprom.Engine(router),
+		ginprom.Namespace("beanpon"),
+		ginprom.Subsystem("messenger"),
+	)
+	router.Use(p.Instrument())
+
 	// CORS middleware
 	router.Use(func(c *gin.Context) {
 		c.Header("Access-Control-Allow-Origin", "*")
