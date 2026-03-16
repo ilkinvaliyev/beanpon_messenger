@@ -73,10 +73,10 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 	}
 
 	// Kendi kendine mesaj göndermesini engelle
-	if senderID.(uint) == req.ReceiverID {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Kendi kendinize mesaj gönderemezsiniz"})
-		return
-	}
+	//if senderID.(uint) == req.ReceiverID {
+	//	c.JSON(http.StatusBadRequest, gin.H{"error": "Kendi kendinize mesaj gönderemezsiniz"})
+	//	return
+	//}
 
 	// Block kontrolü ekle
 	if models.IsBlocked(database.DB, senderID.(uint), req.ReceiverID) {
