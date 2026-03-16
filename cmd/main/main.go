@@ -7,6 +7,7 @@ import (
 	"beanpon_messenger/middleware"
 	"beanpon_messenger/services"
 	"beanpon_messenger/websocket"
+	"github.com/Depado/ginprom"
 	"github.com/gin-gonic/gin"
 	"log"
 	"net/http"
