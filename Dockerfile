@@ -1,5 +1,5 @@
 # Base image olarak Go'nun resmi imajını kullan
-FROM golang:1.23-alpine
+FROM golang:1.24-alpine
 
 # Proje dizinini ayarla
 WORKDIR /app
