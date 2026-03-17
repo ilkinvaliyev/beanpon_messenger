@@ -2,7 +2,6 @@ package websocket
 
 import (
 	"beanpon_messenger/config"
-	"beanpon_messenger/handlers"
 	"beanpon_messenger/models"
 	"beanpon_messenger/utils"
 	"bytes"
@@ -724,8 +723,10 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 		}
 
 		// 🎯 TEK SEFERDE: Conversation'ı getir + izin kontrolü yap
-		conversationHandler := handlers.NewConversationHandler(c.Hub, c.Hub.encryptionService)
-		conversation, canSend, errorMsg, err := conversationHandler.GetOrCreateConversationWithPermission(c.UserID, receiverID)
+		//conversationHandler := handlers.NewConversationHandler(c.Hub, c.Hub.encryptionService)
+		//conversation, canSend, errorMsg, err := conversationHandler.GetOrCreateConversationWithPermission(c.UserID, receiverID)
+
+		conversation, canSend, errorMsg, err := c.Hub.getOrCreateConversationWithPermission(c.UserID, receiverID)
 
 		if err != nil || !canSend {
 			log.Printf("Mesaj gönderilemedi: %d -> %d, error: %v, msg: %s", c.UserID, receiverID, err, errorMsg)
@@ -1192,4 +1193,31 @@ func (h *Hub) BroadcastScreenshotProtectionChange(user1ID, user2ID uint, isDisab
 
 	log.Printf("Screenshot protection değişikliği yayınlandı: User1: %d, User2: %d, Disabled: %t, ChangedBy: %d",
 		user1ID, user2ID, isDisabled, changedByUserID)
+}
+
+func (h *Hub) getOrCreateConversationWithPermission(senderID, receiverID uint) (*models.Conversation, bool, string, error) {
+	var conversation models.Conversation
+	err := h.db.Where(
+		"(user1_id = ? AND user2_id = ?) OR (user1_id = ? AND user2_id = ?)",
+		senderID, receiverID, receiverID, senderID,
+	).First(&conversation).Error
+
+	if err != nil {
+		// Conversation yok, yeni oluştur
+		newConv := models.Conversation{
+			User1ID: senderID,
+			User2ID: receiverID,
+			Status:  "pending",
+		}
+		if err := h.db.Create(&newConv).Error; err != nil {
+			return nil, false, "conversation oluşturulamadı", err
+		}
+		return &newConv, true, "", nil
+	}
+
+	if conversation.Status == "blocked" {
+		return nil, false, "Bu kullanıcıya mesaj gönderemezsiniz", nil
+	}
+
+	return &conversation, true, "", nil
 }
