@@ -185,6 +185,7 @@ func (h *RaveHub) handleRaveEvent(event *RaveEvent) {
 
 		provider, _ := dataMap["provider"].(string)
 		videoID, _ := dataMap["video_id"].(string)
+		title, _ := dataMap["title"].(string)
 
 		if provider == "" || videoID == "" {
 			return
@@ -192,8 +193,8 @@ func (h *RaveHub) handleRaveEvent(event *RaveEvent) {
 
 		// DB'ye yaz
 		go database.DB.Exec(
-			`UPDATE raves SET provider = ?, provider_video_id = ?, position_ms = 0, is_playing = true, position_updated_at = NOW() WHERE id = ?`,
-			provider, videoID, event.RaveID,
+			`UPDATE raves SET provider = ?, provider_video_id = ?, title = ?, position_ms = 0, is_playing = true, position_updated_at = NOW() WHERE id = ?`,
+			provider, videoID, title, event.RaveID,
 		)
 
 		dataMap["timestamp"] = time.Now().UnixMilli()
