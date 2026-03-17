@@ -37,11 +37,16 @@ func main() {
 	liveHub := websocket.NewLiveHub()
 	go liveHub.Run()
 
+	// 3. RAVE Hub'ı
+	raveHub := websocket.NewRaveHub()
+	go raveHub.Run()
+
 	// Handler'ları oluştur
 	messageHandler := handlers.NewMessageHandler(encryptionService, wsHub)
 	conversationHandler := handlers.NewConversationHandler(wsHub, encryptionService)
 	groupHandler := handlers.NewGroupHandler(wsHub, encryptionService)
 	groupMsgHandler := handlers.NewGroupMessageHandler(encryptionService, wsHub)
+	raveHandler := handlers.NewRaveHandler(raveHub) // ← YENİ
 
 	// Gin router'ını oluştur
 	router := gin.Default()
@@ -70,6 +75,7 @@ func main() {
 	// 🔌 WEBSOCKET ENDPOINT'LERİ
 	router.GET("/ws", middleware.JWTMiddlewareForWebSocket(cfg.JWTSecret), wsHub.HandleWebSocket)
 	router.GET("/ws/live", middleware.JWTMiddlewareForWebSocket(cfg.JWTSecret), liveHub.HandleWebSocket)
+	router.GET("/ws/rave", middleware.JWTMiddlewareForWebSocket(cfg.JWTSecret), raveHandler.HandleWebSocket) // ← YENİ
 
 	// Mesajlaşma API route'ları (JWT korumalı)
 	api := router.Group("/api/v1")
