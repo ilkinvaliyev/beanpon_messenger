@@ -195,16 +195,16 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
 	offset := (page - 1) * limit
 
-	// Story bilgisi de dahil edilmiş struct
 	var messages []struct {
 		ID                   string     `gorm:"column:id"`
 		SenderID             uint       `gorm:"column:sender_id"`
 		ReceiverID           uint       `gorm:"column:receiver_id"`
-		StoryID              *uint      `gorm:"column:story_id"`       // YENİ ALAN
-		StoryMetadata        *string    `gorm:"column:story_metadata"` // BU SATIRI EKLE
+		StoryID              *uint      `gorm:"column:story_id"`
+		StoryMetadata        *string    `gorm:"column:story_metadata"`
 		ReplyToMessageID     *string    `gorm:"column:reply_to_message_id"`
 		EncryptedText        string     `gorm:"column:encrypted_text"`
 		Read                 bool       `gorm:"column:read"`
+		IsEdited             bool       `gorm:"column:is_edited"` // ← YENİ
 		SenderReaction       *string    `gorm:"column:sender_reaction"`
 		ReceiverReaction     *string    `gorm:"column:receiver_reaction"`
 		CreatedAt            time.Time  `gorm:"column:created_at"`
@@ -212,12 +212,11 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 		ReplyToMessageText   *string    `gorm:"column:reply_to_message_text"`
 		ReplyToMessageSender *uint      `gorm:"column:reply_to_message_sender"`
 		ReplyToCreatedAt     *time.Time `gorm:"column:reply_to_created_at"`
-		// Story bilgileri
-		StoryType      *string    `gorm:"column:story_type"`
-		StoryMediaURL  *string    `gorm:"column:story_media_url"`
-		StoryContent   *string    `gorm:"column:story_content"`
-		StoryUserID    *uint      `gorm:"column:story_user_id"`
-		StoryCreatedAt *time.Time `gorm:"column:story_created_at"`
+		StoryType            *string    `gorm:"column:story_type"`
+		StoryMediaURL        *string    `gorm:"column:story_media_url"`
+		StoryContent         *string    `gorm:"column:story_content"`
+		StoryUserID          *uint      `gorm:"column:story_user_id"`
+		StoryCreatedAt       *time.Time `gorm:"column:story_created_at"`
 	}
 
 	query := `
@@ -247,8 +246,8 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
     `
 
 	err = database.DB.Raw(query,
-		userID, otherUserID, otherUserID, userID, // mesaj filtri
-		userID, // delete filtri
+		userID, otherUserID, otherUserID, userID,
+		userID,
 		limit, offset,
 	).Scan(&messages).Error
 
@@ -257,7 +256,6 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 		return
 	}
 
-	// Mesajları çöz ve response'a hazırla
 	var responseMessages []gin.H
 	for _, msg := range messages {
 		decryptedText, err := h.encryptionService.DecryptMessage(msg.EncryptedText)
@@ -269,31 +267,29 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 			"id":                  msg.ID,
 			"sender_id":           msg.SenderID,
 			"receiver_id":         msg.ReceiverID,
-			"story_id":            msg.StoryID, // YENİ ALAN
+			"story_id":            msg.StoryID,
 			"reply_to_message_id": msg.ReplyToMessageID,
 			"text":                decryptedText,
 			"read":                msg.Read,
+			"is_edited":           msg.IsEdited, // ← YENİ
 			"sender_reaction":     msg.SenderReaction,
 			"receiver_reaction":   msg.ReceiverReaction,
 			"created_at":          msg.CreatedAt,
 			"updated_at":          msg.UpdatedAt,
 		}
 
-		// Story bilgisi varsa ekle
 		if msg.StoryID != nil {
 			if msg.StoryType != nil {
-				// Story hala mevcut
 				storyResponse := gin.H{
 					"id":         *msg.StoryID,
 					"type":       *msg.StoryType,
-					"media_url":  utils.PrependS3URL(msg.StoryMediaURL), // PrependBaseURL ekle
+					"media_url":  utils.PrependS3URL(msg.StoryMediaURL),
 					"content":    msg.StoryContent,
 					"user_id":    *msg.StoryUserID,
 					"created_at": msg.StoryCreatedAt,
 					"available":  true,
 				}
 
-				// Video ise ve metadata varsa thumbnail kontrolü
 				if *msg.StoryType == "video" && msg.StoryMetadata != nil {
 					var metadata map[string]interface{}
 					if err := json.Unmarshal([]byte(*msg.StoryMetadata), &metadata); err == nil {
@@ -305,7 +301,6 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 
 				responseMessage["story"] = storyResponse
 			} else {
-				// Story silinmiş veya erişilemiyor
 				responseMessage["story"] = gin.H{
 					"id":        *msg.StoryID,
 					"available": false,
@@ -314,7 +309,6 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 			}
 		}
 
-		// Reply mesajı varsa ekle (mevcut kod aynı...)
 		if msg.ReplyToMessageID != nil && msg.ReplyToMessageText != nil {
 			replyDecryptedText, err := h.encryptionService.DecryptMessage(*msg.ReplyToMessageText)
 			if err != nil {
@@ -334,7 +328,6 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 
 	go h.markReceivedMessagesAsRead(userID.(uint), uint(otherUserID))
 
-	// Count query'yi de güncelle
 	var totalCount int64
 	countQuery := `
         SELECT COUNT(*) 
