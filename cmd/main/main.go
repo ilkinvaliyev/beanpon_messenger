@@ -85,6 +85,7 @@ func main() {
 		api.POST("/messages", messageHandler.SendMessage)
 		api.GET("/messages/:user_id", messageHandler.GetMessages)
 		api.PUT("/messages/:message_id/read", messageHandler.MarkAsRead)
+		api.PUT("/messages/:message_id", messageHandler.EditMessage)
 		api.DELETE("/messages/:message_id", messageHandler.DeleteMessage)
 
 		api.DELETE("/conversations/:other_user_id/clear", messageHandler.ClearConversation)

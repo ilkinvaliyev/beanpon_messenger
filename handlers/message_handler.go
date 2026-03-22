@@ -1121,3 +1121,74 @@ func (h *MessageHandler) ClearAllMyMessages(c *gin.Context) {
 	})
 
 }
+
+func (h *MessageHandler) EditMessage(c *gin.Context) {
+	userIDVal, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+	userID := userIDVal.(uint)
+
+	messageID := c.Param("message_id")
+
+	var body struct {
+		Text string `json:"text" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	var message models.Message
+	if err := database.DB.Where("id = ?", messageID).First(&message).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Mesaj tapılmadı"})
+		return
+	}
+
+	// Yalnız göndərən edit edə bilər
+	if message.SenderID != userID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Yalnız öz mesajını edit edə bilərsən"})
+		return
+	}
+
+	// Yalnız text tipli mesajlar edit edilə bilər
+	//if message.Type != nil && *message.Type != "text" && *message.Type != "" {
+	//	c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "Yalnız text mesajlar edit edilə bilər"})
+	//	return
+	//}
+
+	encryptedText, err := h.encryptionService.EncryptMessage(body.Text)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Şifrələmə xətası"})
+		return
+	}
+
+	now := time.Now().UTC()
+	if err := database.DB.Model(&message).Updates(map[string]interface{}{
+		"encrypted_text": encryptedText,
+		"is_edited":      true,
+		"updated_at":     now,
+	}).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Mesaj yenilənə bilmədi"})
+		return
+	}
+
+	// WebSocket ilə hər iki tərəfə bildir
+	editPayload := map[string]interface{}{
+		"message_id": messageID,
+		"text":       body.Text,
+		"is_edited":  true,
+		"edited_at":  now,
+	}
+
+	h.wsHub.SendToUser(message.SenderID, "message_edited", editPayload)
+	if message.ReceiverID != nil {
+		h.wsHub.SendToUser(*message.ReceiverID, "message_edited", editPayload)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Mesaj yeniləndi",
+		"data":    editPayload,
+	})
+}
