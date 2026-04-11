@@ -40,8 +40,19 @@ func (h *LiveHub) HandleWebSocket(c *gin.Context) {
 
 	var participant models.LiveRoomParticipant
 	if err := database.DB.Where("live_room_id = ? AND user_id = ? AND status = 'active'", roomID, userID).First(&participant).Error; err != nil {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Odaya erişim izniniz yok"})
-		return
+		// Participant yoxdur — admin-dirsə icazə ver
+		var user models.User
+		if dbErr := database.DB.Select("is_admin").First(&user, userID).Error; dbErr != nil || !user.IsAdmin {
+			c.JSON(http.StatusForbidden, gin.H{"error": "Odaya erişim izniniz yok"})
+			return
+		}
+		participant = models.LiveRoomParticipant{
+			LiveRoomID: uint(roomID),
+			UserID:     userID,
+			Role:       "broadcaster",
+			Status:     "active",
+		}
+		database.DB.Create(&participant)
 	}
 
 	var room models.LiveRoom

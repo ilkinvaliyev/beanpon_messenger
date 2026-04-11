@@ -12,6 +12,7 @@ type User struct {
 	ProfileImage  *string   `json:"profile_image" gorm:"type:text"`
 	AccountTypeID int       `json:"account_type_id" gorm:"default:1"`
 	IsVerified    bool      `json:"is_verified" gorm:"default:false"`
+	IsAdmin       bool      `json:"is_admin" gorm:"default:false"`
 	CreatedAt     time.Time `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt     time.Time `json:"updated_at" gorm:"autoUpdateTime"`
 }
