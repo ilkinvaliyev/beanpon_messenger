@@ -288,7 +288,6 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		gifURL, _ := dataMap["gif_url"].(string)
 		imageURL, _ := dataMap["image_url"].(string)
 
-		// text, gif_url, image_url — ən azı biri olmalıdır
 		if textData == "" && gifURL == "" && imageURL == "" {
 			return
 		}
@@ -342,6 +341,20 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 			}
 		}
 
+		// URL-ləri tam et
+		var fullImageURL string
+		if imageURL != "" {
+			if w := utils.PrependS3URL(&imageURL); w != nil {
+				fullImageURL = *w
+			}
+		}
+		var fullGifURL string
+		if gifURL != "" {
+			if w := utils.PrependS3URL(&gifURL); w != nil {
+				fullGifURL = *w
+			}
+		}
+
 		// DB kayıt
 		chatMsg := models.LiveRoomMessage{
 			LiveRoomID: event.RoomID,
@@ -349,22 +362,23 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 			Text:       textData,
 			ReplyToID:  replyToID,
 		}
-		if gifURL != "" {
-			chatMsg.GifURL = &gifURL
+		if fullImageURL != "" {
+			chatMsg.ImageURL = &fullImageURL
 		}
-		if imageURL != "" {
-			chatMsg.ImageURL = &imageURL
+		if fullGifURL != "" {
+			chatMsg.GifURL = &fullGifURL
 		}
 
 		if err := database.DB.Create(&chatMsg).Error; err != nil {
 			log.Printf("💥 DB KAYIT HATASI: %v", err)
 		}
 
+		// DB-dən sonra marshal et — ID artıq doludur
 		updatedData, _ := json.Marshal(map[string]interface{}{
 			"id":            chatMsg.ID,
 			"text":          textData,
-			"gif_url":       gifURL,
-			"image_url":     imageURL,
+			"gif_url":       fullGifURL,
+			"image_url":     fullImageURL,
 			"sender_id":     event.SenderID,
 			"sender_name":   senderName,
 			"sender_avatar": utils.PrependBaseURL(senderAvatar),

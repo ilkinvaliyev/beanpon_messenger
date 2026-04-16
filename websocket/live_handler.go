@@ -289,6 +289,12 @@ func (h *LiveHub) GetLiveRoomMessages(c *gin.Context) {
 		if messages[i].ReplySenderAvatar != nil {
 			messages[i].ReplySenderAvatar = utils.PrependBaseURL(messages[i].ReplySenderAvatar)
 		}
+		if messages[i].ImageURL != nil {
+			messages[i].ImageURL = utils.PrependS3URL(messages[i].ImageURL) // ← YENİ
+		}
+		if messages[i].GifURL != nil {
+			messages[i].GifURL = utils.PrependS3URL(messages[i].GifURL) // ← YENİ
+		}
 	}
 
 	var nextCursor *uint
