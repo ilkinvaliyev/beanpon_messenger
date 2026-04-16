@@ -233,6 +233,8 @@ func (h *LiveHub) GetLiveRoomMessages(c *gin.Context) {
 	type MessageRow struct {
 		ID           uint      `json:"id"`
 		Text         string    `json:"text"`
+		GifURL       *string   `json:"gif_url"`   // ← YENİ
+		ImageURL     *string   `json:"image_url"` // ← YENİ
 		SenderID     uint      `json:"sender_id"`
 		SenderName   string    `json:"sender_name"`
 		SenderAvatar *string   `json:"sender_avatar"`
@@ -246,13 +248,13 @@ func (h *LiveHub) GetLiveRoomMessages(c *gin.Context) {
 	}
 
 	query := database.DB.Table("live_room_messages lm").
-		Select(`lm.id, lm.text, lm.sender_id, lm.created_at, lm.reply_to_id,
-        u.name as sender_name,
-        p.profile_image as sender_avatar,
-        rm.text as reply_text,
-        rm.sender_id as reply_sender_id,
-        ru.name as reply_sender_name,
-        rp.profile_image as reply_sender_avatar`).
+		Select(`lm.id, lm.text, lm.gif_url, lm.image_url, lm.sender_id, lm.created_at, lm.reply_to_id,
+    u.name as sender_name,
+    p.profile_image as sender_avatar,
+    rm.text as reply_text,
+    rm.sender_id as reply_sender_id,
+    ru.name as reply_sender_name,
+    rp.profile_image as reply_sender_avatar`).
 		Joins("LEFT JOIN users u ON u.id = lm.sender_id").
 		Joins("LEFT JOIN profiles p ON p.user_id = lm.sender_id").
 		Joins("LEFT JOIN live_room_messages rm ON rm.id = lm.reply_to_id").

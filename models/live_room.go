@@ -48,12 +48,14 @@ type LiveRoomMessage struct {
 	SenderID   uint      `json:"sender_id" gorm:"not null;index"`
 	ReplyToID  *uint     `json:"reply_to_id" gorm:"index"`
 	Text       string    `json:"text" gorm:"type:text;not null"`
+	GifURL     *string   `json:"gif_url" gorm:"type:varchar(500)"`   // ← YENİ
+	ImageURL   *string   `json:"image_url" gorm:"type:varchar(500)"` // ← YENİ
 	CreatedAt  time.Time `json:"created_at" gorm:"autoCreateTime"`
-	UpdatedAt  time.Time `json:"updated_at" gorm:"autoUpdateTime"` // BU SATIR EKLENDİ (Hata buradaydı!)
+	UpdatedAt  time.Time `json:"updated_at" gorm:"autoUpdateTime"`
 
-	// İlişkiler
 	Sender User `json:"sender" gorm:"foreignKey:SenderID"`
 }
+
 type LiveRoomReaction struct {
 	ID           uint      `json:"id" gorm:"primaryKey;autoIncrement"`
 	LiveRoomID   uint      `json:"live_room_id" gorm:"not null;index"`

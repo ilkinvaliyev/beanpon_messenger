@@ -284,8 +284,12 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 			return
 		}
 
-		textData, ok := dataMap["text"].(string)
-		if !ok || textData == "" {
+		textData, _ := dataMap["text"].(string)
+		gifURL, _ := dataMap["gif_url"].(string)
+		imageURL, _ := dataMap["image_url"].(string)
+
+		// text, gif_url, image_url — ən azı biri olmalıdır
+		if textData == "" && gifURL == "" && imageURL == "" {
 			return
 		}
 
@@ -302,7 +306,7 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		h.mu.RUnlock()
 
 		senderName := "User"
-		var senderAvatar *string = nil
+		var senderAvatar *string
 		if senderExists {
 			senderName = senderClient.Name
 			if senderClient.Avatar != nil {
@@ -338,12 +342,20 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 			}
 		}
 
+		// DB kayıt
 		chatMsg := models.LiveRoomMessage{
 			LiveRoomID: event.RoomID,
 			SenderID:   event.SenderID,
 			Text:       textData,
 			ReplyToID:  replyToID,
 		}
+		if gifURL != "" {
+			chatMsg.GifURL = &gifURL
+		}
+		if imageURL != "" {
+			chatMsg.ImageURL = &imageURL
+		}
+
 		if err := database.DB.Create(&chatMsg).Error; err != nil {
 			log.Printf("💥 DB KAYIT HATASI: %v", err)
 		}
@@ -351,6 +363,8 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		updatedData, _ := json.Marshal(map[string]interface{}{
 			"id":            chatMsg.ID,
 			"text":          textData,
+			"gif_url":       gifURL,
+			"image_url":     imageURL,
 			"sender_id":     event.SenderID,
 			"sender_name":   senderName,
 			"sender_avatar": utils.PrependBaseURL(senderAvatar),
