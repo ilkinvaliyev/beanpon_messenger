@@ -14,14 +14,15 @@ import (
 )
 
 type LiveRoomClient struct {
-	Hub    *LiveHub
-	Conn   *websocket.Conn
-	UserID uint
-	RoomID uint
-	Role   string
-	Name   string
-	Avatar *string
-	Send   chan []byte
+	Hub        *LiveHub
+	Conn       *websocket.Conn
+	UserID     uint
+	RoomID     uint
+	Role       string
+	Name       string
+	Avatar     *string
+	AvatarType *string
+	Send       chan []byte
 }
 
 type LiveHub struct {
@@ -332,11 +333,22 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 				Scan(&rr).Error
 			if err == nil && rr.ID != 0 {
 				replyPreview = map[string]interface{}{
-					"id":            rr.ID,
-					"text":          rr.Text,
-					"sender_id":     rr.SenderID,
-					"sender_name":   rr.SenderName,
-					"sender_avatar": utils.PrependBaseURL(rr.SenderAvatar),
+					"id":          rr.ID,
+					"text":        rr.Text,
+					"sender_id":   rr.SenderID,
+					"sender_name": rr.SenderName,
+					"sender_avatar": func() *string {
+						if senderExists && senderClient.AvatarType != nil && *senderClient.AvatarType == "gif" {
+							return senderAvatar
+						}
+						return utils.PrependBaseURL(senderAvatar)
+					}(),
+					"sender_avatar_type": func() *string {
+						if senderExists {
+							return senderClient.AvatarType
+						}
+						return nil
+					}(),
 				}
 			}
 		}
@@ -375,14 +387,25 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 
 		// DB-dən sonra marshal et — ID artıq doludur
 		updatedData, _ := json.Marshal(map[string]interface{}{
-			"id":            chatMsg.ID,
-			"text":          textData,
-			"gif_url":       fullGifURL,
-			"image_url":     fullImageURL,
-			"sender_id":     event.SenderID,
-			"sender_name":   senderName,
-			"sender_avatar": utils.PrependBaseURL(senderAvatar),
-			"reply_to":      replyPreview,
+			"id":          chatMsg.ID,
+			"text":        textData,
+			"gif_url":     fullGifURL,
+			"image_url":   fullImageURL,
+			"sender_id":   event.SenderID,
+			"sender_name": senderName,
+			"sender_avatar": func() *string {
+				if senderClient.AvatarType != nil && *senderClient.AvatarType == "gif" {
+					return senderAvatar
+				}
+				return utils.PrependBaseURL(senderAvatar)
+			}(),
+			"sender_avatar_type": func() *string { // ← əlavə et
+				if senderExists {
+					return senderClient.AvatarType
+				}
+				return nil
+			}(),
+			"reply_to": replyPreview,
 		})
 		event.Data = updatedData
 
@@ -529,8 +552,14 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 				eligible = append(eligible, map[string]interface{}{
 					"user_id": c.UserID,
 					"name":    c.Name,
-					"avatar":  utils.PrependBaseURL(c.Avatar),
-					"role":    c.Role,
+					"avatar": func() *string {
+						if c.AvatarType != nil && *c.AvatarType == "gif" {
+							return c.Avatar
+						}
+						return utils.PrependBaseURL(c.Avatar)
+					}(),
+					"avatar_type": c.AvatarType,
+					"role":        c.Role,
 				})
 			}
 		}

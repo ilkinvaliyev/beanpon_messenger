@@ -73,25 +73,27 @@ func (h *LiveHub) HandleWebSocket(c *gin.Context) {
 	}
 
 	type SenderInfo struct {
-		Name         string
-		ProfileImage *string
+		Name             string
+		ProfileImage     *string
+		ProfileImageType *string
 	}
 	var senderInfo SenderInfo
 	database.DB.Table("users").
-		Select("users.name, profiles.profile_image").
+		Select("users.name, profiles.profile_image, profiles.profile_image_type").
 		Joins("left join profiles on profiles.user_id = users.id").
 		Where("users.id = ?", userID).
 		Scan(&senderInfo)
 
 	client := &LiveRoomClient{
-		Hub:    h,
-		Conn:   conn,
-		UserID: userID,
-		RoomID: uint(roomID),
-		Role:   participant.Role,
-		Name:   senderInfo.Name,
-		Avatar: senderInfo.ProfileImage,
-		Send:   make(chan []byte, 256),
+		Hub:        h,
+		Conn:       conn,
+		UserID:     userID,
+		RoomID:     uint(roomID),
+		Role:       participant.Role,
+		Name:       senderInfo.Name,
+		Avatar:     senderInfo.ProfileImage,
+		AvatarType: senderInfo.ProfileImageType,
+		Send:       make(chan []byte, 256),
 	}
 
 	client.Hub.Register <- client
@@ -231,30 +233,33 @@ func (h *LiveHub) GetLiveRoomMessages(c *gin.Context) {
 	}
 
 	type MessageRow struct {
-		ID           uint      `json:"id"`
-		Text         string    `json:"text"`
-		GifURL       *string   `json:"gif_url"`   // ← YENİ
-		ImageURL     *string   `json:"image_url"` // ← YENİ
-		SenderID     uint      `json:"sender_id"`
-		SenderName   string    `json:"sender_name"`
-		SenderAvatar *string   `json:"sender_avatar"`
-		CreatedAt    time.Time `json:"created_at"`
-
-		ReplyToID         *uint   `json:"reply_to_id"`
-		ReplyText         *string `json:"reply_text"`
-		ReplySenderID     *uint   `json:"reply_sender_id"`
-		ReplySenderName   *string `json:"reply_sender_name"`
-		ReplySenderAvatar *string `json:"reply_sender_avatar"`
+		ID                    uint      `json:"id"`
+		Text                  string    `json:"text"`
+		GifURL                *string   `json:"gif_url"`
+		ImageURL              *string   `json:"image_url"`
+		SenderID              uint      `json:"sender_id"`
+		SenderName            string    `json:"sender_name"`
+		SenderAvatar          *string   `json:"sender_avatar"`
+		SenderAvatarType      *string   `json:"sender_avatar_type"`
+		CreatedAt             time.Time `json:"created_at"`
+		ReplyToID             *uint     `json:"reply_to_id"`
+		ReplyText             *string   `json:"reply_text"`
+		ReplySenderID         *uint     `json:"reply_sender_id"`
+		ReplySenderName       *string   `json:"reply_sender_name"`
+		ReplySenderAvatar     *string   `json:"reply_sender_avatar"`
+		ReplySenderAvatarType *string   `json:"reply_sender_avatar_type"`
 	}
 
 	query := database.DB.Table("live_room_messages lm").
 		Select(`lm.id, lm.text, lm.gif_url, lm.image_url, lm.sender_id, lm.created_at, lm.reply_to_id,
-    u.name as sender_name,
-    p.profile_image as sender_avatar,
-    rm.text as reply_text,
-    rm.sender_id as reply_sender_id,
-    ru.name as reply_sender_name,
-    rp.profile_image as reply_sender_avatar`).
+		u.name as sender_name,
+		p.profile_image as sender_avatar,
+		p.profile_image_type as sender_avatar_type,
+		rm.text as reply_text,
+		rm.sender_id as reply_sender_id,
+		ru.name as reply_sender_name,
+		rp.profile_image as reply_sender_avatar,
+		rp.profile_image_type as reply_sender_avatar_type`).
 		Joins("LEFT JOIN users u ON u.id = lm.sender_id").
 		Joins("LEFT JOIN profiles p ON p.user_id = lm.sender_id").
 		Joins("LEFT JOIN live_room_messages rm ON rm.id = lm.reply_to_id").
@@ -283,17 +288,23 @@ func (h *LiveHub) GetLiveRoomMessages(c *gin.Context) {
 	}
 
 	for i := range messages {
-		if messages[i].SenderAvatar != nil {
+		if messages[i].SenderAvatarType != nil && *messages[i].SenderAvatarType == "gif" {
+			// gif — olduğu kimi qal
+		} else if messages[i].SenderAvatar != nil {
 			messages[i].SenderAvatar = utils.PrependBaseURL(messages[i].SenderAvatar)
 		}
-		if messages[i].ReplySenderAvatar != nil {
+
+		if messages[i].ReplySenderAvatarType != nil && *messages[i].ReplySenderAvatarType == "gif" {
+			// gif — olduğu kimi qal
+		} else if messages[i].ReplySenderAvatar != nil {
 			messages[i].ReplySenderAvatar = utils.PrependBaseURL(messages[i].ReplySenderAvatar)
 		}
+
 		if messages[i].ImageURL != nil {
-			messages[i].ImageURL = utils.PrependS3URL(messages[i].ImageURL) // ← YENİ
+			messages[i].ImageURL = utils.PrependS3URL(messages[i].ImageURL)
 		}
 		if messages[i].GifURL != nil {
-			messages[i].GifURL = utils.PrependS3URL(messages[i].GifURL) // ← YENİ
+			messages[i].GifURL = utils.PrependS3URL(messages[i].GifURL)
 		}
 	}
 
