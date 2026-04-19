@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"log"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -295,10 +296,19 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 
 		var replyToID *uint
 		if replyVal, exists := dataMap["reply_to_id"]; exists && replyVal != nil {
-			if replyFloat, ok := replyVal.(float64); ok {
-				id := uint(replyFloat)
-				replyToID = &id
+			switch v := replyVal.(type) {
+			case float64:
+				if v > 0 {
+					id := uint(v)
+					replyToID = &id
+				}
+			case string:
+				if parsed, err := strconv.ParseUint(v, 10, 64); err == nil && parsed > 0 {
+					id := uint(parsed)
+					replyToID = &id
+				}
 			}
+			//log.Printf("🔍 reply_to_id: raw=%v, parsed=%v", replyVal, replyToID)
 		}
 
 		h.mu.RLock()
