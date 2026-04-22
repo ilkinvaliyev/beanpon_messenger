@@ -396,6 +396,8 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		}
 
 		// DB-dən sonra marshal et — ID artıq doludur
+		mentions := utils.ParseMentions(textData)
+
 		updatedData, _ := json.Marshal(map[string]interface{}{
 			"id":          chatMsg.ID,
 			"text":        textData,
@@ -409,13 +411,14 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 				}
 				return utils.PrependBaseURL(senderAvatar)
 			}(),
-			"sender_avatar_type": func() *string { // ← əlavə et
+			"sender_avatar_type": func() *string {
 				if senderExists {
 					return senderClient.AvatarType
 				}
 				return nil
 			}(),
 			"reply_to": replyPreview,
+			"mentions": mentions,
 		})
 		event.Data = updatedData
 

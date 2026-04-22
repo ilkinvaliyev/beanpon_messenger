@@ -233,21 +233,22 @@ func (h *LiveHub) GetLiveRoomMessages(c *gin.Context) {
 	}
 
 	type MessageRow struct {
-		ID                    uint      `json:"id"`
-		Text                  string    `json:"text"`
-		GifURL                *string   `json:"gif_url"`
-		ImageURL              *string   `json:"image_url"`
-		SenderID              uint      `json:"sender_id"`
-		SenderName            string    `json:"sender_name"`
-		SenderAvatar          *string   `json:"sender_avatar"`
-		SenderAvatarType      *string   `json:"sender_avatar_type"`
-		CreatedAt             time.Time `json:"created_at"`
-		ReplyToID             *uint     `json:"reply_to_id"`
-		ReplyText             *string   `json:"reply_text"`
-		ReplySenderID         *uint     `json:"reply_sender_id"`
-		ReplySenderName       *string   `json:"reply_sender_name"`
-		ReplySenderAvatar     *string   `json:"reply_sender_avatar"`
-		ReplySenderAvatarType *string   `json:"reply_sender_avatar_type"`
+		ID                    uint                    `json:"id"`
+		Text                  string                  `json:"text"`
+		GifURL                *string                 `json:"gif_url"`
+		ImageURL              *string                 `json:"image_url"`
+		SenderID              uint                    `json:"sender_id"`
+		SenderName            string                  `json:"sender_name"`
+		SenderAvatar          *string                 `json:"sender_avatar"`
+		SenderAvatarType      *string                 `json:"sender_avatar_type"`
+		CreatedAt             time.Time               `json:"created_at"`
+		ReplyToID             *uint                   `json:"reply_to_id"`
+		ReplyText             *string                 `json:"reply_text"`
+		ReplySenderID         *uint                   `json:"reply_sender_id"`
+		ReplySenderName       *string                 `json:"reply_sender_name"`
+		ReplySenderAvatar     *string                 `json:"reply_sender_avatar"`
+		ReplySenderAvatarType *string                 `json:"reply_sender_avatar_type"`
+		Mentions              []utils.MentionResponse `json:"mentions"`
 	}
 
 	query := database.DB.Table("live_room_messages lm").
@@ -306,6 +307,9 @@ func (h *LiveHub) GetLiveRoomMessages(c *gin.Context) {
 		if messages[i].GifURL != nil {
 			messages[i].GifURL = utils.PrependS3URL(messages[i].GifURL)
 		}
+
+		messages[i].Mentions = utils.ParseMentions(messages[i].Text)
+
 	}
 
 	var nextCursor *uint
