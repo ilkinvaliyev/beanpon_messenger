@@ -14,6 +14,9 @@ type MentionResponse struct {
 }
 
 func ParseMentions(text string) []MentionResponse {
+	if !strings.Contains(text, "@") {
+		return []MentionResponse{}
+	}
 	re := regexp.MustCompile(`@([\w][\w.]*[\w])`)
 	matches := re.FindAllStringSubmatchIndex(text, -1)
 
