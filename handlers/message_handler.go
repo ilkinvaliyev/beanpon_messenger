@@ -529,10 +529,8 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 		return
 	}
 
-	// ✅ Query parametresinden status filtresi al (default: all)
-	statusFilter := c.DefaultQuery("status", "all") // all, active, pending, restricted
+	statusFilter := c.DefaultQuery("status", "all")
 
-	// En son mesajları getir - silinmiş olanları hariç tut
 	var conversations []struct {
 		OtherUserID        uint      `json:"other_user_id"`
 		LastMessageID      string    `json:"last_message_id"`
@@ -543,7 +541,6 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 		UnreadCount        int       `json:"unread_count"`
 		ConversationStatus string    `json:"conversation_status"`
 
-		// Conversation detayları
 		ConversationID     *uint `json:"conversation_id"`
 		MyMessageCount     *int  `json:"my_message_count"`
 		OtherMessageCount  *int  `json:"other_message_count"`
@@ -558,14 +555,15 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 		OtherUserIsVerified bool    `json:"other_user_is_verified"`
 		AccountTypeID       int     `json:"account_type_id"`
 		ProfileImage        *string `json:"profile_image"`
+
+		AllowVoiceMessages bool `json:"allow_voice_messages"`
+		ShowReadReceipts   bool `json:"show_read_receipts"`
 	}
 
-	// ✅ Status filtresine göre WHERE clause oluştur
 	statusWhereClause := ""
 	var extraParams []interface{}
 
 	if statusFilter == "pending" {
-		// Pending: Sadece KARŞI TARAFIN mesaj attığı conversation'lar
 		statusWhereClause = `
         AND COALESCE(conv.status, 'active') = 'pending'
         AND CASE 
@@ -575,7 +573,6 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
     `
 		extraParams = append(extraParams, userID)
 	} else if statusFilter == "active" {
-		// ✅ Active: pending OLMAYAN veya BEN mesaj attıysam göster
 		statusWhereClause = `
         AND (
             COALESCE(conv.status, 'active') = 'active'
@@ -592,7 +589,6 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 	} else if statusFilter == "restricted" {
 		statusWhereClause = "AND COALESCE(conv.status, 'active') = 'restricted'"
 	}
-	// statusFilter == "all" ise WHERE clause eklenmez
 
 	query := `
     WITH latest_messages AS (
@@ -676,36 +672,36 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
         u.username as other_user_username,
         u.account_type_id,
         u.is_verified as other_user_is_verified,
-        p.profile_image
+        p.profile_image,
+        COALESCE(us.allow_voice_messages, true) as allow_voice_messages,
+        COALESCE(us.show_read_receipts, true) as show_read_receipts
     FROM latest_messages lm
     LEFT JOIN unread_counts uc ON lm.other_user_id = uc.other_user_id
     LEFT JOIN users u ON u.id = lm.other_user_id
     LEFT JOIN profiles p ON p.user_id = lm.other_user_id
+    LEFT JOIN user_settings us ON us.user_id = lm.other_user_id
     LEFT JOIN conversations conv ON (
         (conv.user1_id = LEAST(?, lm.other_user_id) AND conv.user2_id = GREATEST(?, lm.other_user_id))
     )
-    WHERE lm.rn = 1 ` + statusWhereClause + ` 
+    WHERE lm.rn = 1 ` + statusWhereClause + `
     ORDER BY lm.created_at DESC
     `
 
-	// ✅ Parametreleri birleştir
 	params := []interface{}{
-		userID, userID, userID, userID, userID, // latest_messages için
-		userID,                                                                                         // delete filter için
-		userID,                                                                                         // unread_counts için
-		userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, // conversation detayları için
-		userID, userID, // conversations JOIN için
+		userID, userID, userID, userID, userID,
+		userID,
+		userID,
+		userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID,
+		userID, userID,
 	}
-	params = append(params, extraParams...) // ✅ Pending için ekstra parametre
+	params = append(params, extraParams...)
 
 	err := database.DB.Raw(query, params...).Scan(&conversations).Error
-
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Konuşmalar alınamadı"})
 		return
 	}
 
-	// Mesajları çöz ve detaylı conversation bilgileri ekle
 	var responseConversations []gin.H
 	for _, conv := range conversations {
 		decryptedText, err := h.encryptionService.DecryptMessage(conv.LastMessageText)
@@ -713,10 +709,9 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 			decryptedText = "Mesaj çözülemedi"
 		}
 
-		// Conversation durumu analizi
 		canSendMessage := true
 		conversationActive := true
-		conversationType := "normal" // normal, pending, restricted
+		conversationType := "normal"
 
 		if conv.ConversationStatus != "" && conv.ConversationStatus != "active" {
 			conversationActive = false
@@ -724,7 +719,6 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 			switch conv.ConversationStatus {
 			case "pending":
 				conversationType = "pending"
-				// Pending durumda mesaj limiti kontrol et
 				if conv.MyMessageCount != nil && conv.MaxPendingMessages != nil {
 					if *conv.MyMessageCount >= *conv.MaxPendingMessages {
 						canSendMessage = false
@@ -736,12 +730,10 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 			}
 		}
 
-		// Kişisel kısıtlamalar
 		if conv.AmIRestricted != nil && *conv.AmIRestricted {
 			canSendMessage = false
 		}
 
-		// Mute durumu (mesaj göndermeyi engellemez ama UI'da farklı gösterilebilir)
 		isMutedByMe := conv.AmIMuted != nil && *conv.AmIMuted
 
 		responseData := gin.H{
@@ -758,11 +750,7 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 			"last_message_read":      conv.LastMessageRead,
 			"unread_count":           conv.UnreadCount,
 			"is_online":              h.wsHub.IsUserOnline(conv.OtherUserID),
-
-			// Conversation durumu (eski uyumluluk için)
-			"conversation_active": conversationActive,
-
-			// Detaylı conversation bilgileri
+			"conversation_active":    conversationActive,
 			"conversation": gin.H{
 				"id":                   conv.ConversationID,
 				"status":               conv.ConversationStatus,
@@ -775,6 +763,8 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 				"my_message_count":     conv.MyMessageCount,
 				"other_message_count":  conv.OtherMessageCount,
 				"max_pending_messages": conv.MaxPendingMessages,
+				"allow_voice_messages": conv.AllowVoiceMessages,
+				"show_read_receipts":   conv.ShowReadReceipts,
 			},
 		}
 
