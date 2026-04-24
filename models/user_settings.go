@@ -7,8 +7,10 @@ import (
 type UserSettings struct {
 	ID                             uint      `json:"id" gorm:"primaryKey;autoIncrement"`
 	UserID                         uint      `json:"user_id" gorm:"uniqueIndex;not null"`
-	MessageRequests                string    `json:"message_requests" gorm:"type:enum('ALL','ONLY_VERIFIED');default:'ALL'"`
-	ConversationScreenshotDisabled bool      `json:"conversation_screenshot_disabled" gorm:"default:false"` // 🆕 YENİ
+	MessageRequests                string    `json:"message_requests" gorm:"type:enum('ALL','ONLY_VERIFIED','FOLLOWING');default:'ALL'"`
+	ConversationScreenshotDisabled bool      `json:"conversation_screenshot_disabled" gorm:"default:false"`
+	AllowVoiceMessages             bool      `json:"allow_voice_messages" gorm:"default:true"`
+	ShowReadReceipts               bool      `json:"show_read_receipts" gorm:"default:true"`
 	CreatedAt                      time.Time `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt                      time.Time `json:"updated_at" gorm:"autoUpdateTime"`
 }

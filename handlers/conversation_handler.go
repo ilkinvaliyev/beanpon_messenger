@@ -484,22 +484,19 @@ func (h *ConversationHandler) GetConversationDetails(c *gin.Context) {
 		return
 	}
 
-	// Conversation durumu analizi
 	canSendMessage := true
-	conversationType := "normal"        // normal, pending, restricted
-	var stopMessageReason *string = nil // 🆕 YENİ ALAN
+	conversationType := "normal"
+	var stopMessageReason *string = nil
 
 	switch conversation.Status {
 	case "pending":
 		conversationType = "pending"
-		// Pending durumda mesaj limiti kontrol et
 		var myMessageCount int
 		if userID.(uint) == conversation.User1ID {
 			myMessageCount = conversation.User1MessageCount
 		} else {
 			myMessageCount = conversation.User2MessageCount
 		}
-
 		if myMessageCount >= conversation.MaxPendingMessages {
 			canSendMessage = false
 		}
@@ -510,7 +507,6 @@ func (h *ConversationHandler) GetConversationDetails(c *gin.Context) {
 		conversationType = "normal"
 	}
 
-	// Kullanıcıya göre detayları ayarla
 	var myMessageCount, otherMessageCount int
 	var isMutedByMe, amIRestricted, isOtherMuted, isOtherRestricted bool
 
@@ -530,18 +526,22 @@ func (h *ConversationHandler) GetConversationDetails(c *gin.Context) {
 		isOtherRestricted = conversation.User1Restricted
 	}
 
-	// Kişisel kısıtlamalar kontrol et
 	if amIRestricted {
 		canSendMessage = false
 	}
 
-	// 🆕 STOP_MESSAGE_REASON KONTROLÜ
-	// Sadece daha önce hiç mesaj atılmamışsa (yeni conversation)
+	// Other user settings — scope'u buraya çek ki aşağıda da erişebilelim
+	allowVoiceMessages := true
+	showReadReceipts := true
+
 	totalMessages := conversation.User1MessageCount + conversation.User2MessageCount
 
 	if totalMessages == 0 {
 		var otherUserSettings models.UserSettings
 		if err := database.DB.Where("user_id = ?", otherUserID).First(&otherUserSettings).Error; err == nil {
+
+			allowVoiceMessages = otherUserSettings.AllowVoiceMessages
+			showReadReceipts = otherUserSettings.ShowReadReceipts
 
 			if otherUserSettings.MessageRequests == "ONLY_VERIFIED" {
 				var myUser models.User
@@ -555,8 +555,6 @@ func (h *ConversationHandler) GetConversationDetails(c *gin.Context) {
 						stopMessageReason = &reason
 					}
 				}
-
-				// ✅ YENİ: FOLLOWING check
 			} else if otherUserSettings.MessageRequests == "FOLLOWING" {
 				var followCount int64
 				database.DB.Table("follows").
@@ -570,15 +568,19 @@ func (h *ConversationHandler) GetConversationDetails(c *gin.Context) {
 					reason := "ALL"
 					stopMessageReason = &reason
 				}
-
 			} else {
 				reason := "ALL"
 				stopMessageReason = &reason
 			}
 		}
 	} else {
-		// Daha önce mesaj varsa, artık kısıtlama yok (eski conversation)
-		// stop_message_reason null kalır veya "PREVIOUS_CONVERSATION" diyebiliriz
+		// Mövcud conversation — settings yenə də lazımdır
+		var otherUserSettings models.UserSettings
+		if err := database.DB.Where("user_id = ?", otherUserID).First(&otherUserSettings).Error; err == nil {
+			allowVoiceMessages = otherUserSettings.AllowVoiceMessages
+			showReadReceipts = otherUserSettings.ShowReadReceipts
+		}
+
 		reason := "PREVIOUS_CONVERSATION"
 		stopMessageReason = &reason
 	}
@@ -589,7 +591,7 @@ func (h *ConversationHandler) GetConversationDetails(c *gin.Context) {
 			"status":               conversation.Status,
 			"type":                 conversationType,
 			"can_send_message":     canSendMessage,
-			"stop_message_reason":  stopMessageReason, // 🆕 YENİ ALAN
+			"stop_message_reason":  stopMessageReason,
 			"is_muted_by_me":       isMutedByMe,
 			"am_i_restricted":      amIRestricted,
 			"is_other_muted":       isOtherMuted,
@@ -597,6 +599,8 @@ func (h *ConversationHandler) GetConversationDetails(c *gin.Context) {
 			"my_message_count":     myMessageCount,
 			"other_message_count":  otherMessageCount,
 			"max_pending_messages": conversation.MaxPendingMessages,
+			"allow_voice_messages": allowVoiceMessages,
+			"show_read_receipts":   showReadReceipts,
 		},
 	}
 
