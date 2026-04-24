@@ -233,6 +233,14 @@ func (h *ConversationHandler) GetOrCreateConversationWithPermission(senderID, re
 					if !sender.IsVerified {
 						return nil, false, "Bu istifadəçiyə mesaj göndərmək üçün təsdiqlənmiş hesab tələb olunur", nil
 					}
+				} else if receiverSettings.MessageRequests == "FOLLOWING" {
+					var followCount int64
+					database.DB.Table("follows").
+						Where("follower_id = ? AND following_id = ?", senderID, receiverID).
+						Count(&followCount)
+					if followCount == 0 {
+						return nil, false, "Bu istifadəçi yalnız izlədiyi hesablardan mesaj qəbul edir", nil
+					}
 				}
 			}
 			// Conversation yok ama izin var - nil conversation döndür
@@ -532,34 +540,41 @@ func (h *ConversationHandler) GetConversationDetails(c *gin.Context) {
 	totalMessages := conversation.User1MessageCount + conversation.User2MessageCount
 
 	if totalMessages == 0 {
-		// Karşı tarafın ayarlarını kontrol et
 		var otherUserSettings models.UserSettings
 		if err := database.DB.Where("user_id = ?", otherUserID).First(&otherUserSettings).Error; err == nil {
-			// Ayar varsa kontrolü yap
+
 			if otherUserSettings.MessageRequests == "ONLY_VERIFIED" {
-				// Benim verified durumumu kontrol et
 				var myUser models.User
 				if err := database.DB.Where("id = ?", userID).First(&myUser).Error; err == nil {
 					if !myUser.IsVerified {
-						// Verified değilim ve karşı taraf ONLY_VERIFIED istiyor
 						reason := "ONLY_VERIFIED"
 						stopMessageReason = &reason
 						canSendMessage = false
 					} else {
-						// Verified'im, izin var
 						reason := "ALL"
 						stopMessageReason = &reason
 					}
 				}
+
+				// ✅ YENİ: FOLLOWING check
+			} else if otherUserSettings.MessageRequests == "FOLLOWING" {
+				var followCount int64
+				database.DB.Table("follows").
+					Where("follower_id = ? AND following_id = ?", userID, otherUserID).
+					Count(&followCount)
+				if followCount == 0 {
+					reason := "FOLLOWING"
+					stopMessageReason = &reason
+					canSendMessage = false
+				} else {
+					reason := "ALL"
+					stopMessageReason = &reason
+				}
+
 			} else {
-				// MessageRequests = "ALL" ise
 				reason := "ALL"
 				stopMessageReason = &reason
 			}
-		} else {
-			// Ayar yoksa default ALL
-			reason := "ALL"
-			stopMessageReason = &reason
 		}
 	} else {
 		// Daha önce mesaj varsa, artık kısıtlama yok (eski conversation)
