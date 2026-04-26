@@ -128,11 +128,14 @@ func (h *Hub) registerClient(client *Client) {
 			close(existingClient.Send)
 		}
 		existingClient.Conn.Close()
-		log.Printf("Kullanıcı %d eski bağlantısı temizlendi", client.UserID)
+		//log.Printf("Kullanıcı %d eski bağlantısı temizlendi", client.UserID)
 	}
 
 	h.clients[client.UserID] = client
-	log.Printf("Kullanıcı %d WebSocket'e bağlandı", client.UserID)
+	//log.Printf("Kullanıcı %d WebSocket'e bağlandı", client.UserID)
+
+	//online oldugunu yazir
+	h.setUserOnline(client.UserID)
 
 	// Kullanıcı online durumunu diğer kullanıcılara bildir
 	h.broadcastUserStatus(client.UserID, "online")
@@ -152,14 +155,19 @@ func (h *Hub) unregisterClient(client *Client) {
 	if _, exists := h.clients[client.UserID]; exists {
 		delete(h.clients, client.UserID)
 
+		h.setUserOffline(client.UserID)
+
 		select {
 		case <-client.Send:
 		default:
 			close(client.Send)
 		}
 
-		client.Conn.Close()
-		log.Printf("Kullanıcı %d WebSocket'ten ayrıldı", client.UserID)
+		err := client.Conn.Close()
+		if err != nil {
+			return
+		}
+		//log.Printf("Kullanıcı %d WebSocket'ten ayrıldı", client.UserID)
 
 		// Kullanıcı offline durumunu diğer kullanıcılara bildir
 		h.broadcastUserStatus(client.UserID, "offline")

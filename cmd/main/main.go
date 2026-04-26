@@ -31,6 +31,7 @@ func main() {
 
 	// 1. MEVCUT SİSTEM: Özel Mesajlaşma (Chat) Hub'ı
 	wsHub := websocket.NewHub(database.DB, encryptionService, cfg)
+	database.DB.Exec("UPDATE user_presences SET is_online = false, last_seen_at = NOW() WHERE is_online = true")
 	go wsHub.Run()
 
 	// 2. YENİ SİSTEM: Canlı Yayın Odaları (Live) Hub'ı
