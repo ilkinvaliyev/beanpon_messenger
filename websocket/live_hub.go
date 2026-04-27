@@ -287,6 +287,25 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		}
 
 		textData, _ := dataMap["text"].(string)
+		if utils.ContainsBadWord(textData) {
+			// göndərənə xəbər ver
+			errPayload, _ := json.Marshal(map[string]interface{}{
+				"type": "message_blocked",
+				"data": map[string]string{
+					"reason": "Mesajınız uygunsuz içerik nedeniyle göndərilmədi.",
+				},
+			})
+			h.mu.RLock()
+			if sender, ok := roomClients[event.SenderID]; ok {
+				select {
+				case sender.Send <- errPayload:
+				default:
+				}
+			}
+			h.mu.RUnlock()
+			return
+		}
+
 		gifURL, _ := dataMap["gif_url"].(string)
 		imageURL, _ := dataMap["image_url"].(string)
 
