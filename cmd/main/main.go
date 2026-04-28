@@ -161,6 +161,21 @@ func main() {
 		})
 	}
 
+	// Internal routes (Laravel-dən çağrılır)
+	internal := router.Group("/internal")
+	internal.Use(func(c *gin.Context) {
+		secret := c.GetHeader("X-Internal-Secret")
+		if secret != cfg.InternalSecret {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+			c.Abort()
+			return
+		}
+		c.Next()
+	})
+	{
+		internal.POST("/live-rooms/:room_id/force-end", liveHub.ForceEndRoom)
+	}
+
 	// Public routes
 	router.GET("/ping", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"message": "pong running"})

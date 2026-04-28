@@ -5,7 +5,9 @@ import (
 	"beanpon_messenger/models"
 	"beanpon_messenger/utils"
 	"encoding/json"
+	"github.com/gin-gonic/gin"
 	"log"
+	"net/http"
 	"sort"
 	"strconv"
 	"sync"
@@ -771,4 +773,33 @@ func (h *LiveHub) EnforceBlock(blockerID, blockedID uint) {
 			}
 		}
 	}
+}
+
+func (h *LiveHub) ForceEndRoom(c *gin.Context) {
+	roomIDStr := c.Param("room_id")
+	roomID, err := strconv.ParseUint(roomIDStr, 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid room_id"})
+		return
+	}
+
+	endedPayload, _ := json.Marshal(map[string]interface{}{
+		"type": "ended",
+		"data": map[string]interface{}{},
+	})
+
+	h.mu.RLock()
+	roomClients, ok := h.rooms[uint(roomID)]
+	h.mu.RUnlock()
+
+	if ok {
+		for _, client := range roomClients {
+			select {
+			case client.Send <- endedPayload:
+			default:
+			}
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Room force ended."})
 }

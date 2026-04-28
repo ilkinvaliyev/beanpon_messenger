@@ -8,16 +8,17 @@ import (
 
 // Config yapılandırma verilerini tutar
 type Config struct {
-	Port         string
-	JWTSecret    string
-	AESKey       string
-	PostgresUser string
-	PostgresPass string
-	PostgresHost string
-	PostgresPort string
-	PostgresDB   string
-	CloudToken   string
-	BackendUrl   string
+	Port           string
+	JWTSecret      string
+	AESKey         string
+	PostgresUser   string
+	PostgresPass   string
+	PostgresHost   string
+	PostgresPort   string
+	PostgresDB     string
+	CloudToken     string
+	BackendUrl     string
+	InternalSecret string
 }
 
 // LoadConfig konfigürasyon dosyasını okur ve Config yapısına doldurur
@@ -29,16 +30,17 @@ func LoadConfig() *Config {
 	}
 
 	cfg := &Config{
-		Port:         os.Getenv("APP_PORT"),
-		JWTSecret:    os.Getenv("JWT_SECRET"),
-		PostgresUser: os.Getenv("DB_USER"),
-		PostgresPass: os.Getenv("DB_PASSWORD"),
-		PostgresHost: os.Getenv("DB_HOST"),
-		PostgresPort: os.Getenv("DB_PORT"),
-		PostgresDB:   os.Getenv("DB_NAME"),
-		AESKey:       os.Getenv("AES_KEY"),
-		CloudToken:   os.Getenv("CLOUD_TOKEN"),
-		BackendUrl:   os.Getenv("BACKEND_URL"),
+		Port:           os.Getenv("APP_PORT"),
+		JWTSecret:      os.Getenv("JWT_SECRET"),
+		PostgresUser:   os.Getenv("DB_USER"),
+		PostgresPass:   os.Getenv("DB_PASSWORD"),
+		PostgresHost:   os.Getenv("DB_HOST"),
+		PostgresPort:   os.Getenv("DB_PORT"),
+		PostgresDB:     os.Getenv("DB_NAME"),
+		AESKey:         os.Getenv("AES_KEY"),
+		CloudToken:     os.Getenv("CLOUD_TOKEN"),
+		BackendUrl:     os.Getenv("BACKEND_URL"),
+		InternalSecret: os.Getenv("INTERNAL_SECRET"),
 	}
 
 	// Default values
