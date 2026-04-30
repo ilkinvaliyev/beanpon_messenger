@@ -732,6 +732,99 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		}
 		h.mu.RUnlock()
 
+	case "global_mute_user":
+		h.mu.RLock()
+		sender, ok := roomClients[event.SenderID]
+		h.mu.RUnlock()
+		if !ok || sender.Role != "host" {
+			return
+		}
+
+		var d map[string]interface{}
+		if err := json.Unmarshal(event.Data, &d); err != nil {
+			return
+		}
+		targetID := uint(d["target_user_id"].(float64))
+
+		payload, _ := json.Marshal(map[string]interface{}{
+			"type":    "user_global_muted",
+			"room_id": event.RoomID,
+			"data":    map[string]interface{}{"target_user_id": targetID},
+		})
+		h.mu.RLock()
+		for _, c := range roomClients {
+			select {
+			case c.Send <- payload:
+			default:
+			}
+		}
+		h.mu.RUnlock()
+
+	case "global_unmute_user":
+		h.mu.RLock()
+		sender, ok := roomClients[event.SenderID]
+		h.mu.RUnlock()
+		if !ok || sender.Role != "host" {
+			return
+		}
+
+		var d map[string]interface{}
+		if err := json.Unmarshal(event.Data, &d); err != nil {
+			return
+		}
+		targetID := uint(d["target_user_id"].(float64))
+
+		payload, _ := json.Marshal(map[string]interface{}{
+			"type":    "user_global_unmuted",
+			"room_id": event.RoomID,
+			"data":    map[string]interface{}{"target_user_id": targetID},
+		})
+		h.mu.RLock()
+		for _, c := range roomClients {
+			select {
+			case c.Send <- payload:
+			default:
+			}
+		}
+		h.mu.RUnlock()
+
+	case "kick_from_live":
+		h.mu.RLock()
+		sender, senderExists := roomClients[event.SenderID]
+		h.mu.RUnlock()
+		if !senderExists || sender.Role != "host" {
+			return
+		}
+
+		var d map[string]interface{}
+		if err := json.Unmarshal(event.Data, &d); err != nil {
+			return
+		}
+		targetID := uint(d["target_user_id"].(float64))
+
+		h.mu.RLock()
+		tClient, tExists := roomClients[targetID]
+		h.mu.RUnlock()
+		if !tExists {
+			return
+		}
+
+		payload, _ := json.Marshal(map[string]interface{}{
+			"type":    "kicked_from_live",
+			"room_id": event.RoomID,
+			"data":    map[string]interface{}{"target_user_id": targetID},
+		})
+		h.mu.RLock()
+		for _, c := range roomClients {
+			select {
+			case c.Send <- payload:
+			default:
+			}
+		}
+		h.mu.RUnlock()
+
+		go func(c *LiveRoomClient) { h.Unregister <- c }(tClient)
+
 	case "trigger_block_kick":
 		var dataMap map[string]interface{}
 		if err := json.Unmarshal(event.Data, &dataMap); err != nil {
