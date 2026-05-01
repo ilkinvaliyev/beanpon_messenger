@@ -14,7 +14,6 @@ type LiveRoom struct {
 	RoomType           string           `json:"room_type"` // audio, video, both
 	Status             string           `json:"status"`    // waiting, live, ended
 	HasPassword        bool             `json:"has_password"`
-	HasBlocked         bool             `json:"has_blocked"`
 	FilterGender       *string          `json:"filter_gender"`
 	FilterMinAge       *int             `json:"filter_min_age"`
 	FilterMaxAge       *int             `json:"filter_max_age"`

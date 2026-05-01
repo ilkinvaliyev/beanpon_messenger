@@ -715,16 +715,13 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		)
 
 		hasBlocked := models.IsBlocked(database.DB, targetUserID, event.SenderID)
-		var room models.LiveRoom
-		database.DB.Select("has_blocked").Where("id = ?", event.RoomID).First(&room)
 		transferPayload, _ := json.Marshal(map[string]interface{}{
 			"type":    "host_transferred",
 			"room_id": event.RoomID,
 			"data": map[string]interface{}{
-				"new_host_id":      targetUserID,
-				"old_host_id":      event.SenderID,
-				"has_blocked":      hasBlocked,
-				"room_has_blocked": room.HasBlocked,
+				"new_host_id": targetUserID,
+				"old_host_id": event.SenderID,
+				"has_blocked": hasBlocked,
 			},
 		})
 
