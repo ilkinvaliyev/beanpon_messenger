@@ -811,6 +811,16 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 			return
 		}
 
+		go func() {
+			if err := database.DB.Exec(`
+				INSERT INTO live_room_bans (live_room_id, user_id, created_at)
+				VALUES (?, ?, NOW())
+				ON CONFLICT (live_room_id, user_id) DO NOTHING
+			`, event.RoomID, targetID).Error; err != nil {
+				log.Printf("❌ live_room_bans insert hatası: %v", err)
+			}
+		}()
+
 		payload, _ := json.Marshal(map[string]interface{}{
 			"type":    "kicked_from_live",
 			"room_id": event.RoomID,

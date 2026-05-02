@@ -66,6 +66,13 @@ func (h *LiveHub) HandleWebSocket(c *gin.Context) {
 		return
 	}
 
+	var banCount int64
+	database.DB.Raw("SELECT COUNT(1) FROM live_room_bans WHERE live_room_id = ? AND user_id = ?", roomID, userID).Scan(&banCount)
+	if banCount > 0 {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Bu yayından ban olunmusunuz"})
+		return
+	}
+
 	conn, err := liveUpgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		log.Println("Live WebSocket Upgrade Error:", err)
