@@ -95,6 +95,8 @@ func main() {
 		// ── DM: Sohbet operasyonları ─────────────────────────────────────
 		api.GET("/conversations", messageHandler.GetConversations)
 		api.GET("/unread-count", messageHandler.GetUnreadCount)
+		// Share modal — recency+frequency-əsaslı tövsiyə list (wave/post share).
+		api.GET("/conversations/share-recipients", messageHandler.GetShareRecipients)
 
 		// ── DM: Conversation request yönetimi ───────────────────────────
 		api.GET("/conversation-requests", conversationHandler.GetPendingRequests)

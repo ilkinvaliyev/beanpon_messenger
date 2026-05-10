@@ -1175,3 +1175,85 @@ func (h *MessageHandler) EditMessage(c *gin.Context) {
 		"data":    editPayload,
 	})
 }
+
+// GetShareRecipients — share modal-da göstəriləcək tövsiyə olunan istifadəçilər.
+// Wave/post share zamanı ilkin auditoriya `follow-list`-dən deyil, **chat
+// keçmişindən** alınır: ən son danışdığım VƏ ən çox danışdığım dostlar
+// üstə çıxsın. Boş chat tarixi olan user üçün caller (Flutter tərəf)
+// follow-list-ə düşür.
+//
+// Score: w_recency * recency_score + w_freq * freq_score
+//
+//	recency_score = 1 / (1 + days_since_last_message)
+//	freq_score    = LN(my_count + other_count + 1) / 5.0  (cap ~ ln(150)/5 = 1.0)
+//
+// Default w_recency=0.6, w_freq=0.4 — son danışıq əhəmiyyətli, amma ümumi
+// münasibət sıxlığı da nəzərə alınır.
+//
+// Response: [{ user_id, name, username, profile_image, is_verified, score }]
+func (h *MessageHandler) GetShareRecipients(c *gin.Context) {
+	userIDRaw, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+	userID, ok := userIDRaw.(uint)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid user"})
+		return
+	}
+
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "20"))
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+
+	type Row struct {
+		UserID       uint    `json:"user_id"`
+		Name         string  `json:"name"`
+		Username     string  `json:"username"`
+		ProfileImage *string `json:"profile_image"`
+		IsVerified   bool    `json:"is_verified"`
+		Score        float64 `json:"score"`
+	}
+
+	const stmt = `
+SELECT
+    other_id AS user_id,
+    u.name,
+    u.username,
+    u.profile_image,
+    u.is_verified,
+    (
+        0.6 * (1.0 / (1.0 + GREATEST(EXTRACT(EPOCH FROM (NOW() - last_message_at)) / 86400.0, 0)))
+      + 0.4 * (LN(GREATEST(my_count + other_count, 0) + 1) / 5.0)
+    ) AS score
+FROM (
+    SELECT
+        CASE WHEN c.user1_id = ? THEN c.user2_id ELSE c.user1_id END AS other_id,
+        c.last_message_at,
+        CASE WHEN c.user1_id = ? THEN c.user1_message_count ELSE c.user2_message_count END AS my_count,
+        CASE WHEN c.user1_id = ? THEN c.user2_message_count ELSE c.user1_message_count END AS other_count
+    FROM conversations c
+    WHERE c.deleted_at IS NULL
+      AND COALESCE(c.chat_type, 'direct') = 'direct'
+      AND COALESCE(c.status, 'active') = 'active'
+      AND c.last_message_at IS NOT NULL
+      AND (c.user1_id = ? OR c.user2_id = ?)
+) AS partners
+INNER JOIN users u ON u.id = partners.other_id
+ORDER BY score DESC
+LIMIT ?`
+
+	var rows []Row
+	if err := database.GetDB().Raw(stmt, userID, userID, userID, userID, userID, limit).
+		Scan(&rows).Error; err != nil {
+		log.Printf("GetShareRecipients query error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "DB error"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"data": rows,
+	})
+}
