@@ -1261,11 +1261,11 @@ LIMIT ? OFFSET ?`
 		return
 	}
 
-	// profile_image S3 key kimi gəlir (məs. "profile_images/abc.jpg") —
-	// frontend-ə tam URL göndər (utils.PrependS3URL pattern, GetConversations
-	// də belə edir).
+	// profile_image relative key kimi gəlir (məs. "profile_images/abc.jpg") —
+	// frontend-ə tam URL göndər. GetConversations da məhz `PrependBaseURL`
+	// (default StorageLocal → /storage/...) işlədir, S3 storage tipi deyil.
 	for i := range rows {
-		rows[i].ProfileImage = utils.PrependS3URL(rows[i].ProfileImage)
+		rows[i].ProfileImage = utils.PrependBaseURL(rows[i].ProfileImage)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
