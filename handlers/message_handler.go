@@ -1223,29 +1223,39 @@ func (h *MessageHandler) GetShareRecipients(c *gin.Context) {
 	//   • Secondary sort: ümumi mesaj sayı (COUNT(*) DESC)
 	// Bu halda son danışılan kişi öndə olur, eyni gündə danışdığı bir
 	// neçə nəfər varsa daha çox yazışdığı öndə.
+	// `profile_image` users-də deyil, `profiles` cədvəlindədir (eyni
+	// pattern GetConversations-dakı kimi). LEFT JOIN istifadə edirik ki,
+	// profile satırı olmayan user-lər də ekrandan çıxmasın.
 	const stmt = `
 SELECT
     m.receiver_id AS user_id,
     u.name,
     u.username,
-    u.profile_image,
+    p.profile_image,
     u.is_verified,
     EXTRACT(EPOCH FROM MAX(m.created_at)) AS score
 FROM messages m
 INNER JOIN users u ON u.id = m.receiver_id
+LEFT JOIN profiles p ON p.user_id = m.receiver_id
 WHERE m.sender_id = ?
   AND m.receiver_id IS NOT NULL
   AND m.deleted_at IS NULL
   AND COALESCE(m.is_deleted_by_sender, false) = false
-GROUP BY m.receiver_id, u.name, u.username, u.profile_image, u.is_verified
+GROUP BY m.receiver_id, u.name, u.username, p.profile_image, u.is_verified
 ORDER BY MAX(m.created_at) DESC, COUNT(*) DESC
 LIMIT ?`
 
 	var rows []Row
 	if err := database.GetDB().Raw(stmt, userID, limit).
 		Scan(&rows).Error; err != nil {
-		log.Printf("GetShareRecipients query error: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "DB error"})
+		log.Printf("GetShareRecipients query error (userID=%d): %v", userID, err)
+		// Real error mesajını qaytar — diaqnostika üçün, prod-da `DB error`
+		// kimi gizlənə bilər
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "DB error",
+			"detail":  err.Error(),
+			"user_id": userID,
+		})
 		return
 	}
 
