@@ -1217,36 +1217,32 @@ func (h *MessageHandler) GetShareRecipients(c *gin.Context) {
 		Score        float64 `json:"score"`
 	}
 
+	// Birbaşa messages cədvəlindən: current user-in göndərdiyi mesajlar
+	// (sender_id = current). Receiver-ə görə qruplaşdırılır:
+	//   • Primary sort: ən son mesajın tarixi (MAX(created_at) DESC)
+	//   • Secondary sort: ümumi mesaj sayı (COUNT(*) DESC)
+	// Bu halda son danışılan kişi öndə olur, eyni gündə danışdığı bir
+	// neçə nəfər varsa daha çox yazışdığı öndə.
 	const stmt = `
 SELECT
-    other_id AS user_id,
+    m.receiver_id AS user_id,
     u.name,
     u.username,
     u.profile_image,
     u.is_verified,
-    (
-        0.6 * (1.0 / (1.0 + GREATEST(EXTRACT(EPOCH FROM (NOW() - last_message_at)) / 86400.0, 0)))
-      + 0.4 * (LN(GREATEST(my_count + other_count, 0) + 1) / 5.0)
-    ) AS score
-FROM (
-    SELECT
-        CASE WHEN c.user1_id = ? THEN c.user2_id ELSE c.user1_id END AS other_id,
-        c.last_message_at,
-        CASE WHEN c.user1_id = ? THEN c.user1_message_count ELSE c.user2_message_count END AS my_count,
-        CASE WHEN c.user1_id = ? THEN c.user2_message_count ELSE c.user1_message_count END AS other_count
-    FROM conversations c
-    WHERE c.deleted_at IS NULL
-      AND COALESCE(c.chat_type, 'direct') = 'direct'
-      AND COALESCE(c.status, 'active') = 'active'
-      AND c.last_message_at IS NOT NULL
-      AND (c.user1_id = ? OR c.user2_id = ?)
-) AS partners
-INNER JOIN users u ON u.id = partners.other_id
-ORDER BY score DESC
+    EXTRACT(EPOCH FROM MAX(m.created_at)) AS score
+FROM messages m
+INNER JOIN users u ON u.id = m.receiver_id
+WHERE m.sender_id = ?
+  AND m.receiver_id IS NOT NULL
+  AND m.deleted_at IS NULL
+  AND COALESCE(m.is_deleted_by_sender, false) = false
+GROUP BY m.receiver_id, u.name, u.username, u.profile_image, u.is_verified
+ORDER BY MAX(m.created_at) DESC, COUNT(*) DESC
 LIMIT ?`
 
 	var rows []Row
-	if err := database.GetDB().Raw(stmt, userID, userID, userID, userID, userID, limit).
+	if err := database.GetDB().Raw(stmt, userID, limit).
 		Scan(&rows).Error; err != nil {
 		log.Printf("GetShareRecipients query error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "DB error"})
