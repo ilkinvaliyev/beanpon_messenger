@@ -1203,9 +1203,13 @@ func (h *MessageHandler) GetShareRecipients(c *gin.Context) {
 		return
 	}
 
-	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "20"))
-	if limit <= 0 || limit > 100 {
-		limit = 20
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "10"))
+	if limit <= 0 || limit > 50 {
+		limit = 10
+	}
+	offset, _ := strconv.Atoi(c.DefaultQuery("offset", "0"))
+	if offset < 0 {
+		offset = 0
 	}
 
 	type Row struct {
@@ -1243,20 +1247,25 @@ WHERE m.sender_id = ?
   AND COALESCE(m.is_deleted_by_sender, false) = false
 GROUP BY m.receiver_id, u.name, u.username, p.profile_image, u.is_verified
 ORDER BY MAX(m.created_at) DESC, COUNT(*) DESC
-LIMIT ?`
+LIMIT ? OFFSET ?`
 
 	var rows []Row
-	if err := database.GetDB().Raw(stmt, userID, limit).
+	if err := database.GetDB().Raw(stmt, userID, limit, offset).
 		Scan(&rows).Error; err != nil {
 		log.Printf("GetShareRecipients query error (userID=%d): %v", userID, err)
-		// Real error mesajını qaytar — diaqnostika üçün, prod-da `DB error`
-		// kimi gizlənə bilər
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error":   "DB error",
 			"detail":  err.Error(),
 			"user_id": userID,
 		})
 		return
+	}
+
+	// profile_image S3 key kimi gəlir (məs. "profile_images/abc.jpg") —
+	// frontend-ə tam URL göndər (utils.PrependS3URL pattern, GetConversations
+	// də belə edir).
+	for i := range rows {
+		rows[i].ProfileImage = utils.PrependS3URL(rows[i].ProfileImage)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
