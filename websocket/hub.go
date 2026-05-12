@@ -1083,6 +1083,18 @@ func (h *Hub) handleAddReaction(userID uint, messageID, emoji string) {
 		return
 	}
 
+	// ✅ İdempotensiya: eyni istifadəçi eyni emoji-ni təkrar atırsa, push göndərmə
+	isDuplicate := false
+	if userID == message.SenderID {
+		if message.SenderReaction != nil && *message.SenderReaction == emoji {
+			isDuplicate = true
+		}
+	} else {
+		if message.ReceiverReaction != nil && *message.ReceiverReaction == emoji {
+			isDuplicate = true
+		}
+	}
+
 	// Reaction güncelle
 	if userID == message.SenderID {
 		message.SenderReaction = &emoji
@@ -1115,15 +1127,17 @@ func (h *Hub) handleAddReaction(userID uint, messageID, emoji string) {
 	if message.ReceiverID != nil {
 		h.updateConversationLastReaction(message.SenderID, *message.ReceiverID, userID, emoji, now, "added")
 
-		// Reaksiyanı qarşı tərəfə push notification kimi göndər (mute olmayanlara)
-		otherUserID := message.SenderID
-		if userID == message.SenderID {
-			otherUserID = *message.ReceiverID
-		}
-		// Yalnız reaksiyanı verən özü deyilsə, push at
-		if otherUserID != userID {
-			if !h.IsUserOnline(otherUserID) || !h.IsUserInChatWith(otherUserID, userID) {
-				go h.sendReactionPushNotification(userID, otherUserID, emoji)
+		// Reaksiyanı qarşı tərəfə push notification kimi göndər (mute olmayanlara,
+		// yalnız reaksiya əslində dəyişibsə — duplikat-da push atma)
+		if !isDuplicate {
+			otherUserID := message.SenderID
+			if userID == message.SenderID {
+				otherUserID = *message.ReceiverID
+			}
+			if otherUserID != userID {
+				if !h.IsUserOnline(otherUserID) || !h.IsUserInChatWith(otherUserID, userID) {
+					go h.sendReactionPushNotification(userID, otherUserID, emoji)
+				}
 			}
 		}
 	}
