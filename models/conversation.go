@@ -20,18 +20,23 @@ type Conversation struct {
 	HasPreviousConversation bool       `json:"has_previous_conversation" gorm:"default:false"`
 	FirstMessageAt          *time.Time `json:"first_message_at"`
 	LastMessageAt           *time.Time `json:"last_message_at"`
-	User1Muted              bool       `json:"user1_muted" gorm:"default:false"`
-	User2Muted              bool       `json:"user2_muted" gorm:"default:false"`
-	User1MutedAt            *time.Time `json:"user1_muted_at"`
-	User2MutedAt            *time.Time `json:"user2_muted_at"`
-	User1MutedUntil         *time.Time `json:"user1_muted_until"`
-	User2MutedUntil         *time.Time `json:"user2_muted_until"`
-	User1Restricted         bool       `json:"user1_restricted" gorm:"default:false"`
-	User2Restricted         bool       `json:"user2_restricted" gorm:"default:false"`
-	RestrictionReason       *string    `json:"restriction_reason" gorm:"type:text"`
-	TotalMessagesCount      int        `json:"total_messages_count" gorm:"default:0"`
-	StatusChangedAt         *time.Time `json:"status_changed_at"`
-	FollowHistory           *string    `json:"follow_history" gorm:"type:jsonb"`
+
+	// ✅ YENİ: Son reaksiya bilgisi (conversations siyahısında göstərmək üçün)
+	LastReactionEmoji    *string    `json:"last_reaction_emoji" gorm:"type:varchar(16)"`
+	LastReactionAt       *time.Time `json:"last_reaction_at"`
+	LastReactionByUserID *uint      `json:"last_reaction_by_user_id"`
+	User1Muted           bool       `json:"user1_muted" gorm:"default:false"`
+	User2Muted           bool       `json:"user2_muted" gorm:"default:false"`
+	User1MutedAt         *time.Time `json:"user1_muted_at"`
+	User2MutedAt         *time.Time `json:"user2_muted_at"`
+	User1MutedUntil      *time.Time `json:"user1_muted_until"`
+	User2MutedUntil      *time.Time `json:"user2_muted_until"`
+	User1Restricted      bool       `json:"user1_restricted" gorm:"default:false"`
+	User2Restricted      bool       `json:"user2_restricted" gorm:"default:false"`
+	RestrictionReason    *string    `json:"restriction_reason" gorm:"type:text"`
+	TotalMessagesCount   int        `json:"total_messages_count" gorm:"default:0"`
+	StatusChangedAt      *time.Time `json:"status_changed_at"`
+	FollowHistory        *string    `json:"follow_history" gorm:"type:jsonb"`
 
 	// ✅ YENİ: Screenshot Disable
 	User1ScreenshotDisabled   bool       `json:"user1_screenshot_disabled" gorm:"default:false"`

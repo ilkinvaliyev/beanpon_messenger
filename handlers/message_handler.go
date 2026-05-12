@@ -558,6 +558,11 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 
 		AllowVoiceMessages bool `json:"allow_voice_messages"`
 		ShowReadReceipts   bool `json:"show_read_receipts"`
+
+		// ✅ YENİ: son reaksiya
+		LastReactionEmoji    *string    `json:"last_reaction_emoji"`
+		LastReactionAt       *time.Time `json:"last_reaction_at"`
+		LastReactionByUserID *uint      `json:"last_reaction_by_user_id"`
 	}
 
 	statusWhereClause := ""
@@ -674,7 +679,10 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
         u.is_verified as other_user_is_verified,
         p.profile_image,
         COALESCE(us.allow_voice_messages, true) as allow_voice_messages,
-        COALESCE(us.show_read_receipts, true) as show_read_receipts
+        COALESCE(us.show_read_receipts, true) as show_read_receipts,
+        conv.last_reaction_emoji,
+        conv.last_reaction_at,
+        conv.last_reaction_by_user_id
     FROM latest_messages lm
     LEFT JOIN unread_counts uc ON lm.other_user_id = uc.other_user_id
     LEFT JOIN users u ON u.id = lm.other_user_id
@@ -737,20 +745,23 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 		isMutedByMe := conv.AmIMuted != nil && *conv.AmIMuted
 
 		responseData := gin.H{
-			"other_user_id":          conv.OtherUserID,
-			"other_user_name":        conv.OtherUserName,
-			"other_user_username":    conv.OtherUserUsername,
-			"other_user_is_verified": conv.OtherUserIsVerified,
-			"account_type_id":        conv.AccountTypeID,
-			"profile_image":          utils.PrependBaseURL(conv.ProfileImage),
-			"last_message_id":        conv.LastMessageID,
-			"last_message_text":      decryptedText,
-			"last_message_time":      conv.LastMessageTime,
-			"is_last_from_me":        conv.IsLastFromMe,
-			"last_message_read":      conv.LastMessageRead,
-			"unread_count":           conv.UnreadCount,
-			"is_online":              h.wsHub.IsUserOnline(conv.OtherUserID),
-			"conversation_active":    conversationActive,
+			"other_user_id":            conv.OtherUserID,
+			"other_user_name":          conv.OtherUserName,
+			"other_user_username":      conv.OtherUserUsername,
+			"other_user_is_verified":   conv.OtherUserIsVerified,
+			"account_type_id":          conv.AccountTypeID,
+			"last_reaction_emoji":      conv.LastReactionEmoji,
+			"last_reaction_at":         conv.LastReactionAt,
+			"last_reaction_by_user_id": conv.LastReactionByUserID,
+			"profile_image":            utils.PrependBaseURL(conv.ProfileImage),
+			"last_message_id":          conv.LastMessageID,
+			"last_message_text":        decryptedText,
+			"last_message_time":        conv.LastMessageTime,
+			"is_last_from_me":          conv.IsLastFromMe,
+			"last_message_read":        conv.LastMessageRead,
+			"unread_count":             conv.UnreadCount,
+			"is_online":                h.wsHub.IsUserOnline(conv.OtherUserID),
+			"conversation_active":      conversationActive,
 			"conversation": gin.H{
 				"id":                   conv.ConversationID,
 				"status":               conv.ConversationStatus,

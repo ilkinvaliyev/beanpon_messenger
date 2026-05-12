@@ -26,6 +26,18 @@ func main() {
 	// GORM ile PostgreSQL'e bağlan
 	database.InitializePostgreSQL(cfg)
 
+	// ✅ Conversations cədvəlinə reaksiya sütunlarını əlavə et (idempotent)
+	if err := database.DB.Exec(`
+		ALTER TABLE conversations
+		ADD COLUMN IF NOT EXISTS last_reaction_emoji VARCHAR(16),
+		ADD COLUMN IF NOT EXISTS last_reaction_at TIMESTAMPTZ,
+		ADD COLUMN IF NOT EXISTS last_reaction_by_user_id BIGINT
+	`).Error; err != nil {
+		log.Printf("⚠️ conversations reaction sütunları əlavə edilə bilmədi: %v", err)
+	} else {
+		log.Printf("✅ conversations reaction sütunları hazırdır")
+	}
+
 	// Servisleri başlat
 	encryptionService := services.NewEncryptionService(cfg.AESKey)
 

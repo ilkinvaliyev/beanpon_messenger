@@ -1090,7 +1090,8 @@ func (h *Hub) handleAddReaction(userID uint, messageID, emoji string) {
 		message.ReceiverReaction = &emoji
 	}
 
-	message.UpdatedAt = time.Now().UTC()
+	now := time.Now().UTC()
+	message.UpdatedAt = now
 
 	if err := h.db.Save(&message).Error; err != nil {
 		log.Printf("Reaction kaydedilemedi: %v", err)
@@ -1108,6 +1109,23 @@ func (h *Hub) handleAddReaction(userID uint, messageID, emoji string) {
 	h.SendToUser(message.SenderID, "reaction_updated", reactionData)
 	if message.ReceiverID != nil {
 		h.SendToUser(*message.ReceiverID, "reaction_updated", reactionData)
+	}
+
+	// ✅ YENİ: Conversation last_reaction sütunlarını yenilə və conversations siyahısına yay
+	if message.ReceiverID != nil {
+		h.updateConversationLastReaction(message.SenderID, *message.ReceiverID, userID, emoji, now, "added")
+
+		// Reaksiyanı qarşı tərəfə push notification kimi göndər (mute olmayanlara)
+		otherUserID := message.SenderID
+		if userID == message.SenderID {
+			otherUserID = *message.ReceiverID
+		}
+		// Yalnız reaksiyanı verən özü deyilsə, push at
+		if otherUserID != userID {
+			if !h.IsUserOnline(otherUserID) || !h.IsUserInChatWith(otherUserID, userID) {
+				go h.sendReactionPushNotification(userID, otherUserID, emoji)
+			}
+		}
 	}
 
 	log.Printf("Reaction eklendi: User %d, Message %s, Emoji %s", userID, messageID, emoji)
@@ -1132,7 +1150,8 @@ func (h *Hub) handleRemoveReaction(userID uint, messageID string) {
 		message.ReceiverReaction = nil
 	}
 
-	message.UpdatedAt = time.Now().UTC()
+	now := time.Now().UTC()
+	message.UpdatedAt = now
 
 	if err := h.db.Save(&message).Error; err != nil {
 		log.Printf("Reaction kaldırılamadı: %v", err)
@@ -1151,7 +1170,163 @@ func (h *Hub) handleRemoveReaction(userID uint, messageID string) {
 		h.SendToUser(*message.ReceiverID, "reaction_updated", reactionData)
 	}
 
+	// ✅ YENİ: Reaksiya silindikdə conversations siyahısında son mesaja geri dön
+	if message.ReceiverID != nil {
+		h.updateConversationLastReaction(message.SenderID, *message.ReceiverID, userID, "", now, "removed")
+	}
+
 	log.Printf("Reaction kaldırıldı: User %d, Message %s", userID, messageID)
+}
+
+// updateConversationLastReaction conversations cədvəlində son reaksiya sütunlarını yenil
+// və hər iki istifadəçinin conversations siyahısına `conversation_update` event göndər.
+//
+// action: "added" və ya "removed"
+func (h *Hub) updateConversationLastReaction(senderID, receiverID, reactorID uint, emoji string, at time.Time, action string) {
+	// Conversation-ı tap
+	var conversation models.Conversation
+	err := h.db.Where(
+		"(user1_id = ? AND user2_id = ?) OR (user1_id = ? AND user2_id = ?)",
+		senderID, receiverID, receiverID, senderID,
+	).First(&conversation).Error
+	if err != nil {
+		log.Printf("⚠️ Reaction üçün conversation tapılmadı: %v", err)
+		return
+	}
+
+	updates := map[string]interface{}{}
+	if action == "added" {
+		updates["last_reaction_emoji"] = emoji
+		updates["last_reaction_at"] = at
+		updates["last_reaction_by_user_id"] = reactorID
+	} else {
+		// removed → reaksiya sütunlarını sıfırla
+		updates["last_reaction_emoji"] = nil
+		updates["last_reaction_at"] = nil
+		updates["last_reaction_by_user_id"] = nil
+	}
+
+	if err := h.db.Model(&conversation).Updates(updates).Error; err != nil {
+		log.Printf("⚠️ conversation last_reaction yenilənə bilmədi: %v", err)
+		// Yenilənmə uğursuz olsa da broadcast etməyə davam edək
+	}
+
+	// İki tərəf üçün də conversation_update yay
+	atStr := ""
+	if action == "added" {
+		atStr = at.Format(time.RFC3339)
+	}
+
+	buildPayload := func(otherUserID uint, isFromMe bool) map[string]interface{} {
+		payload := map[string]interface{}{
+			"type":                     "conversation_update",
+			"event":                    "reaction_" + action, // reaction_added / reaction_removed
+			"other_user_id":            otherUserID,
+			"last_reaction_emoji":      nilIfEmpty(emoji, action),
+			"last_reaction_at":         nilIfEmptyStr(atStr),
+			"last_reaction_by_user_id": reactorID,
+			"is_reaction_from_me":      isFromMe,
+		}
+		return payload
+	}
+
+	// senderID üçün: qarşı tərəf receiverID
+	h.SendToUser(senderID, "conversation_update", buildPayload(receiverID, reactorID == senderID))
+	// receiverID üçün: qarşı tərəf senderID
+	h.SendToUser(receiverID, "conversation_update", buildPayload(senderID, reactorID == receiverID))
+}
+
+// nilIfEmpty action=removed olduqda emoji boşdur, JSON-da null göndərək
+func nilIfEmpty(emoji, action string) interface{} {
+	if action == "removed" || emoji == "" {
+		return nil
+	}
+	return emoji
+}
+
+func nilIfEmptyStr(s string) interface{} {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+// sendReactionPushNotification reaksiya üçün push notification göndər (async)
+func (h *Hub) sendReactionPushNotification(reactorID, receiverID uint, emoji string) {
+	// Mute statusunu yoxla — eyni məntiq sendPushNotification-da olduğu kimi
+	var conversation models.Conversation
+	err := h.db.Where("(user1_id = ? AND user2_id = ?) OR (user1_id = ? AND user2_id = ?)",
+		reactorID, receiverID, receiverID, reactorID).First(&conversation).Error
+	if err != nil {
+		log.Printf("❌ Reaction push: conversation tapılmadı: %v", err)
+		return
+	}
+
+	var isMuted bool
+	var mutedUntil *time.Time
+	if conversation.User1ID == receiverID {
+		isMuted = conversation.User1Muted
+		mutedUntil = conversation.User1MutedUntil
+	} else {
+		isMuted = conversation.User2Muted
+		mutedUntil = conversation.User2MutedUntil
+	}
+
+	if isMuted {
+		if mutedUntil == nil {
+			log.Printf("🔕 Reaction push: User %d sürəkli mute", receiverID)
+			return
+		}
+		if time.Now().Before(*mutedUntil) {
+			log.Printf("🔕 Reaction push: User %d mute (bitiş: %s)", receiverID, mutedUntil.Format("15:04:05"))
+			return
+		}
+	}
+
+	if h.config.CloudToken == "" || h.config.BackendUrl == "" {
+		log.Printf("❌ Reaction push: CloudToken və ya BackendUrl boşdur")
+		return
+	}
+
+	// Notification mətni Azərbaycanca
+	// Backend FCM servisi adətən "Ali: <message>" formasında title/body düzəldir.
+	notificationMessage := "Mesajınıza " + emoji + " ilə reaksiya verdi"
+
+	url := h.config.BackendUrl + "/notification/new-message"
+	payload := map[string]interface{}{
+		"receiver_id": receiverID,
+		"sender_id":   reactorID,
+		"message":     notificationMessage,
+		"type":        "reaction",
+		"emoji":       emoji,
+	}
+
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("❌ Reaction notification payload marshal xətası: %v", err)
+		return
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		log.Printf("❌ Reaction notification request xətası: %v", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", h.config.CloudToken)
+
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		log.Printf("❌ Reaction push göndərmə xətası: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 200 {
+		log.Printf("✅ Reaction push göndərildi: %d -> %d (%s)", reactorID, receiverID, emoji)
+	} else {
+		log.Printf("❌ Reaction push uğursuz, status: %d", resp.StatusCode)
+	}
 }
 
 // handleMarkRead kullanıcının mesajlarını okundu olarak işaretle
