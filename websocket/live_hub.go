@@ -921,3 +921,87 @@ func (h *LiveHub) ForceEndRoom(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{"message": "Room force ended."})
 }
+
+// KickUser — Filament admin paneldən çağrılır.
+// İstifadəçini canlı otaqdan çıxarır və bütün otağa "kicked_from_live" yayır.
+func (h *LiveHub) KickUser(c *gin.Context) {
+	roomIDStr := c.Param("room_id")
+	roomID, err := strconv.ParseUint(roomIDStr, 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid room_id"})
+		return
+	}
+
+	userIDStr := c.Param("user_id")
+	userID, err := strconv.ParseUint(userIDStr, 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user_id"})
+		return
+	}
+
+	payload, _ := json.Marshal(map[string]interface{}{
+		"type":    "kicked_from_live",
+		"room_id": uint(roomID),
+		"data":    map[string]interface{}{"target_user_id": uint(userID)},
+	})
+
+	h.mu.RLock()
+	roomClients, ok := h.rooms[uint(roomID)]
+	var targetClient *LiveRoomClient
+	if ok {
+		for _, client := range roomClients {
+			select {
+			case client.Send <- payload:
+			default:
+			}
+		}
+		if tc, exists := roomClients[uint(userID)]; exists {
+			targetClient = tc
+		}
+	}
+	h.mu.RUnlock()
+
+	if targetClient != nil {
+		go func(c *LiveRoomClient) { h.Unregister <- c }(targetClient)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "User kicked from live room."})
+}
+
+// MuteUser — Filament admin paneldən çağrılır.
+// İstifadəçini bu otaq üçün susturur. Geri qaytarmaq mümkün deyil — unmute endpoint-i yoxdur.
+func (h *LiveHub) MuteUser(c *gin.Context) {
+	roomIDStr := c.Param("room_id")
+	roomID, err := strconv.ParseUint(roomIDStr, 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid room_id"})
+		return
+	}
+
+	userIDStr := c.Param("user_id")
+	userID, err := strconv.ParseUint(userIDStr, 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user_id"})
+		return
+	}
+
+	payload, _ := json.Marshal(map[string]interface{}{
+		"type":    "user_global_muted",
+		"room_id": uint(roomID),
+		"data":    map[string]interface{}{"target_user_id": uint(userID)},
+	})
+
+	h.mu.RLock()
+	roomClients, ok := h.rooms[uint(roomID)]
+	if ok {
+		for _, client := range roomClients {
+			select {
+			case client.Send <- payload:
+			default:
+			}
+		}
+	}
+	h.mu.RUnlock()
+
+	c.JSON(http.StatusOK, gin.H{"message": "User muted in live room."})
+}
