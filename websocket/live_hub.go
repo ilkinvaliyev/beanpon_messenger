@@ -775,33 +775,8 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		}
 		h.mu.RUnlock()
 
-	case "global_unmute_user":
-		h.mu.RLock()
-		sender, ok := roomClients[event.SenderID]
-		h.mu.RUnlock()
-		if !ok || sender.Role != "host" {
-			return
-		}
-
-		var d map[string]interface{}
-		if err := json.Unmarshal(event.Data, &d); err != nil {
-			return
-		}
-		targetID := uint(d["target_user_id"].(float64))
-
-		payload, _ := json.Marshal(map[string]interface{}{
-			"type":    "user_global_unmuted",
-			"room_id": event.RoomID,
-			"data":    map[string]interface{}{"target_user_id": targetID},
-		})
-		h.mu.RLock()
-		for _, c := range roomClients {
-			select {
-			case c.Send <- payload:
-			default:
-			}
-		}
-		h.mu.RUnlock()
+	// global_unmute_user qəsdən silinib — unmute yalnız Filament admin üzərindən
+	// /internal/live-rooms/:room_id/unmute/:user_id endpoint-i ilə mümkündür.
 
 	case "kick_from_live":
 		h.mu.RLock()
@@ -968,8 +943,46 @@ func (h *LiveHub) KickUser(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "User kicked from live room."})
 }
 
+// UnmuteUser — Filament admin paneldən çağrılır.
+// İstifadəçinin sesini admin tərəfindən geri açır.
+func (h *LiveHub) UnmuteUser(c *gin.Context) {
+	roomIDStr := c.Param("room_id")
+	roomID, err := strconv.ParseUint(roomIDStr, 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid room_id"})
+		return
+	}
+
+	userIDStr := c.Param("user_id")
+	userID, err := strconv.ParseUint(userIDStr, 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user_id"})
+		return
+	}
+
+	payload, _ := json.Marshal(map[string]interface{}{
+		"type":    "user_global_unmuted",
+		"room_id": uint(roomID),
+		"data":    map[string]interface{}{"target_user_id": uint(userID)},
+	})
+
+	h.mu.RLock()
+	roomClients, ok := h.rooms[uint(roomID)]
+	if ok {
+		for _, client := range roomClients {
+			select {
+			case client.Send <- payload:
+			default:
+			}
+		}
+	}
+	h.mu.RUnlock()
+
+	c.JSON(http.StatusOK, gin.H{"message": "User unmuted in live room."})
+}
+
 // MuteUser — Filament admin paneldən çağrılır.
-// İstifadəçini bu otaq üçün susturur. Geri qaytarmaq mümkün deyil — unmute endpoint-i yoxdur.
+// İstifadəçini bu otaq üçün susturur. Yalnız admin Filament üzərindən geri aça bilər.
 func (h *LiveHub) MuteUser(c *gin.Context) {
 	roomIDStr := c.Param("room_id")
 	roomID, err := strconv.ParseUint(roomIDStr, 10, 32)

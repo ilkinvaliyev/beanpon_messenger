@@ -197,6 +197,7 @@ func main() {
 		internal.POST("/live-rooms/:room_id/force-end", liveHub.ForceEndRoom)
 		internal.POST("/live-rooms/:room_id/kick/:user_id", liveHub.KickUser)
 		internal.POST("/live-rooms/:room_id/mute/:user_id", liveHub.MuteUser)
+		internal.POST("/live-rooms/:room_id/unmute/:user_id", liveHub.UnmuteUser)
 	}
 
 	// Public routes
