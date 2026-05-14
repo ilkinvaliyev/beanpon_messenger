@@ -521,6 +521,71 @@ func (h *MessageHandler) MarkAsRead(c *gin.Context) {
 	})
 }
 
+// MarkConversationAsRead — A↔B söhbətində bütün okunmamış mesajları (where
+// sender_id=other AND receiver_id=current AND read=false) toplu okundu et.
+//
+// İstifadə yeri: native (iOS/Android) inline reply (Quick Reply) — kullanıcı
+// bildirimi aşağı çekib reply göndərdiyi anda qarşı tərəfin mesajlarını
+// avtomatik okundu hesab edirik. Eyni zamanda chat-page açılışında batch
+// işarələmə üçün də istifadə oluna bilər. WebSocket-dən aynı işi yapan
+// `mark_read` event-i mevcuddur; bu HTTP wrapper-i WS bağlantısı yoxsa
+// fallback edir.
+func (h *MessageHandler) MarkConversationAsRead(c *gin.Context) {
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+	readerID := userID.(uint)
+
+	otherStr := c.Param("other_user_id")
+	otherUint64, err := strconv.ParseUint(otherStr, 10, 64)
+	if err != nil || otherUint64 == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz other_user_id"})
+		return
+	}
+	otherID := uint(otherUint64)
+
+	if otherID == readerID {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "other_user_id self ola bilməz"})
+		return
+	}
+
+	now := time.Now().UTC()
+	result := database.DB.Model(&models.Message{}).
+		Where("sender_id = ? AND receiver_id = ? AND read = false", otherID, readerID).
+		Updates(map[string]interface{}{
+			"read":       true,
+			"updated_at": now,
+		})
+
+	if result.Error != nil {
+		log.Printf("MarkConversationAsRead DB error: %v", result.Error)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Veritabanı hatası"})
+		return
+	}
+
+	updatedCount := result.RowsAffected
+
+	// WebSocket üzərindən qarşı tərəfə (mesajları göndərənə) bildir
+	// — UI tick'lərini "görüldü" olaraq dəyişdirmək üçün. Hub-da eyni
+	// event format-ı (`message_read`) istifadə olunur.
+	if updatedCount > 0 {
+		readData := map[string]interface{}{
+			"reader_id":     readerID,
+			"other_user_id": otherID,
+			"read_count":    updatedCount,
+		}
+		h.wsHub.SendToUser(otherID, "message_read", readData)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":    "Conversation okundu olarak işaretlendi",
+		"read_count": updatedCount,
+		"read_at":    now,
+	})
+}
+
 // GetConversations sohbet listesi
 func (h *MessageHandler) GetConversations(c *gin.Context) {
 	userID, exists := c.Get("user_id")

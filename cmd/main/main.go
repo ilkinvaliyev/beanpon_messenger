@@ -101,6 +101,11 @@ func main() {
 		api.PUT("/messages/:message_id", messageHandler.EditMessage)
 		api.DELETE("/messages/:message_id", messageHandler.DeleteMessage)
 
+		// Batch mark-as-read — bir söhbətdəki bütün okunmamış mesajları
+		// (qarşı tərəfdən gələnləri) eyni anda okundu işarələ. Native
+		// inline reply (Quick Reply) bunu chağırır.
+		api.POST("/conversations/:other_user_id/mark-read", messageHandler.MarkConversationAsRead)
+
 		api.DELETE("/conversations/:other_user_id/clear", messageHandler.ClearConversation)
 		api.DELETE("/conversations/clear-all", messageHandler.ClearAllMyMessages)
 
