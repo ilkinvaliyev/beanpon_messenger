@@ -153,6 +153,7 @@ func main() {
 		// ── Live yayın ───────────────────────────────────────────────────
 		api.GET("/live-rooms/:room_id/messages", liveHub.GetLiveRoomMessages)
 		api.GET("/live-rooms/:room_id/reactions", liveHub.GetLiveRoomReactions)
+		api.POST("/live-rooms/:room_id/ask-question", liveHub.AskQuestion)
 
 		// ── WebSocket bilgi endpoint'leri ────────────────────────────────
 		api.GET("/online-users", func(c *gin.Context) {

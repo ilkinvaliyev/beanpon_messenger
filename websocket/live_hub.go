@@ -521,6 +521,19 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 			}
 		}
 
+	case "question":
+		// Host tarafindan tetiklenen icebreaker sorusu — otaqdaki hər kəsə eyni anda göstərilir
+		for _, client := range roomClients {
+			select {
+			case client.Send <- payload:
+			default:
+				close(client.Send)
+				go func(c *LiveRoomClient) {
+					h.Unregister <- c
+				}(client)
+			}
+		}
+
 	case "request_approved":
 		var dataMap map[string]interface{}
 		if err := json.Unmarshal(event.Data, &dataMap); err != nil {
