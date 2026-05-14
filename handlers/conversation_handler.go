@@ -354,7 +354,7 @@ func (h *ConversationHandler) MuteConversation(c *gin.Context) {
 		return
 	}
 
-	otherUserID, err := strconv.ParseUint(c.Param("user_id"), 10, 32)
+	otherUserID, err := strconv.ParseUint(c.Param("other_user_id"), 10, 32)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz kullanıcı ID"})
 		return
@@ -431,7 +431,7 @@ func (h *ConversationHandler) UnmuteConversation(c *gin.Context) {
 		return
 	}
 
-	otherUserID, err := strconv.ParseUint(c.Param("user_id"), 10, 32)
+	otherUserID, err := strconv.ParseUint(c.Param("other_user_id"), 10, 32)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz kullanıcı ID"})
 		return
@@ -472,7 +472,7 @@ func (h *ConversationHandler) GetConversationDetails(c *gin.Context) {
 		return
 	}
 
-	otherUserID, err := strconv.ParseUint(c.Param("user_id"), 10, 32)
+	otherUserID, err := strconv.ParseUint(c.Param("other_user_id"), 10, 32)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz kullanıcı ID"})
 		return
@@ -900,7 +900,7 @@ func (h *ConversationHandler) ToggleScreenshotProtection(c *gin.Context) {
 		return
 	}
 
-	otherUserID, err := strconv.ParseUint(c.Param("user_id"), 10, 32)
+	otherUserID, err := strconv.ParseUint(c.Param("other_user_id"), 10, 32)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz kullanıcı ID"})
 		return
@@ -984,7 +984,7 @@ func (h *ConversationHandler) GetScreenshotProtectionStatus(c *gin.Context) {
 		return
 	}
 
-	otherUserID, err := strconv.ParseUint(c.Param("user_id"), 10, 32)
+	otherUserID, err := strconv.ParseUint(c.Param("other_user_id"), 10, 32)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz kullanıcı ID"})
 		return

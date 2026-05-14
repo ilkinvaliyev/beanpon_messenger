@@ -122,11 +122,12 @@ func main() {
 		api.POST("/conversation-requests/:requester_id/reject", conversationHandler.RejectConversationRequest)
 
 		// ── DM: Conversation yönetimi ────────────────────────────────────
-		api.GET("/conversations/:user_id/details", conversationHandler.GetConversationDetails)
-		api.POST("/conversations/:user_id/mute", conversationHandler.MuteConversation)
-		api.POST("/conversations/:user_id/unmute", conversationHandler.UnmuteConversation)
-		api.POST("/conversations/:user_id/screenshot-protection", conversationHandler.ToggleScreenshotProtection)
-		api.GET("/conversations/:user_id/screenshot-protection", conversationHandler.GetScreenshotProtectionStatus)
+		api.GET("/conversations/:other_user_id/details", conversationHandler.GetConversationDetails)
+		api.POST("/conversations/:other_user_id/mute", conversationHandler.MuteConversation)
+
+		api.POST("/conversations/:other_user_id/unmute", conversationHandler.UnmuteConversation)
+		api.POST("/conversations/:other_user_id/screenshot-protection", conversationHandler.ToggleScreenshotProtection)
+		api.GET("/conversations/:other_user_id/screenshot-protection", conversationHandler.GetScreenshotProtectionStatus)
 
 		// ── GROUP: Grup yönetimi ─────────────────────────────────────────
 		api.POST("/groups", groupHandler.CreateGroup)
