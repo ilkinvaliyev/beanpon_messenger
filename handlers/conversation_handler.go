@@ -234,9 +234,11 @@ func (h *ConversationHandler) GetOrCreateConversationWithPermission(senderID, re
 						return nil, false, "Bu istifadəçiyə mesaj göndərmək üçün təsdiqlənmiş hesab tələb olunur", nil
 					}
 				} else if receiverSettings.MessageRequests == "FOLLOWING" {
+					// Receiver yalnız özü izlədiyi hesablardan mesaj qəbul edir.
+					// Yəni: receiver -> sender follow əlaqəsi olmalıdır.
 					var followCount int64
 					database.DB.Table("follows").
-						Where("follower_id = ? AND following_id = ?", senderID, receiverID).
+						Where("follower_id = ? AND following_id = ?", receiverID, senderID).
 						Count(&followCount)
 					if followCount == 0 {
 						return nil, false, "Bu istifadəçi yalnız izlədiyi hesablardan mesaj qəbul edir", nil
@@ -556,9 +558,11 @@ func (h *ConversationHandler) GetConversationDetails(c *gin.Context) {
 					}
 				}
 			} else if otherUserSettings.MessageRequests == "FOLLOWING" {
+				// Qarşı tərəf (otherUser) yalnız özü izlədiyi hesablardan mesaj qəbul edir.
+				// Yəni: otherUser -> me (userID) follow əlaqəsi olmalıdır.
 				var followCount int64
 				database.DB.Table("follows").
-					Where("follower_id = ? AND following_id = ?", userID, otherUserID).
+					Where("follower_id = ? AND following_id = ?", otherUserID, userID).
 					Count(&followCount)
 				if followCount == 0 {
 					reason := "FOLLOWING"
