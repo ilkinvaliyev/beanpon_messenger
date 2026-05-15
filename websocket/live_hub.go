@@ -689,6 +689,42 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		}
 		h.mu.RUnlock()
 
+	// HOST canlı otaqdakı chat tarixini hər kəs üçün təmizləyir.
+	// Yalnız host icazəlidir. Server tərəfdə də mesajları silirik ki,
+	// sonradan tarixçə endpoint-dən gələn list də təmiz olsun.
+	case "clear_chat":
+		h.mu.RLock()
+		sender, exists := roomClients[event.SenderID]
+		h.mu.RUnlock()
+		if !exists || sender.Role != "host" {
+			return
+		}
+
+		// Hard-delete bütün otaq mesajlarını. (live_room_messages
+		// modelində `deleted_at` sütunu yoxdur — soft-delete dəstəyi
+		// də yoxdur, ona görə hard delete edirik.)
+		go database.DB.Exec(
+			"DELETE FROM live_room_messages WHERE live_room_id = ?",
+			event.RoomID,
+		)
+
+		clearPayload, _ := json.Marshal(map[string]interface{}{
+			"type":    "chat_cleared",
+			"room_id": event.RoomID,
+			"data": map[string]interface{}{
+				"cleared_by": event.SenderID,
+			},
+		})
+
+		h.mu.RLock()
+		for _, c := range roomClients {
+			select {
+			case c.Send <- clearPayload:
+			default:
+			}
+		}
+		h.mu.RUnlock()
+
 	case "transfer_host":
 		h.mu.RLock()
 		sender, exists := roomClients[event.SenderID]
