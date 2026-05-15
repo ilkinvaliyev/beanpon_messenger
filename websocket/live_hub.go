@@ -725,6 +725,38 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		}
 		h.mu.RUnlock()
 
+	// Speaker özünü mute edib/açıb. Otaqdakı hər kəsə yaymaq lazımdır
+	// ki, onlar da o iştirakçının avatarında self-mute badge-i görsünlər.
+	// Host icazəsindən fərqlidir — burada yalnız özünü mute etmə.
+	case "self_mute_change":
+		var dataMap map[string]interface{}
+		if err := json.Unmarshal(event.Data, &dataMap); err != nil {
+			log.Printf("❌ self_mute_change data parse hatası: %v", err)
+			return
+		}
+		isMuted, _ := dataMap["is_muted"].(bool)
+
+		mutePayload, _ := json.Marshal(map[string]interface{}{
+			"type":    "self_mute_change",
+			"room_id": event.RoomID,
+			"data": map[string]interface{}{
+				"user_id":  event.SenderID,
+				"is_muted": isMuted,
+			},
+		})
+
+		h.mu.RLock()
+		for _, c := range roomClients {
+			// Göndərənə də göndərmək lazım deyil — onun lokal UI-i
+			// onsuz da güncəllidir. Amma göndərmək ziyan da vermir,
+			// idempotent: lokal state ilə eyni olacaq.
+			select {
+			case c.Send <- mutePayload:
+			default:
+			}
+		}
+		h.mu.RUnlock()
+
 	case "transfer_host":
 		h.mu.RLock()
 		sender, exists := roomClients[event.SenderID]
