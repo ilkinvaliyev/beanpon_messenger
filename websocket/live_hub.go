@@ -843,8 +843,38 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		}
 		h.mu.RUnlock()
 
-	// global_unmute_user qəsdən silinib — unmute yalnız Filament admin üzərindən
-	// /internal/live-rooms/:room_id/unmute/:user_id endpoint-i ilə mümkündür.
+	// Host bir istifadəçinin global-mute-unu açır. Hədəf otağa "user_global_unmuted"
+	// alır və öz tərəfində mikrofonunu yenidən aktiv edir. Hostdan başqa kimsə
+	// bu əməliyyatı edə bilməz. (Filament admin endpoint-i `/internal/live-rooms/
+	// :room_id/unmute/:user_id` da paralel olaraq mövcuddur — burası real-time
+	// WS yoludur.)
+	case "global_unmute_user":
+		h.mu.RLock()
+		sender, ok := roomClients[event.SenderID]
+		h.mu.RUnlock()
+		if !ok || sender.Role != "host" {
+			return
+		}
+
+		var d map[string]interface{}
+		if err := json.Unmarshal(event.Data, &d); err != nil {
+			return
+		}
+		targetID := uint(d["target_user_id"].(float64))
+
+		payload, _ := json.Marshal(map[string]interface{}{
+			"type":    "user_global_unmuted",
+			"room_id": event.RoomID,
+			"data":    map[string]interface{}{"target_user_id": targetID},
+		})
+		h.mu.RLock()
+		for _, c := range roomClients {
+			select {
+			case c.Send <- payload:
+			default:
+			}
+		}
+		h.mu.RUnlock()
 
 	case "kick_from_live":
 		h.mu.RLock()
