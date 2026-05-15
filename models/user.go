@@ -13,6 +13,7 @@ type User struct {
 	AccountTypeID int       `json:"account_type_id" gorm:"default:1"`
 	IsVerified    bool      `json:"is_verified" gorm:"default:false"`
 	IsAdmin       bool      `json:"is_admin" gorm:"default:false"`
+	IsGhost       bool      `json:"is_ghost" gorm:"default:false"`
 	CreatedAt     time.Time `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt     time.Time `json:"updated_at" gorm:"autoUpdateTime"`
 }

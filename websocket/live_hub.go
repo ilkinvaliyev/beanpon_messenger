@@ -25,7 +25,22 @@ type LiveRoomClient struct {
 	Name       string
 	Avatar     *string
 	AvatarType *string
+	IsGhost    bool
 	Send       chan []byte
+}
+
+// visibleCount — otaqdakı ghost olmayan istifadəçilərin sayını qaytarır.
+// Çağıran tərəf h.mu lock-u tutmalıdır (RLock kifayətdir).
+func (h *LiveHub) visibleCount(roomID uint) int {
+	count := 0
+	if room, ok := h.rooms[roomID]; ok {
+		for _, c := range room {
+			if !c.IsGhost {
+				count++
+			}
+		}
+	}
+	return count
 }
 
 type LiveHub struct {
@@ -66,38 +81,42 @@ func (h *LiveHub) Run() {
 				h.rooms[client.RoomID] = make(map[uint]*LiveRoomClient)
 			}
 			h.rooms[client.RoomID][client.UserID] = client
-			count := len(h.rooms[client.RoomID])
+			count := h.visibleCount(client.RoomID)
 			h.mu.Unlock()
 
-			log.Printf("User %d joined Live Room %d as %s", client.UserID, client.RoomID, client.Role)
+			log.Printf("User %d joined Live Room %d as %s (ghost=%v)", client.UserID, client.RoomID, client.Role, client.IsGhost)
 
-			eventData, _ := json.Marshal(map[string]interface{}{"count": count})
-			go func(e *LiveMessageEvent) { h.Broadcast <- e }(&LiveMessageEvent{
-				Type: "viewer_count_update", RoomID: client.RoomID,
-				Data: eventData,
-			})
-
-			joinData, _ := json.Marshal(map[string]interface{}{
-				"user_id":   client.UserID,
-				"user_name": client.Name,
-			})
-			go func(roomID uint, senderID uint, data json.RawMessage) {
-				h.mu.RLock()
-				clients := h.rooms[roomID]
-				h.mu.RUnlock()
-				payload, _ := json.Marshal(map[string]interface{}{
-					"type":      "user_joined",
-					"sender_id": senderID,
-					"room_id":   roomID,
-					"data":      data,
+			// Ghost user-lər üçün qoşulma eventi və viewer count yenilənməsi
+			// yayılmır — heç kim onun otaqda olduğunu bilməməlidir.
+			if !client.IsGhost {
+				eventData, _ := json.Marshal(map[string]interface{}{"count": count})
+				go func(e *LiveMessageEvent) { h.Broadcast <- e }(&LiveMessageEvent{
+					Type: "viewer_count_update", RoomID: client.RoomID,
+					Data: eventData,
 				})
-				for _, c := range clients {
-					select {
-					case c.Send <- payload:
-					default:
+
+				joinData, _ := json.Marshal(map[string]interface{}{
+					"user_id":   client.UserID,
+					"user_name": client.Name,
+				})
+				go func(roomID uint, senderID uint, data json.RawMessage) {
+					h.mu.RLock()
+					clients := h.rooms[roomID]
+					h.mu.RUnlock()
+					payload, _ := json.Marshal(map[string]interface{}{
+						"type":      "user_joined",
+						"sender_id": senderID,
+						"room_id":   roomID,
+						"data":      data,
+					})
+					for _, c := range clients {
+						select {
+						case c.Send <- payload:
+						default:
+						}
 					}
-				}
-			}(client.RoomID, client.UserID, joinData)
+				}(client.RoomID, client.UserID, joinData)
+			}
 
 		case client := <-h.Unregister:
 			h.mu.Lock()
@@ -110,9 +129,9 @@ func (h *LiveHub) Run() {
 					close(client.Send)
 					log.Printf("User %d left Live Room %d", client.UserID, client.RoomID)
 				}
-				count = len(room)
+				count = h.visibleCount(client.RoomID)
 				roomExists = true
-				if count == 0 {
+				if len(room) == 0 {
 					delete(h.rooms, client.RoomID)
 					delete(h.reactionBuffer, client.RoomID)
 					roomExists = false
@@ -120,7 +139,10 @@ func (h *LiveHub) Run() {
 			}
 			h.mu.Unlock()
 
-			if roomExists {
+			// Ghost user otaqdan ayrılanda viewer count yenilənməsi
+			// broadcast olunmur — onun olub-olmaması heç kim üçün
+			// görünməməlidir, ona görə sayğac da dəyişməməlidir.
+			if roomExists && !client.IsGhost {
 				eventData, _ := json.Marshal(map[string]interface{}{"count": count})
 				go func(e *LiveMessageEvent) { h.Broadcast <- e }(&LiveMessageEvent{
 					Type: "viewer_count_update", RoomID: client.RoomID,

@@ -83,10 +83,11 @@ func (h *LiveHub) HandleWebSocket(c *gin.Context) {
 		Name             string
 		ProfileImage     *string
 		ProfileImageType *string
+		IsGhost          bool
 	}
 	var senderInfo SenderInfo
 	database.DB.Table("users").
-		Select("users.name, profiles.profile_image, profiles.profile_image_type").
+		Select("users.name, users.is_ghost, profiles.profile_image, profiles.profile_image_type").
 		Joins("left join profiles on profiles.user_id = users.id").
 		Where("users.id = ?", userID).
 		Scan(&senderInfo)
@@ -100,6 +101,7 @@ func (h *LiveHub) HandleWebSocket(c *gin.Context) {
 		Name:       senderInfo.Name,
 		Avatar:     senderInfo.ProfileImage,
 		AvatarType: senderInfo.ProfileImageType,
+		IsGhost:    senderInfo.IsGhost,
 		Send:       make(chan []byte, 256),
 	}
 
