@@ -14,6 +14,7 @@ type User struct {
 	IsVerified    bool      `json:"is_verified" gorm:"default:false"`
 	IsAdmin       bool      `json:"is_admin" gorm:"default:false"`
 	IsGhost       bool      `json:"is_ghost" gorm:"default:false"`
+	LiveSpam      bool      `json:"live_spam" gorm:"default:false"`
 	CreatedAt     time.Time `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt     time.Time `json:"updated_at" gorm:"autoUpdateTime"`
 }

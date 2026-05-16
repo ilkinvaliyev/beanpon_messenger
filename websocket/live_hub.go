@@ -26,16 +26,22 @@ type LiveRoomClient struct {
 	Avatar     *string
 	AvatarType *string
 	IsGhost    bool
-	Send       chan []byte
+	// LiveSpam — shadow ban. Əgər true-dursa, bu user-in göndərdiyi
+	// chat_message / broadcast_request / reaction event-ləri otaqdaki
+	// digər istifadəçilərə YAYIMLANMIR. User isə özü mesajları görür və
+	// heç bir error / status almır (silent drop) — özünü bloklanmış kimi
+	// hiss etməsin deyə.
+	LiveSpam bool
+	Send     chan []byte
 }
 
-// visibleCount — otaqdakı ghost olmayan istifadəçilərin sayını qaytarır.
-// Çağıran tərəf h.mu lock-u tutmalıdır (RLock kifayətdir).
+// visibleCount — otaqdakı ghost və live_spam olmayan istifadəçilərin
+// sayını qaytarır. Çağıran tərəf h.mu lock-u tutmalıdır (RLock kifayətdir).
 func (h *LiveHub) visibleCount(roomID uint) int {
 	count := 0
 	if room, ok := h.rooms[roomID]; ok {
 		for _, c := range room {
-			if !c.IsGhost {
+			if !c.IsGhost && !c.LiveSpam {
 				count++
 			}
 		}
@@ -86,9 +92,11 @@ func (h *LiveHub) Run() {
 
 			log.Printf("User %d joined Live Room %d as %s (ghost=%v)", client.UserID, client.RoomID, client.Role, client.IsGhost)
 
-			// Ghost user-lər üçün qoşulma eventi və viewer count yenilənməsi
-			// yayılmır — heç kim onun otaqda olduğunu bilməməlidir.
-			if !client.IsGhost {
+			// Ghost user-lər və live_spam (shadow ban) user-ləri üçün
+			// qoşulma eventi və viewer count yenilənməsi yayılmır — heç kim
+			// onun otaqda olduğunu bilməməlidir. User isə bunu hiss etmir,
+			// çünki connect uğurlu qaytarılmışdı.
+			if !client.IsGhost && !client.LiveSpam {
 				eventData, _ := json.Marshal(map[string]interface{}{"count": count})
 				go func(e *LiveMessageEvent) { h.Broadcast <- e }(&LiveMessageEvent{
 					Type: "viewer_count_update", RoomID: client.RoomID,
@@ -139,10 +147,10 @@ func (h *LiveHub) Run() {
 			}
 			h.mu.Unlock()
 
-			// Ghost user otaqdan ayrılanda viewer count yenilənməsi
+			// Ghost / live_spam user otaqdan ayrılanda viewer count yenilənməsi
 			// broadcast olunmur — onun olub-olmaması heç kim üçün
 			// görünməməlidir, ona görə sayğac da dəyişməməlidir.
-			if roomExists && !client.IsGhost {
+			if roomExists && !client.IsGhost && !client.LiveSpam {
 				eventData, _ := json.Marshal(map[string]interface{}{"count": count})
 				go func(e *LiveMessageEvent) { h.Broadcast <- e }(&LiveMessageEvent{
 					Type: "viewer_count_update", RoomID: client.RoomID,
@@ -290,6 +298,16 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 			"withyou": true, "cry": true, "angry": true, "dislike": true,
 		}
 		if !validReactions[reactionName] {
+			return
+		}
+
+		// Shadow ban: live_spam istifadəçisinin reaksiyaları
+		// agregata yığılmır və başqalarına yayılmır. Sender heç nə
+		// hiss etmir — UI öz client-də artıq oynayır.
+		h.mu.RLock()
+		senderClient, senderExists := roomClients[event.SenderID]
+		h.mu.RUnlock()
+		if senderExists && senderClient.LiveSpam {
 			return
 		}
 
@@ -467,7 +485,15 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 
 		chatPayload, _ := json.Marshal(event)
 
+		// Shadow ban: əgər sender live_spam-dırsa, mesaj otağa
+		// broadcast OLUNMUR. Yalnız sender özünə echo alır ki, mesajın
+		// göndərildiyini düşünsün. Heç bir error qaytarılmır.
+		senderIsSpam := senderExists && senderClient.LiveSpam
+
 		for _, client := range roomClients {
+			if senderIsSpam && client.UserID != event.SenderID {
+				continue
+			}
 			if client.UserID != event.SenderID {
 				if models.IsBlocked(database.DB, event.SenderID, client.UserID) {
 					continue
@@ -485,6 +511,13 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		h.mu.RLock()
 		senderClient, senderExists := roomClients[event.SenderID]
 		h.mu.RUnlock()
+
+		// Shadow ban: live_spam istifadəçisinin live-ə qoşulma /
+		// danışma istəyi HEÇ KİMƏ göndərilmir (host da daxil olmaqla).
+		// Sender-ə də heç bir cavab dönmür — sanki istək çıxıb gedib.
+		if senderExists && senderClient.LiveSpam {
+			return
+		}
 
 		senderName := "User"
 		var senderAvatar *string = nil
