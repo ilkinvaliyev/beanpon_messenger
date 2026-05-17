@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   app:
     build: .
@@ -11,7 +9,10 @@ services:
       - ENV=production
     networks:
       - monitoring
+      - beanpon_local-network
 
 networks:
   monitoring:
     driver: bridge
+  beanpon_local-network:
+    external: true

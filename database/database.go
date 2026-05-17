@@ -3,16 +3,19 @@ package database
 import (
 	"beanpon_messenger/config"
 	"fmt"
+	"log"
+
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
-	"log"
 )
 
 var DB *gorm.DB
 
-// InitializePostgreSQL PostgreSQL veritabanına bağlanır
+// InitializePostgreSQL PostgreSQL veritabanına bağlanır.
+// PGBOUNCER_ENABLED=true olduqda DSN-ə "default_query_exec_mode=simple_protocol"
+// əlavə olunur — pgbouncer-in transaction/statement pool mode-larında
+// pgx-in prepared statement cache-i ilə bağlı xətaları aradan qaldırır.
 func InitializePostgreSQL(cfg *config.Config) {
-	// PostgreSQL bağlantı string'i oluştur
 	dsn := fmt.Sprintf(
 		"host=%s user=%s password=%s dbname=%s port=%s sslmode=disable TimeZone=UTC",
 		cfg.PostgresHost,
@@ -22,16 +25,26 @@ func InitializePostgreSQL(cfg *config.Config) {
 		cfg.PostgresPort,
 	)
 
-	// GORM ile bağlan
-	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	if cfg.PgBouncerEnabled {
+		dsn += " default_query_exec_mode=simple_protocol"
+	}
+
+	gormCfg := &gorm.Config{
+		PrepareStmt: false,
+	}
+
+	db, err := gorm.Open(postgres.Open(dsn), gormCfg)
 	if err != nil {
 		log.Fatalf("PostgreSQL bağlantı hatası: %v", err)
 	}
 
-	// Global DB değişkenine ata
 	DB = db
 
-	log.Println("PostgreSQL bağlantısı başarılı!")
+	if cfg.PgBouncerEnabled {
+		log.Println("PostgreSQL bağlantısı başarılı (pgbouncer mode)!")
+	} else {
+		log.Println("PostgreSQL bağlantısı başarılı!")
+	}
 }
 
 // GetDB veritabanı bağlantısını döndürür

@@ -4,6 +4,7 @@ import (
 	"github.com/joho/godotenv"
 	"log"
 	"os"
+	"strconv"
 )
 
 // Config yapılandırma verilerini tutar
@@ -19,6 +20,11 @@ type Config struct {
 	CloudToken     string
 	BackendUrl     string
 	InternalSecret string
+
+	// PgBouncer — true olduqda DSN-ə "default_query_exec_mode=simple_protocol"
+	// əlavə olunur ki, pgbouncer transaction/statement mode-da pgx-in
+	// prepared statement cache-i ilə bağlı xətalar olmasın.
+	PgBouncerEnabled bool
 }
 
 // LoadConfig konfigürasyon dosyasını okur ve Config yapısına doldurur
@@ -30,17 +36,18 @@ func LoadConfig() *Config {
 	}
 
 	cfg := &Config{
-		Port:           os.Getenv("APP_PORT"),
-		JWTSecret:      os.Getenv("JWT_SECRET"),
-		PostgresUser:   os.Getenv("DB_USER"),
-		PostgresPass:   os.Getenv("DB_PASSWORD"),
-		PostgresHost:   os.Getenv("DB_HOST"),
-		PostgresPort:   os.Getenv("DB_PORT"),
-		PostgresDB:     os.Getenv("DB_NAME"),
-		AESKey:         os.Getenv("AES_KEY"),
-		CloudToken:     os.Getenv("CLOUD_TOKEN"),
-		BackendUrl:     os.Getenv("BACKEND_URL"),
-		InternalSecret: os.Getenv("INTERNAL_SECRET"),
+		Port:             os.Getenv("APP_PORT"),
+		JWTSecret:        os.Getenv("JWT_SECRET"),
+		PostgresUser:     os.Getenv("DB_USER"),
+		PostgresPass:     os.Getenv("DB_PASSWORD"),
+		PostgresHost:     os.Getenv("DB_HOST"),
+		PostgresPort:     os.Getenv("DB_PORT"),
+		PostgresDB:       os.Getenv("DB_NAME"),
+		AESKey:           os.Getenv("AES_KEY"),
+		CloudToken:       os.Getenv("CLOUD_TOKEN"),
+		BackendUrl:       os.Getenv("BACKEND_URL"),
+		InternalSecret:   os.Getenv("INTERNAL_SECRET"),
+		PgBouncerEnabled: envBool("PGBOUNCER_ENABLED", false),
 	}
 
 	// Default values
@@ -65,4 +72,13 @@ func LoadConfig() *Config {
 	}
 
 	return cfg
+}
+
+func envBool(key string, defaultVal bool) bool {
+	if v := os.Getenv(key); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
+		}
+	}
+	return defaultVal
 }
