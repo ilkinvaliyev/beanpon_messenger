@@ -1096,6 +1096,144 @@ func (h *LiveHub) KickUser(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "User kicked from live room."})
 }
 
+// SetLiveSpam — Filament admin paneldən çağrılır.
+// İstifadəçinin shadow ban (live_spam) statusunu BÜTÜN aktiv canlı
+// otaqlardakı açıq client obyektlərində REAL-TIME yeniləyir.
+//
+// Problem: HandleWebSocket live_spam dəyərini yalnız WS bağlantısı
+// qurulan an bir dəfə oxuyub client obyektinə "dondurur". İstifadəçi
+// otaqda ikən admin onu live_spam = true etsə, yaddaşdakı client
+// obyekti köhnə (false) dəyəri saxladığı üçün shadow ban yalnız
+// reconnect-dən sonra işə düşürdü. Bu handler həmin boşluğu bağlayır.
+//
+// live_spam = true olduqda: əgər user əvvəl görünən idisə, otağa onun
+// "ayrıldığı" effektini veririk — viewer count azalır və user_left
+// yayılır ki, qalan iştirakçılar üçün də görünməz olsun.
+// live_spam = false olduqda: əksinə, user "qoşulmuş" kimi yenidən
+// görünür — viewer count artır və user_joined yayılır.
+//
+// Qeyd: Filament users.live_spam sütununu DB-də onsuz da yeniləyir;
+// bu endpoint yalnız yaddaşdakı canlı vəziyyəti sinxronlaşdırır.
+func (h *LiveHub) SetLiveSpam(c *gin.Context) {
+	userIDStr := c.Param("user_id")
+	userID, err := strconv.ParseUint(userIDStr, 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user_id"})
+		return
+	}
+
+	// Body: {"live_spam": true}  — yoxdursa true qəbul edirik.
+	var body struct {
+		LiveSpam *bool `json:"live_spam"`
+	}
+	_ = c.ShouldBindJSON(&body)
+	newVal := true
+	if body.LiveSpam != nil {
+		newVal = *body.LiveSpam
+	}
+
+	type affectedRoom struct {
+		roomID   uint
+		count    int
+		wasGhost bool
+		userName string
+	}
+	var affected []affectedRoom
+
+	h.mu.Lock()
+	for roomID, clients := range h.rooms {
+		client, exists := clients[uint(userID)]
+		if !exists {
+			continue
+		}
+		// Real dəyişiklik yoxdursa keç.
+		if client.LiveSpam == newVal {
+			continue
+		}
+		client.LiveSpam = newVal
+
+		ar := affectedRoom{
+			roomID:   roomID,
+			wasGhost: client.IsGhost,
+			userName: client.Name,
+		}
+		// Yeni dəyər tətbiq olunduqdan sonra görünən izləyici sayı.
+		ar.count = h.visibleCount(roomID)
+		affected = append(affected, ar)
+	}
+	h.mu.Unlock()
+
+	// Ghost user üçün heç bir görünürlük eventi yaymırıq — o, live_spam
+	// statusundan asılı olmayaraq onsuz da daimi görünməzdir.
+	for _, ar := range affected {
+		if ar.wasGhost {
+			continue
+		}
+
+		h.mu.RLock()
+		roomClients, ok := h.rooms[ar.roomID]
+		h.mu.RUnlock()
+		if !ok {
+			continue
+		}
+
+		// Viewer count yenilənməsi — hər iki istiqamətdə.
+		countData, _ := json.Marshal(map[string]interface{}{"count": ar.count})
+		countPayload, _ := json.Marshal(map[string]interface{}{
+			"type":    "viewer_count_update",
+			"room_id": ar.roomID,
+			"data":    json.RawMessage(countData),
+		})
+
+		var visibilityPayload []byte
+		if newVal {
+			// Artıq shadow-ban: user otaqda qalanlar üçün "ayrıldı".
+			d, _ := json.Marshal(map[string]interface{}{
+				"user_id": uint(userID),
+			})
+			visibilityPayload, _ = json.Marshal(map[string]interface{}{
+				"type":    "user_left",
+				"room_id": ar.roomID,
+				"data":    json.RawMessage(d),
+			})
+		} else {
+			// Shadow-ban götürüldü: user yenidən "qoşuldu".
+			d, _ := json.Marshal(map[string]interface{}{
+				"user_id":   uint(userID),
+				"user_name": ar.userName,
+			})
+			visibilityPayload, _ = json.Marshal(map[string]interface{}{
+				"type":    "user_joined",
+				"room_id": ar.roomID,
+				"data":    json.RawMessage(d),
+			})
+		}
+
+		for cid, client := range roomClients {
+			// Hədəf user-in özünə görünürlük eventi göndərmirik —
+			// o, banlandığını/açıldığını hiss etməməlidir (silent).
+			if cid == uint(userID) {
+				continue
+			}
+			select {
+			case client.Send <- countPayload:
+			default:
+			}
+			select {
+			case client.Send <- visibilityPayload:
+			default:
+			}
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":        "Live spam status synced.",
+		"user_id":        uint(userID),
+		"live_spam":      newVal,
+		"rooms_affected": len(affected),
+	})
+}
+
 // UnmuteUser — Filament admin paneldən çağrılır.
 // İstifadəçinin sesini admin tərəfindən geri açır.
 func (h *LiveHub) UnmuteUser(c *gin.Context) {

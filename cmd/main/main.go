@@ -198,6 +198,11 @@ func main() {
 		internal.POST("/live-rooms/:room_id/kick/:user_id", liveHub.KickUser)
 		internal.POST("/live-rooms/:room_id/mute/:user_id", liveHub.MuteUser)
 		internal.POST("/live-rooms/:room_id/unmute/:user_id", liveHub.UnmuteUser)
+		// Shadow ban (live_spam) statusunu real-time sinxronlaşdırır.
+		// Body: {"live_spam": true|false}. Filament users.live_spam-ı
+		// dəyişdikdən sonra bu endpoint-i çağırmalıdır ki, otaqda
+		// olan client-lər dərhal yenilənsin (reconnect gözləmədən).
+		internal.POST("/users/:user_id/live-spam", liveHub.SetLiveSpam)
 	}
 
 	// Public routes
