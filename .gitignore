@@ -33,3 +33,5 @@ logs/
 # Local override
 /tmp/
 /coverage/
+.env
+/vendor/
