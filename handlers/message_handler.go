@@ -809,6 +809,12 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 
 		isMutedByMe := conv.AmIMuted != nil && *conv.AmIMuted
 
+		// Əgər tərəflərdən biri digərini bloklayıbsa, online statusu göstərilməməlidir.
+		isOnline := false
+		if !models.IsBlocked(database.DB, userID.(uint), conv.OtherUserID) {
+			isOnline = h.wsHub.IsUserOnline(conv.OtherUserID)
+		}
+
 		responseData := gin.H{
 			"other_user_id":            conv.OtherUserID,
 			"other_user_name":          conv.OtherUserName,
@@ -825,7 +831,7 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 			"is_last_from_me":          conv.IsLastFromMe,
 			"last_message_read":        conv.LastMessageRead,
 			"unread_count":             conv.UnreadCount,
-			"is_online":                h.wsHub.IsUserOnline(conv.OtherUserID),
+			"is_online":                isOnline,
 			"conversation_active":      conversationActive,
 			"conversation": gin.H{
 				"id":                   conv.ConversationID,
