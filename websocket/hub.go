@@ -1413,10 +1413,9 @@ func (h *Hub) getOrCreateConversationWithPermission(senderID, receiverID uint) (
 	).First(&conversation).Error
 
 	if err != nil {
-		// 🚫 SPAM KONTROLÜ: mesaj banlı kullanıcı (actions NULL veya "message"
-		// içeriyorsa) YENİ conversation başlatamaz. Sessizce başarısız ol —
-		// sentinel reason döndür, conversation oluşturma. actions "message"
-		// içermiyorsa (örn. ["post"]) engellenmez.
+		// 🚫 SPAM KONTROLÜ: spam_bans'ta kaydı olan (deleted_at IS NULL)
+		// kullanıcı YENİ conversation başlatamaz. Sessizce başarısız ol —
+		// sentinel reason döndür, conversation oluşturma.
 		if models.IsMessagingBanned(h.db, senderID) {
 			return nil, false, spamSilentReason, nil
 		}

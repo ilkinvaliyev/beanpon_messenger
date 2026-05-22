@@ -222,11 +222,10 @@ func (h *ConversationHandler) GetOrCreateConversationWithPermission(senderID, re
 	// Conversation yoksa yeni conversation için verified kontrolü
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			// 🚫 SPAM KONTROLÜ: spam_bans'ta aktif mesaj banı olan kullanıcı
-			// (actions NULL veya "message" içeriyorsa) YENİ conversation
-			// başlatamaz. Sessizce başarısız olur — kullanıcıya hata gösterilmez
-			// (canSend=false, errorMsg=""), conversation oluşturulmaz.
-			// actions "message" içermiyorsa (örn. ["post"]) engellenmez.
+			// 🚫 SPAM KONTROLÜ: spam_bans'ta kaydı olan (deleted_at IS NULL)
+			// kullanıcı YENİ conversation başlatamaz. Sessizce başarısız olur —
+			// kullanıcıya hata gösterilmez (canSend=false, errorMsg=""),
+			// conversation oluşturulmaz.
 			if models.IsMessagingBanned(database.DB, senderID) {
 				return nil, false, "", nil
 			}
