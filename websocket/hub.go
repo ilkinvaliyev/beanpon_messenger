@@ -737,6 +737,14 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 		conversation, canSend, errorMsg, err := c.Hub.getOrCreateConversationWithPermission(c.UserID, receiverID)
 
 		if err != nil || !canSend {
+			// 🚫 SPAM: spam'lı kullanıcıya hata bile gösterme — sessizce yut.
+			// Mesaj DB'ye yazılmaz, karşı tarafa gitmez, gönderene message_error
+			// dönülmez (shadow-ban davranışı).
+			if errorMsg == spamSilentReason {
+				log.Printf("Spam'lı kullanıcının mesajı sessizce engellendi: %d -> %d", c.UserID, receiverID)
+				return
+			}
+
 			log.Printf("Mesaj gönderilemedi: %d -> %d, error: %v, msg: %s", c.UserID, receiverID, err, errorMsg)
 			c.sendMessage(&OutgoingMessage{
 				Type: "message_error",
@@ -1392,6 +1400,11 @@ func (h *Hub) BroadcastScreenshotProtectionChange(user1ID, user2ID uint, isDisab
 		user1ID, user2ID, isDisabled, changedByUserID)
 }
 
+// spamSilentReason — spam'lı kullanıcının mesaj denemesinde dönülen sentinel
+// errorMsg değeri. Çağıran kod bunu görünce kullanıcıya hata göstermeden
+// sessizce çıkar (shadow-ban).
+const spamSilentReason = "__SPAM_SILENT__"
+
 func (h *Hub) getOrCreateConversationWithPermission(senderID, receiverID uint) (*models.Conversation, bool, string, error) {
 	var conversation models.Conversation
 	err := h.db.Where(
@@ -1400,6 +1413,14 @@ func (h *Hub) getOrCreateConversationWithPermission(senderID, receiverID uint) (
 	).First(&conversation).Error
 
 	if err != nil {
+		// 🚫 SPAM KONTROLÜ: mesaj banlı kullanıcı (actions NULL veya "message"
+		// içeriyorsa) YENİ conversation başlatamaz. Sessizce başarısız ol —
+		// sentinel reason döndür, conversation oluşturma. actions "message"
+		// içermiyorsa (örn. ["post"]) engellenmez.
+		if models.IsMessagingBanned(h.db, senderID) {
+			return nil, false, spamSilentReason, nil
+		}
+
 		// Conversation yok, yeni oluştur
 		newConv := models.Conversation{
 			User1ID: senderID,

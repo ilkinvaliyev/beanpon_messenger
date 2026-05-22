@@ -222,6 +222,15 @@ func (h *ConversationHandler) GetOrCreateConversationWithPermission(senderID, re
 	// Conversation yoksa yeni conversation için verified kontrolü
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
+			// 🚫 SPAM KONTROLÜ: spam_bans'ta aktif mesaj banı olan kullanıcı
+			// (actions NULL veya "message" içeriyorsa) YENİ conversation
+			// başlatamaz. Sessizce başarısız olur — kullanıcıya hata gösterilmez
+			// (canSend=false, errorMsg=""), conversation oluşturulmaz.
+			// actions "message" içermiyorsa (örn. ["post"]) engellenmez.
+			if models.IsMessagingBanned(database.DB, senderID) {
+				return nil, false, "", nil
+			}
+
 			var receiverSettings models.UserSettings
 			if err := database.DB.Where("user_id = ?", receiverID).First(&receiverSettings).Error; err == nil {
 				if receiverSettings.MessageRequests == "ONLY_VERIFIED" {
@@ -284,6 +293,21 @@ func (h *ConversationHandler) checkConversationPermission(conversation *models.C
 
 // UpdateConversationOnMessage mesaj gönderildikten sonra conversation güncelle
 func (h *ConversationHandler) UpdateConversationOnMessage(senderID, receiverID uint) error {
+	// 🚫 SPAM KORUMASI: mesaj banlı kullanıcı YENİ conversation başlatamaz.
+	// Conversation yoksa ve gönderenin mesaj banı varsa sessizce çık
+	// (conversation oluşturulmaz, hata da dönülmez). Conversation zaten
+	// varsa dokunma — bu kontrol yalnızca ilk conversation create için.
+	if models.IsMessagingBanned(database.DB, senderID) {
+		var existing models.Conversation
+		convErr := database.DB.Where(
+			"(user1_id = ? AND user2_id = ?) OR (user1_id = ? AND user2_id = ?)",
+			senderID, receiverID, receiverID, senderID,
+		).First(&existing).Error
+		if errors.Is(convErr, gorm.ErrRecordNotFound) {
+			return nil
+		}
+	}
+
 	conversation, err := h.GetOrCreateConversation(senderID, receiverID)
 	if err != nil {
 		return err
