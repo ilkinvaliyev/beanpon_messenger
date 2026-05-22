@@ -19,7 +19,6 @@ func PrependBaseURL(path *string, storageType ...StorageType) *string {
 	if strings.HasPrefix(*path, "http://") || strings.HasPrefix(*path, "https://") {
 		return path
 	}
-
 	// Default storage type
 	storage := StorageLocal
 	if len(storageType) > 0 {
