@@ -219,7 +219,7 @@ func (q *ModerationQueue) process(job ModerationJob) {
 //
 // Qaytarır: ən azı bir kanal uğurlu olubsa true.
 func (q *ModerationQueue) notifyOffPlatformSender(senderID uint) bool {
-	const warnText = "Söhbətləri başqa platformalara köçürmək Beanpon icma qaydalarına ziddir. " +
+	const warnText = "Söhbətləri başqa platformalara köçürmək Piokio icma qaydalarına ziddir. " +
 		"Təhlükəsizliyiniz üçün yazışmalarınızı tətbiq daxilində saxlayın."
 
 	delivered := false
