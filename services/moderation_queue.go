@@ -217,12 +217,15 @@ func (q *ModerationQueue) process(job ModerationJob) {
 		job.MessageID, result.Category, severity, result.Confidence, job.SenderID)
 }
 
-// Laravel notifications.php-dəki tərcümə açarları. Push mətni hər cihazın
-// öz dilinə (fcm_tokens.lang) görə Laravel tərəfində render olunur —
-// messenger yalnız bu açarları göndərir.
+// Off-platform xəbərdarlıq mətni (push notification).
+//
+// FcmController-in `/notification/send` endpoint-i düz `title`/`body`
+// gözləyir (key əsaslı çoxdilli render-i dəstəkləmir), ona görə mətn
+// burada hazır verilir. data sahəsində `category` də göndərilir ki,
+// app istəsə öz tərəfində lokallaşdıra bilsin.
 const (
-	offPlatformTitleKey = "off_platform_warning.title"
-	offPlatformBodyKey  = "off_platform_warning.body"
+	offPlatformPushTitle = "Xəbərdarlıq"
+	offPlatformPushBody  = "Başqa platformaya keçmək təklifi qadağandır."
 )
 
 // notifyOffPlatformSender — off_platform kateqoriyasında MESAJI GÖNDƏRƏN
@@ -250,7 +253,7 @@ func (q *ModerationQueue) notifyOffPlatformSender(senderID uint) bool {
 		delivered = true
 	}
 
-	// 2) Laravel push notification — çoxdilli (key əsaslı).
+	// 2) Laravel push notification (FcmController /notification/send).
 	if q.cfg != nil && q.cfg.BackendUrl != "" && q.cfg.CloudToken != "" {
 		if q.sendBackendWarning(senderID) {
 			delivered = true
@@ -261,33 +264,29 @@ func (q *ModerationQueue) notifyOffPlatformSender(senderID uint) bool {
 }
 
 // sendBackendWarning — Laravel-in FcmController push endpoint-inə
-// çoxdilli moderasiya xəbərdarlığı göndərir.
+// off-platform moderasiya xəbərdarlığı göndərir.
 //
 // Endpoint:  BackendUrl + "/notification/send"
 // Header:    x-api-key: CloudToken   (token.verify middleware)
-// Payload:   {user_id, title_key, body_key, data}
+// Payload:   {user_id, title, body, data}  — FcmController::sendNotification
+//
+//	formatı (title/body məcburidir, düz mətn).
 //
 // QEYD endpoint yolu haqqında: Laravel-də həm `new-message`, həm `send`
 // route-u `cloud/cloud.php` faylındadır və o fayl `prefix('api')` +
-// `prefix('cloud')` + `prefix('notification')` ilə qoşulur. Yəni tam yol
-// `/api/cloud/notification/send`-dir. websocket/hub.go-dakı işləyən
-// `sendPushNotification` `BackendUrl + "/notification/new-message"`
-// yazdığına görə `BackendUrl` artıq `/api/cloud` hissəsini ehtiva edir —
-// ona görə burada da yalnız `/notification/send` əlavə edilir (eyni
-// pattern, eyni baza).
-//
-// title_key/body_key — lang/{dil}/notifications.php-dəki açarlar. Laravel
-// (FcmService) hər cihazın dilinə görə mətni avtomatik render edir, ona
-// görə messenger tərəfində tərcümə saxlamağa ehtiyac yoxdur.
+// `prefix('cloud')` + `prefix('notification')` ilə qoşulur. websocket/
+// hub.go-dakı işləyən `sendPushNotification` `BackendUrl +
+// "/notification/new-message"` yazır — yəni `BackendUrl` artıq `/api/cloud`
+// hissəsini ehtiva edir. Burada da eyni baza ilə `/notification/send`.
 //
 // Bildiriş mesajı YAZAN adama getməlidir: user_id = targetUserID.
 func (q *ModerationQueue) sendBackendWarning(targetUserID uint) bool {
 	url := q.cfg.BackendUrl + "/notification/send"
 
 	payload := map[string]interface{}{
-		"user_id":   targetUserID, // bildiriş off-platform cəhd edən şəxsə gedir
-		"title_key": offPlatformTitleKey,
-		"body_key":  offPlatformBodyKey,
+		"user_id": targetUserID, // bildiriş off-platform cəhd edən şəxsə gedir
+		"title":   offPlatformPushTitle,
+		"body":    offPlatformPushBody,
 		"data": map[string]interface{}{
 			"type":     "moderation_warning",
 			"category": models.CategoryOffPlatform,
