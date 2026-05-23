@@ -21,6 +21,10 @@ type Config struct {
 	BackendUrl     string
 	InternalSecret string
 
+	// OpenAIAPIKey — arxa-plan mesaj moderasiyası (gpt-4o-mini) üçün açar.
+	// Boş olduqda moderasiya sakitcə deaktiv olur — tətbiq normal işləyir.
+	OpenAIAPIKey string
+
 	// PgBouncer — true olduqda DSN-ə "default_query_exec_mode=simple_protocol"
 	// əlavə olunur ki, pgbouncer transaction/statement mode-da pgx-in
 	// prepared statement cache-i ilə bağlı xətalar olmasın.
@@ -47,6 +51,7 @@ func LoadConfig() *Config {
 		CloudToken:       os.Getenv("CLOUD_TOKEN"),
 		BackendUrl:       os.Getenv("BACKEND_URL"),
 		InternalSecret:   os.Getenv("INTERNAL_SECRET"),
+		OpenAIAPIKey:     os.Getenv("OPENAI_API_KEY"),
 		PgBouncerEnabled: envBool("PGBOUNCER_ENABLED", false),
 	}
 

@@ -3,6 +3,7 @@ package handlers
 import (
 	"beanpon_messenger/database"
 	"beanpon_messenger/models"
+	"beanpon_messenger/services"
 	"beanpon_messenger/utils"
 	"encoding/json"
 	"errors"
@@ -16,6 +17,12 @@ import (
 	"gorm.io/gorm"
 )
 
+// moderationEnqueuer — şübhəli mesaj analizi üçün queue-ya iş qoymaq üçün
+// minimal interfeys. services.ModerationQueue bunu ödəyir. Qeyri-bloklayıcıdır.
+type moderationEnqueuer interface {
+	Enqueue(job services.ModerationJob)
+}
+
 type MessageHandler struct {
 	encryptionService interface {
 		EncryptMessage(plainText string) (string, error)
@@ -27,6 +34,8 @@ type MessageHandler struct {
 		IsUserOnline(userID uint) bool
 		SendToUser(userID uint, messageType string, data interface{})
 	}
+	// moderationQueue — opsional. nil olduqda moderasiya sakitcə atlanır.
+	moderationQueue moderationEnqueuer
 }
 
 func NewMessageHandler(encryptionService interface {
@@ -42,6 +51,12 @@ func NewMessageHandler(encryptionService interface {
 		encryptionService: encryptionService,
 		wsHub:             wsHub,
 	}
+}
+
+// SetModerationQueue — moderasiya queue-sunu handler-a bağlayır.
+// main.go-da wsHub və queue qurulduqdan sonra çağırılır.
+func (h *MessageHandler) SetModerationQueue(q moderationEnqueuer) {
+	h.moderationQueue = q
 }
 
 type wsHubForConversation interface {
@@ -182,6 +197,20 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 		req.StoryID,
 		"active",
 	)
+
+	// 🔍 MODERASIYA — mesaj şifrələnib göndərildi, indi arxa planda analizə
+	// qoyuruq. Enqueue() qeyri-bloklayıcıdır: bu sətir mesaj göndərmə
+	// sürətinə HEÇ təsir etmir. Yalnız text tipli mesajları analiz edirik
+	// (image/video/voice mətn daşımır).
+	if h.moderationQueue != nil && (req.Type == "" || req.Type == "text") {
+		h.moderationQueue.Enqueue(services.ModerationJob{
+			MessageID:  message.ID,
+			SenderID:   message.SenderID,
+			ReceiverID: req.ReceiverID,
+			PlainText:  req.Text,
+			CreatedAt:  message.CreatedAt,
+		})
+	}
 
 	// API response
 	c.JSON(http.StatusCreated, gin.H{

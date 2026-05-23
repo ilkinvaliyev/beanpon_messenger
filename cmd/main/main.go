@@ -46,6 +46,26 @@ func main() {
 	database.DB.Exec("UPDATE user_presences SET is_online = false, last_seen_at = NOW() WHERE is_online = true")
 	go wsHub.Run()
 
+	// 🔍 MODERASIYA SİSTEMİ
+	// Mesajlar şifrələnmədən əvvəl arxa planda AI (OpenAI gpt-4o-mini) ilə
+	// analiz edilir. Mesaj göndərmə HEÇ bloklanmır — analiz queue + worker
+	// pool ilə tamamilə asinxron baş verir. Risk aşkar edilərsə nəticə
+	// message_moderation_logs tablosuna yazılır; off_platform kateqoriyasında
+	// mesajı YAZAN adama xəbərdarlıq notification-ı gedir.
+	moderationAI := services.NewModerationAIService(cfg.OpenAIAPIKey)
+	moderationQueue := services.NewModerationQueue(moderationAI, database.DB, cfg, wsHub)
+	moderationQueue.Start()
+	// WS axını üçün enqueue callback-ini hub-a bağla.
+	wsHub.SetModerationEnqueue(func(messageID string, senderID, receiverID uint, plainText string, createdAt time.Time) {
+		moderationQueue.Enqueue(services.ModerationJob{
+			MessageID:  messageID,
+			SenderID:   senderID,
+			ReceiverID: receiverID,
+			PlainText:  plainText,
+			CreatedAt:  createdAt,
+		})
+	})
+
 	// 2. YENİ SİSTEM: Canlı Yayın Odaları (Live) Hub'ı
 	liveHub := websocket.NewLiveHub()
 	go liveHub.Run()
@@ -56,6 +76,8 @@ func main() {
 
 	// Handler'ları oluştur
 	messageHandler := handlers.NewMessageHandler(encryptionService, wsHub)
+	// HTTP axını üçün moderasiya queue-sunu handler-a bağla.
+	messageHandler.SetModerationQueue(moderationQueue)
 	conversationHandler := handlers.NewConversationHandler(wsHub, encryptionService)
 	groupHandler := handlers.NewGroupHandler(wsHub, encryptionService)
 	groupMsgHandler := handlers.NewGroupMessageHandler(encryptionService, wsHub)

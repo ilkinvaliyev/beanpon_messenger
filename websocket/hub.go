@@ -48,6 +48,18 @@ type Hub struct {
 	}
 	httpClient *http.Client   // ← YENI
 	config     *config.Config // ← YENI
+
+	// moderationEnqueue — WS ilə göndərilən mesajları arxa-plan moderasiya
+	// analizinə qoyur. Qeyri-bloklayıcıdır. nil olduqda atlanır.
+	// Lokal funksiya tipi kimi saxlanır ki, services paketinə birbaşa
+	// asılılıq (və potensial import cycle) olmasın.
+	moderationEnqueue func(messageID string, senderID, receiverID uint, plainText string, createdAt time.Time)
+}
+
+// SetModerationEnqueue — WS axını üçün moderasiya enqueue callback-ini bağlayır.
+// main.go-da queue qurulduqdan sonra çağırılır.
+func (h *Hub) SetModerationEnqueue(fn func(messageID string, senderID, receiverID uint, plainText string, createdAt time.Time)) {
+	h.moderationEnqueue = fn
 }
 
 // IncomingMessage client'tan gelen mesaj yapısı
@@ -790,6 +802,13 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 
 			if err := c.Hub.db.Create(&message).Error; err != nil {
 				log.Printf("Mesaj DB'ye yazılamadı: %v", err)
+				return
+			}
+
+			// 🔍 MODERASIYA — mesaj DB-yə yazıldı, arxa-plan analizinə qoy.
+			// Yalnız text mesajları analiz edirik. Qeyri-bloklayıcıdır.
+			if c.Hub.moderationEnqueue != nil && (msgType == "" || msgType == "text") {
+				c.Hub.moderationEnqueue(messageID, c.UserID, receiverID, content, createdAt)
 			}
 		}()
 
