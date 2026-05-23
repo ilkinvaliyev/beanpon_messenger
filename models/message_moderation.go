@@ -61,15 +61,18 @@ var CategorySeverity = map[string]string{
 	CategorySelfHarm:     SeverityHigh,
 }
 
-// CategoryMinConfidence — bir kateqoriyada loga/notification-a çevrilmək üçün
+// CategoryMinConfidence — bir kateqoriyada TABLE-yə LOG yazılması üçün
 // AI-nın minimum əminlik dərəcəsi. AI flaq etsə belə, confidence bu həddən
-// aşağıdırsa nəticə ATILIR — gərəksiz xəbərdarlıq yaranmasın deyə.
+// aşağıdırsa nəticə tamamilə ATILIR (nə log, nə notification).
 //
 // Məntiq:
 //   - csae / anti_state — kritik. Aşağı eşik (0.50): şübhə varsa belə tut.
 //   - threat / self_harm / illegal_goods — ciddi. Orta eşik (0.65).
-//   - harassment / scam / off_platform — yüngül, yanlış-pozitiv ehtimalı
-//     yüksək. Yuxarı eşik (0.75): yalnız AI əmin olduqda flaq.
+//   - harassment / scam — yüngül, yanlış-pozitiv ehtimalı yüksək (0.75).
+//   - off_platform — aşağı eşik (0.50): həm açıq köçürmə təklifi, həm
+//     dolayı maraq ("instada varsan?") table-yə düşməlidir. Notification
+//     gedib-getməməsi isə AYRI eşiklə (NotificationMinConfidence) idarə
+//     olunur — yalnız yüksək əminlikli açıq təkliflərə push gedir.
 var CategoryMinConfidence = map[string]float64{
 	CategoryCSAE:         0.50,
 	CategoryAntiState:    0.50,
@@ -78,18 +81,43 @@ var CategoryMinConfidence = map[string]float64{
 	CategoryIllegalGoods: 0.65,
 	CategoryHarassment:   0.75,
 	CategoryScam:         0.75,
-	CategoryOffPlatform:  0.75,
+	CategoryOffPlatform:  0.50,
 }
 
-// DefaultMinConfidence — kateqoriya xəritədə yoxdursa istifadə olunan eşik.
+// DefaultMinConfidence — kateqoriya xəritədə yoxdursa istifadə olunan log eşiyi.
 const DefaultMinConfidence = 0.70
 
 // MeetsConfidenceThreshold — verilən kateqoriya və əminlik nəticəni
-// log/notification-a çevirməyə kifayət edirmi?
+// TABLE-yə LOG kimi yazmağa kifayət edirmi?
 func MeetsConfidenceThreshold(category string, confidence float64) bool {
 	threshold, ok := CategoryMinConfidence[category]
 	if !ok {
 		threshold = DefaultMinConfidence
+	}
+	return confidence >= threshold
+}
+
+// NotificationMinConfidence — bir kateqoriyada istifadəçiyə PUSH/WS
+// xəbərdarlıq notification-ı GÖNDƏRİLMƏSİ üçün minimum əminlik.
+//
+// Bu, log eşiyindən AYRIDIR və ondan YÜKSƏKDİR: nəticə table-yə düşə bilər
+// (audit üçün), amma istifadəçini yalnız AI həqiqətən əmin olduqda
+// narahat edirik.
+//
+//   - off_platform — yalnız confidence >= 0.90 (AÇIQ köçürmə təklifi)
+//     olduqda push gedir. "instada varsan?" kimi dolayı maraq (0.55-0.75)
+//     table-yə yazılır, amma notification getmir.
+var NotificationMinConfidence = map[string]float64{
+	CategoryOffPlatform: 0.90,
+}
+
+// ShouldNotify — bu kateqoriya və əminlik istifadəçiyə notification
+// göndərməyə kifayət edirmi? Kateqoriya xəritədə yoxdursa, log eşiyi
+// (MeetsConfidenceThreshold) ilə eyni davranır.
+func ShouldNotify(category string, confidence float64) bool {
+	threshold, ok := NotificationMinConfidence[category]
+	if !ok {
+		return MeetsConfidenceThreshold(category, confidence)
 	}
 	return confidence >= threshold
 }

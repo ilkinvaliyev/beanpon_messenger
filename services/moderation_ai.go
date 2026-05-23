@@ -107,24 +107,45 @@ YALNIZ aşağıdakı kateqoriyalardan biri AÇIQ şəkildə mövcuddursa flaq et
 
 3. "anti_state" — Dövlət əleyhinə zorakı fəaliyyət təşkili, terror aktına çağırış və ya təbliğat, zorakı çevriliş planlaması. Sadəcə hökuməti tənqid etmək VƏ YA siyasi narazılıq bu kateqoriya DEYİL.
 
-4. "off_platform" — Göndərən söhbəti bu tətbiqdən KƏNAR, BAŞQA bir platformaya keçirməyə çalışır. Bu kateqoriya YALNIZ konkret xarici platforma VƏ ya əlaqə vasitəsi qeyd olunduqda flaq edilir:
-   • Xarici platformalar: Instagram, TikTok, Facebook, Telegram, WhatsApp, Snapchat, Signal, Discord, Viber, Messenger və s.
-   • ÇOX VACİB — platformaların QISALTMA və JARQON adlarını da tanı və flaq et. Nümunələr:
-     - "ig", "insta", "inst" → Instagram
-     - "tt", "tik tok", "tikok" → TikTok
-     - "tg", "tele" → Telegram
-     - "wp", "wapp", "vatsap", "votsap", "whatsap" → WhatsApp
-     - "fb" → Facebook
-     - "snap" → Snapchat
-     - "disc" → Discord
-     Səhv/əyləncəli yazılış formaları da (məs. "instaqram", "telegrama keçək", "tt-da") eyni qaydada tutulmalıdır.
-   • Əlaqə vasitəsi paylaşma: telefon nömrəsi, e-mail, başqa platformada istifadəçi adı və ya profil linki.
-   Flaq edilən nümunələr: "Instagramda yaz", "ig-də yaz", "tt-da danışaq", "tg-yə keç", "wp nömrəni ver", "@username-imə yaz", profil linki göndərmə.
+4. "off_platform" — Göndərən söhbəti/əlaqəni bu tətbiqdən KƏNARA, BAŞQA bir platformaya və ya birbaşa əlaqə vasitəsinə yönəltməyə çalışır. Bu kateqoriya istənilən dildə (Azərbaycan, türk, rus, ingilis, alman, ispan, özbək və s.) işləyir — dildən asılı olmayaraq mənanı tut.
 
-   ÇOX VACİB — bunlar flaq DEYİL:
-   • Konkret xarici platforma adı OLMAYAN ümumi/qeyri-müəyyən ifadələr: "burda yaz", "bura yazın", "ora yaz", "başqa yerdə danışaq", "sonra yazaram" — bunlar heç bir xarici platformanı göstərmir, ola bilər bu tətbiqin başqa hissəsini (şərh, qrup, profil) və ya sadəcə gələcək vaxtı nəzərdə tutur. FLAQ ETMƏ.
-   • Xarici platforma adının (tam və ya qısaltma) sadəcə söhbət mövzusu kimi çəkilməsi: "TikTok-da gülməli video gördüm", "ig-də onun şəklini gördüm". FLAQ ETMƏ.
-   Yalnız söhbəti köçürmək üçün AÇIQ CƏHD + KONKRET xarici platforma/əlaqə vasitəsi (tam ad VƏ ya qısaltma) birlikdə olduqda flaq et.
+   Xarici platformalar (tam ad, qısaltma və jarqon — hamısını tanı):
+     - Instagram → "ig", "insta", "inst", "instaqram", "инста"
+     - TikTok → "tt", "tik tok", "tikok", "тикток"
+     - Telegram → "tg", "tele", "телега", "телеграм"
+     - WhatsApp → "wp", "wapp", "vatsap", "votsap", "whatsap", "ватсап"
+     - Facebook → "fb", "фб"
+     - Snapchat → "snap", "снэп"
+     - Discord, Signal, Viber, Messenger və s.
+   Əlaqə vasitələri: telefon nömrəsi, e-mail, başqa platformada istifadəçi adı (@username), profil linki.
+   Səhv yazılış / əyləncəli formalar da (məs. "telegrama keçək", "tt-da", "ınsta") eyni qaydada tutulmalıdır.
+
+   ⭐ ƏMİNLİK SƏVİYYƏSİ — bu kateqoriyada confidence dəyəri ÇOX VACİBDİR. İki halı fərqləndir:
+
+   A) YÜKSƏK ƏMİNLİK (confidence 0.90 və ya yuxarı) — AÇIQ köçürmə TƏKLİFİ/ÇAĞIRIŞI:
+      Göndərən birbaşa "gəl ora keçək / orada yazaq / oraya yaz / nömrəni ver" deyir.
+      Nümunələr (hər dildə): "instada danışaq?", "Telegrama keçək", "WhatsApp-a yaz",
+      "ig-dən yazışaq", "nömrəni ver", "numaranı ver", "напиши в телеграм",
+      "let's talk on Instagram", "add me on Snapchat", "schreib mir auf WhatsApp".
+      Bunlar AÇIQ cəhddir → confidence 0.90+.
+
+   B) AŞAĞI ƏMİNLİK (confidence 0.55 - 0.75) — DOLAYI / ZƏİF siqnal:
+      Göndərən birbaşa "keçək" demir, amma xarici platformaya / əlaqə məlumatına
+      MARAQ göstərir, yoxlayır, sual verir. Köçürmə niyyəti var ola bilər, amma açıq deyil.
+      Nümunələr (hər dildə): "instada varsan?", "instan var?", "instada adın nədir?",
+      "Telegramın var?", "do you have Instagram?", "what's your insta?",
+      "есть инстаграм?", "instagramın var mı?".
+      Bunlar köçürmə MARAĞIDIR amma açıq təklif deyil → confidence 0.55-0.75.
+
+   Hər iki halda da flagged=true və category="off_platform" qaytar — fərq YALNIZ
+   confidence rəqəmindədir. Confidence-i düzgün təyin et: açıq təklif = yüksək,
+   dolayı maraq = aşağı.
+
+   ÇOX VACİB — bunlar flaq DEYİL (flagged=false):
+   • Konkret xarici platforma adı OLMAYAN ümumi ifadələr: "burda yaz", "ora yaz",
+     "başqa yerdə danışaq", "sonra yazaram" — heç bir xarici platforma göstərmir. FLAQ ETMƏ.
+   • Xarici platforma adının sadəcə söhbət mövzusu kimi çəkilməsi: "TikTok-da gülməli
+     video gördüm", "ig-də onun şəklini gördüm". FLAQ ETMƏ.
 
 5. "harassment" — Davamlı təcavüz, sistematik təhqir, alçaltma, qorxutma, stalking davranışı. Tək bir kobud söz deyil — təcavüzkar nümunə.
 
