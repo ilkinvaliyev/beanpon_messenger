@@ -246,15 +246,29 @@ func (q *ModerationQueue) notifyOffPlatformSender(senderID uint) bool {
 	return delivered
 }
 
-// sendBackendWarning — Laravel-in mövcud notification endpoint-inə
-// xəbərdarlıq push-u göndərir.
+// sendBackendWarning — Laravel-in MÖVCUD push notification endpoint-inə
+// xəbərdarlıq göndərir.
+//
+// VACİB: burada websocket/hub.go-dakı işləyən `sendPushNotification` ilə
+// TAM EYNİ endpoint, header və payload formatından istifadə olunur:
+//   - endpoint:  BackendUrl + "/notification/new-message"
+//   - header:    x-api-key: CloudToken
+//   - payload:   {receiver_id, sender_id, message}
+//
+// Beləliklə Laravel tərəfində YENİ endpoint yazmağa ehtiyac yoxdur — artıq
+// işləyən infrastruktur istifadə olunur.
+//
+// Xəbərdarlıq mesajı YAZAN adama getməlidir, ona görə:
+//
+//	receiver_id = targetUserID (mesajı yazan/off-platform cəhd edən şəxs)
+//	sender_id   = targetUserID (sistem xəbərdarlığıdır; mənbə = elə özüdür)
 func (q *ModerationQueue) sendBackendWarning(targetUserID uint, text string) bool {
-	url := q.cfg.BackendUrl + "/notification/moderation-warning"
+	url := q.cfg.BackendUrl + "/notification/new-message"
 
+	// new-message endpoint-inin gözlədiyi format — hub.go ilə eyni.
 	payload := map[string]interface{}{
-		"receiver_id": targetUserID, // bildiriş bu istifadəçiyə (göndərənə) gedir
-		"type":        "moderation_warning",
-		"category":    models.CategoryOffPlatform,
+		"receiver_id": targetUserID, // bildiriş GÖNDƏRƏNƏ (yazana) gedir
+		"sender_id":   targetUserID, // sistem xəbərdarlığı
 		"message":     text,
 	}
 
@@ -279,7 +293,7 @@ func (q *ModerationQueue) sendBackendWarning(targetUserID uint, text string) boo
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+	if resp.StatusCode == http.StatusOK {
 		log.Printf("✅ Moderasiya xəbərdarlığı göndərənə çatdırıldı (user %d)", targetUserID)
 		return true
 	}
