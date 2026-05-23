@@ -61,6 +61,39 @@ var CategorySeverity = map[string]string{
 	CategorySelfHarm:     SeverityHigh,
 }
 
+// CategoryMinConfidence — bir kateqoriyada loga/notification-a çevrilmək üçün
+// AI-nın minimum əminlik dərəcəsi. AI flaq etsə belə, confidence bu həddən
+// aşağıdırsa nəticə ATILIR — gərəksiz xəbərdarlıq yaranmasın deyə.
+//
+// Məntiq:
+//   - csae / anti_state — kritik. Aşağı eşik (0.50): şübhə varsa belə tut.
+//   - threat / self_harm / illegal_goods — ciddi. Orta eşik (0.65).
+//   - harassment / scam / off_platform — yüngül, yanlış-pozitiv ehtimalı
+//     yüksək. Yuxarı eşik (0.75): yalnız AI əmin olduqda flaq.
+var CategoryMinConfidence = map[string]float64{
+	CategoryCSAE:         0.50,
+	CategoryAntiState:    0.50,
+	CategoryThreat:       0.65,
+	CategorySelfHarm:     0.65,
+	CategoryIllegalGoods: 0.65,
+	CategoryHarassment:   0.75,
+	CategoryScam:         0.75,
+	CategoryOffPlatform:  0.75,
+}
+
+// DefaultMinConfidence — kateqoriya xəritədə yoxdursa istifadə olunan eşik.
+const DefaultMinConfidence = 0.70
+
+// MeetsConfidenceThreshold — verilən kateqoriya və əminlik nəticəni
+// log/notification-a çevirməyə kifayət edirmi?
+func MeetsConfidenceThreshold(category string, confidence float64) bool {
+	threshold, ok := CategoryMinConfidence[category]
+	if !ok {
+		threshold = DefaultMinConfidence
+	}
+	return confidence >= threshold
+}
+
 // ValidCategories — AI-dan gələn dəyəri yoxlamaq üçün set.
 var ValidCategories = map[string]bool{
 	CategoryThreat:       true,

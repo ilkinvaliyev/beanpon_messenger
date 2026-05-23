@@ -105,7 +105,15 @@ YALNIZ aşağıdakı kateqoriyalardan biri AÇIQ şəkildə mövcuddursa flaq et
 
 3. "anti_state" — Dövlət əleyhinə zorakı fəaliyyət təşkili, terror aktına çağırış və ya təbliğat, zorakı çevriliş planlaması. Sadəcə hökuməti tənqid etmək VƏ YA siyasi narazılıq bu kateqoriya DEYİL.
 
-4. "off_platform" — Göndərən söhbəti bu tətbiqdən kənar başqa platformaya keçirməyə çalışır: Instagram, TikTok, Facebook, Telegram, WhatsApp, Snapchat, Signal, Discord, nömrə paylaşma və s. Məsələn "Instagramda yaz", "nömrəni ver", "Telegram-a keç", istifadəçi adı/link paylaşma. Adi platforma adının çəkilməsi (məs. "TikTok-da gülməli video gördüm") flaq DEYİL — yalnız söhbəti köçürmə CƏHDİ flaqdır.
+4. "off_platform" — Göndərən söhbəti bu tətbiqdən KƏNAR, BAŞQA bir platformaya keçirməyə çalışır. Bu kateqoriya YALNIZ konkret xarici platforma adı VƏ ya əlaqə vasitəsi açıq şəkildə qeyd olunduqda flaq edilir:
+   • Xarici platformalar: Instagram, TikTok, Facebook, Telegram, WhatsApp, Snapchat, Signal, Discord, Viber və s.
+   • Əlaqə vasitəsi paylaşma: telefon nömrəsi, e-mail, başqa platformada istifadəçi adı və ya profil linki.
+   Flaq edilən nümunələr: "Instagramda yaz", "nömrəni ver", "Telegram-a keçək", "@username-imə yaz", profil linki göndərmə.
+
+   ÇOX VACİB — bunlar flaq DEYİL:
+   • Konkret xarici platforma adı OLMAYAN ümumi/qeyri-müəyyən ifadələr: "burda yaz", "bura yazın", "ora yaz", "başqa yerdə danışaq", "sonra yazaram" — bunlar heç bir xarici platformanı göstərmir, ola bilər bu tətbiqin başqa hissəsini (şərh, qrup, profil) və ya sadəcə gələcək vaxtı nəzərdə tutur. FLAQ ETMƏ.
+   • Xarici platforma adının sadəcə söhbət mövzusu kimi çəkilməsi: "TikTok-da gülməli video gördüm", "Instagram-da onun şəklini gördüm". FLAQ ETMƏ.
+   Yalnız söhbəti köçürmək üçün AÇIQ CƏHD + KONKRET xarici platforma/əlaqə vasitəsi birlikdə olduqda flaq et.
 
 5. "harassment" — Davamlı təcavüz, sistematik təhqir, alçaltma, qorxutma, stalking davranışı. Tək bir kobud söz deyil — təcavüzkar nümunə.
 

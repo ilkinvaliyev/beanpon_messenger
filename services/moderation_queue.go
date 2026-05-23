@@ -150,6 +150,15 @@ func (q *ModerationQueue) process(job ModerationJob) {
 		return
 	}
 
+	// Confidence eşiyi — AI flaq etsə belə, əminliyi kateqoriyanın minimum
+	// həddindən aşağıdırsa nəticəni AT. Bu, "hər yazıda xəbərdarlıq" problemini
+	// həll edir: yalnız AI kifayət qədər əmin olduqda log/notification yaranır.
+	if !models.MeetsConfidenceThreshold(result.Category, result.Confidence) {
+		log.Printf("ℹ️ Moderasiya: msg %s flaq edildi (%s) amma confidence aşağı (%.2f) — atıldı",
+			job.MessageID, result.Category, result.Confidence)
+		return
+	}
+
 	// ── Risk aşkar edildi → log yarat ──────────────────────────────────────
 	severity := models.CategorySeverity[result.Category]
 	if severity == "" {
@@ -208,37 +217,42 @@ func (q *ModerationQueue) process(job ModerationJob) {
 		job.MessageID, result.Category, severity, result.Confidence, job.SenderID)
 }
 
+// Laravel notifications.php-dəki tərcümə açarları. Push mətni hər cihazın
+// öz dilinə (fcm_tokens.lang) görə Laravel tərəfində render olunur —
+// messenger yalnız bu açarları göndərir.
+const (
+	offPlatformTitleKey = "off_platform_warning.title"
+	offPlatformBodyKey  = "off_platform_warning.body"
+)
+
 // notifyOffPlatformSender — off_platform kateqoriyasında MESAJI GÖNDƏRƏN
 // adama xəbərdarlıq bildirişi göndərir (qarşı tərəfə YOX).
 //
 // İki kanaldan istifadə edir:
 //  1. Real-time WebSocket eventi (istifadəçi onlayndırsa dərhal görür).
-//  2. Laravel backend-in push notification endpoint-i — beanpon-un
-//     mövcud /notification/new-message infrastrukturu ilə eyni pattern.
-//     Burada göndərən = receiver_id (yəni bildiriş GÖNDƏRƏNƏ gedir).
+//  2. Laravel backend-in push notification endpoint-i (FcmController).
 //
 // Qaytarır: ən azı bir kanal uğurlu olubsa true.
 func (q *ModerationQueue) notifyOffPlatformSender(senderID uint) bool {
-	const warnText = "Söhbətləri başqa platformalara köçürmək Piokio icma qaydalarına ziddir. " +
-		"Təhlükəsizliyiniz üçün yazışmalarınızı tətbiq daxilində saxlayın."
-
 	delivered := false
 
-	// 1) Real-time WebSocket xəbərdarlığı
+	// 1) Real-time WebSocket xəbərdarlığı.
+	//    Messenger tərəfində dil tərcümə infrastrukturu yoxdur, ona görə
+	//    WS eventi sadə Azərbaycanca mətn daşıyır; client istəsə öz
+	//    tərəfində lokallaşdıra bilər (category sahəsi ilə).
 	if q.notifier != nil {
 		q.notifier.SendToUser(senderID, "moderation_warning", map[string]interface{}{
 			"category": models.CategoryOffPlatform,
-			"title":    "Diqqət",
-			"message":  warnText,
+			"title":    "Xəbərdarlıq",
+			"message":  "Başqa platformaya keçmək təklifi qadağandır.",
 			"sent_at":  time.Now().UTC(),
 		})
 		delivered = true
 	}
 
-	// 2) Laravel push notification — beanpon backend-ə.
-	//    receiver_id = senderID → bildiriş mesajı YAZAN adama gedir.
+	// 2) Laravel push notification — çoxdilli (key əsaslı).
 	if q.cfg != nil && q.cfg.BackendUrl != "" && q.cfg.CloudToken != "" {
-		if q.sendBackendWarning(senderID, warnText) {
+		if q.sendBackendWarning(senderID) {
 			delivered = true
 		}
 	}
@@ -246,30 +260,38 @@ func (q *ModerationQueue) notifyOffPlatformSender(senderID uint) bool {
 	return delivered
 }
 
-// sendBackendWarning — Laravel-in MÖVCUD push notification endpoint-inə
-// xəbərdarlıq göndərir.
+// sendBackendWarning — Laravel-in FcmController push endpoint-inə
+// çoxdilli moderasiya xəbərdarlığı göndərir.
 //
-// VACİB: burada websocket/hub.go-dakı işləyən `sendPushNotification` ilə
-// TAM EYNİ endpoint, header və payload formatından istifadə olunur:
-//   - endpoint:  BackendUrl + "/notification/new-message"
-//   - header:    x-api-key: CloudToken
-//   - payload:   {receiver_id, sender_id, message}
+// Endpoint:  BackendUrl + "/notification/send"
+// Header:    x-api-key: CloudToken   (token.verify middleware)
+// Payload:   {user_id, title_key, body_key, data}
 //
-// Beləliklə Laravel tərəfində YENİ endpoint yazmağa ehtiyac yoxdur — artıq
-// işləyən infrastruktur istifadə olunur.
+// QEYD endpoint yolu haqqında: Laravel-də həm `new-message`, həm `send`
+// route-u `cloud/cloud.php` faylındadır və o fayl `prefix('api')` +
+// `prefix('cloud')` + `prefix('notification')` ilə qoşulur. Yəni tam yol
+// `/api/cloud/notification/send`-dir. websocket/hub.go-dakı işləyən
+// `sendPushNotification` `BackendUrl + "/notification/new-message"`
+// yazdığına görə `BackendUrl` artıq `/api/cloud` hissəsini ehtiva edir —
+// ona görə burada da yalnız `/notification/send` əlavə edilir (eyni
+// pattern, eyni baza).
 //
-// Xəbərdarlıq mesajı YAZAN adama getməlidir, ona görə:
+// title_key/body_key — lang/{dil}/notifications.php-dəki açarlar. Laravel
+// (FcmService) hər cihazın dilinə görə mətni avtomatik render edir, ona
+// görə messenger tərəfində tərcümə saxlamağa ehtiyac yoxdur.
 //
-//	receiver_id = targetUserID (mesajı yazan/off-platform cəhd edən şəxs)
-//	sender_id   = targetUserID (sistem xəbərdarlığıdır; mənbə = elə özüdür)
-func (q *ModerationQueue) sendBackendWarning(targetUserID uint, text string) bool {
-	url := q.cfg.BackendUrl + "/notification/new-message"
+// Bildiriş mesajı YAZAN adama getməlidir: user_id = targetUserID.
+func (q *ModerationQueue) sendBackendWarning(targetUserID uint) bool {
+	url := q.cfg.BackendUrl + "/notification/send"
 
-	// new-message endpoint-inin gözlədiyi format — hub.go ilə eyni.
 	payload := map[string]interface{}{
-		"receiver_id": targetUserID, // bildiriş GÖNDƏRƏNƏ (yazana) gedir
-		"sender_id":   targetUserID, // sistem xəbərdarlığı
-		"message":     text,
+		"user_id":   targetUserID, // bildiriş off-platform cəhd edən şəxsə gedir
+		"title_key": offPlatformTitleKey,
+		"body_key":  offPlatformBodyKey,
+		"data": map[string]interface{}{
+			"type":     "moderation_warning",
+			"category": models.CategoryOffPlatform,
+		},
 	}
 
 	body, err := json.Marshal(payload)
