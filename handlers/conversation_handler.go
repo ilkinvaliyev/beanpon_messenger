@@ -230,6 +230,14 @@ func (h *ConversationHandler) GetOrCreateConversationWithPermission(senderID, re
 				return nil, false, "", nil
 			}
 
+			// 🚫 ACTIONS KONTROLÜ: spam_bans'ta aktiv qeydi olan istifadəçinin
+			// `actions` sütunu mesaj göndərməni qadağan edirsə (NULL, ya da
+			// массivində "message" varsa) — YENİ conversation başlada bilməz.
+			// Eyni səssiz shadow-ban davranışı (canSend=false, errorMsg="").
+			if models.IsMessagingBannedByActions(database.DB, senderID) {
+				return nil, false, "", nil
+			}
+
 			var receiverSettings models.UserSettings
 			if err := database.DB.Where("user_id = ?", receiverID).First(&receiverSettings).Error; err == nil {
 				if receiverSettings.MessageRequests == "ONLY_VERIFIED" {

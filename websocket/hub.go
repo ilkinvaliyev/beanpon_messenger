@@ -1439,6 +1439,13 @@ func (h *Hub) getOrCreateConversationWithPermission(senderID, receiverID uint) (
 			return nil, false, spamSilentReason, nil
 		}
 
+		// 🚫 ACTIONS KONTROLÜ: spam_bans aktiv qeydinin `actions` sütunu
+		// mesaj göndərməni qadağan edirsə (NULL, ya da массivində "message"
+		// varsa) — YENİ conversation başlada bilməz. Eyni səssiz shadow-ban.
+		if models.IsMessagingBannedByActions(h.db, senderID) {
+			return nil, false, spamSilentReason, nil
+		}
+
 		// Conversation yok, yeni oluştur
 		newConv := models.Conversation{
 			User1ID: senderID,
