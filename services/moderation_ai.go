@@ -17,15 +17,15 @@ import (
 // ─────────────────────────────────────────────────────────────────────────────
 // AI Moderasiya Servisi
 //
-// Mesajları OpenAI gpt-4o-mini modeli ilə analiz edir. Heç bir üçüncü tərəf
+// Mesajları OpenAI gpt-4o modeli ilə analiz edir. Heç bir üçüncü tərəf
 // SDK istifadə olunmur — standart net/http ilə Chat Completions API çağırılır
 // (vendor qovluğuna yeni asılılıq əlavə etmədən).
 //
-// Model seçimi: gpt-4o-mini
-//   • Çox ucuz (~$0.15 / 1M input token) — yüksək mesaj həcmi üçün ideal.
-//   • Sürətli — orta gecikmə < 1 saniyə.
+// Model seçimi: gpt-4o
+//   • Niyanslı təsnifat — "burda yaz" (flaq deyil) vs "Instagramda yaz"
+//     (off_platform) kimi incə fərqləri dəqiq tutur.
 //   • JSON mode (response_format) dəstəyi — strukturlu, etibarlı cavab.
-//   • Təlimatları yaxşı izləyir — moderasiya kimi təsnifat işləri üçün kifayət.
+//   • gpt-4o-mini-dən bahadır, amma moderasiya qərarlarında daha dəqiqdir.
 //
 // Bu servis YALNIZ queue worker tərəfindən çağırılır — istifadəçi sorğusunu
 // HEÇ VAXT bloklamır.
@@ -33,7 +33,9 @@ import (
 
 const (
 	openAIChatURL = "https://api.openai.com/v1/chat/completions"
-	openAIModel   = "gpt-4o-mini"
+	// Model: gpt-4o — niyanslı moderasiya qərarlarını (məs. "burda yaz" vs
+	// "Instagramda yaz" fərqi) gpt-4o-mini-dən daha dəqiq tutur.
+	openAIModel = "gpt-4o"
 )
 
 // ModerationResult — AI analizinin nəticəsi.
