@@ -33,9 +33,7 @@ import (
 
 const (
 	openAIChatURL = "https://api.openai.com/v1/chat/completions"
-	// Model: gpt-4o — niyanslı moderasiya qərarlarını (məs. "burda yaz" vs
-	// "Instagramda yaz" fərqi) gpt-4o-mini-dən daha dəqiq tutur.
-	openAIModel = "gpt-4o"
+	openAIModel   = "gpt-4o-mini"
 )
 
 // ModerationResult — AI analizinin nəticəsi.
