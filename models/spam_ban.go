@@ -81,18 +81,31 @@ func IsMessagingBannedByActions(db *gorm.DB, userID uint) bool {
 		return false
 	}
 
+	// 🔍 DİAQNOSTİK LOG — funksiyanın nə oxuduğunu və nə qərar verdiyini göstərir.
+	log.Printf("🔍 IsMessagingBannedByActions: user_id=%d, aktiv spam_bans sətir sayı=%d", userID, len(rows))
+
 	// Aktiv qeyd yoxdur — mesaj gedə bilər.
 	if len(rows) == 0 {
+		log.Printf("🔍 IsMessagingBannedByActions: user_id=%d → aktiv ban YOX → mesaj GEDƏ BİLƏR", userID)
 		return false
 	}
 
 	// İstifadəçinin birdən çox aktiv qeydi ola bilər — hər hansı biri
 	// mesajı qadağan edirsə, qadağandır.
-	for _, r := range rows {
-		if actionsBlocksMessaging(r.Actions) {
+	for i, r := range rows {
+		actionsVal := "<nil>"
+		if r.Actions != nil {
+			actionsVal = *r.Actions
+		}
+		blocks := actionsBlocksMessaging(r.Actions)
+		log.Printf("🔍 IsMessagingBannedByActions: user_id=%d, sətir[%d] actions=%q → blokla=%v",
+			userID, i, actionsVal, blocks)
+		if blocks {
+			log.Printf("🚫 IsMessagingBannedByActions: user_id=%d → mesaj BLOKLANDI", userID)
 			return true
 		}
 	}
+	log.Printf("🔍 IsMessagingBannedByActions: user_id=%d → heç bir sətir mesajı bloklamır → mesaj GEDƏ BİLƏR", userID)
 	return false
 }
 
