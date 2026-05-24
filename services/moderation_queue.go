@@ -178,17 +178,20 @@ func (q *ModerationQueue) process(job ModerationJob) {
 	// ver" kimi) — bu sətirə qədər çatıb table-yə LOG kimi yazılır, amma
 	// notification GETMİR. Fərqi models.ShouldNotify təyin edir.
 	senderNotified := false
-	if result.Category == models.CategoryOffPlatform {
-		if models.ShouldNotify(result.Category, result.Confidence) {
-			if q.notifyOffPlatformSender(job.SenderID) {
-				senderNotified = true
-				actions = append(actions, "notify_sender")
-			}
-		} else {
-			log.Printf("ℹ️ Moderasiya: msg %s off_platform amma əminlik aşağı (%.2f) — table-yə yazıldı, notification göndərilmədi",
-				job.MessageID, result.Confidence)
-		}
-	}
+	// NOTIFICATION MÜVƏQQƏTİ SÖNDÜRÜLDÜ — off_platform aşkarlanması yenə də
+	// message_moderation_logs table-yə LOG kimi yazılır, amma göndərənə
+	// xəbərdarlıq notification-ı GETMİR.
+	// if result.Category == models.CategoryOffPlatform {
+	// 	if models.ShouldNotify(result.Category, result.Confidence) {
+	// 		if q.notifyOffPlatformSender(job.SenderID) {
+	// 			senderNotified = true
+	// 			actions = append(actions, "notify_sender")
+	// 		}
+	// 	} else {
+	// 		log.Printf("ℹ️ Moderasiya: msg %s off_platform amma əminlik aşağı (%.2f) — table-yə yazıldı, notification göndərilmədi",
+	// 			job.MessageID, result.Confidence)
+	// 	}
+	// }
 
 	// Kritik kateqoriyalar üçün gələcəkdə admin-alert genişləndirilə bilər.
 	if severity == models.SeverityCritical {
