@@ -1050,6 +1050,55 @@ func (h *LiveHub) ForceEndRoom(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Room force ended."})
 }
 
+// ClearChat — Filament admin paneldən çağrılır.
+// Canlı otaqdakı bütün chat tarixçəsini hər kəs üçün təmizləyir.
+// Host-un WS üzərindən göndərdiyi "clear_chat" event-i ilə eyni nəticə:
+// mesajlar DB-dən hard-delete edilir və otağa "chat_cleared" yayılır,
+// client-lər yerli state-lərini sıfırlayır.
+func (h *LiveHub) ClearChat(c *gin.Context) {
+	roomIDStr := c.Param("room_id")
+	roomID, err := strconv.ParseUint(roomIDStr, 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid room_id"})
+		return
+	}
+
+	// Hard-delete bütün otaq mesajlarını. (live_room_messages
+	// modelində `deleted_at` sütunu yoxdur — soft-delete dəstəyi
+	// də yoxdur, ona görə hard delete edirik.) Sinxron icra edirik
+	// ki, cavab qaytarmadan əvvəl DB həqiqətən təmizlənsin.
+	if err := database.DB.Exec(
+		"DELETE FROM live_room_messages WHERE live_room_id = ?",
+		uint(roomID),
+	).Error; err != nil {
+		log.Printf("❌ ClearChat DB silmə xətası (room %d): %v", roomID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to clear chat"})
+		return
+	}
+
+	clearPayload, _ := json.Marshal(map[string]interface{}{
+		"type":    "chat_cleared",
+		"room_id": uint(roomID),
+		"data": map[string]interface{}{
+			"cleared_by": 0, // 0 = admin/Filament (host SenderID deyil)
+		},
+	})
+
+	h.mu.RLock()
+	roomClients, ok := h.rooms[uint(roomID)]
+	if ok {
+		for _, client := range roomClients {
+			select {
+			case client.Send <- clearPayload:
+			default:
+			}
+		}
+	}
+	h.mu.RUnlock()
+
+	c.JSON(http.StatusOK, gin.H{"message": "Live room chat cleared."})
+}
+
 // KickUser — Filament admin paneldən çağrılır.
 // İstifadəçini canlı otaqdan çıxarır və bütün otağa "kicked_from_live" yayır.
 func (h *LiveHub) KickUser(c *gin.Context) {
