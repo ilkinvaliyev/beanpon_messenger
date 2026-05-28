@@ -4,7 +4,6 @@ import (
 	"beanpon_messenger/database"
 	"beanpon_messenger/models"
 	"errors"
-	"log"
 	"net/http"
 	"strconv"
 	"time"
@@ -223,33 +222,12 @@ func (h *ConversationHandler) GetOrCreateConversationWithPermission(senderID, re
 	// Conversation yoksa yeni conversation için verified kontrolü
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			// 🔍 DIAGNOSTIC: yeni conversation block-una girdik. Bu log
-			// production-da spam check-in çağırıldığını görünər şəkildə
-			// təsdiq edir. Bu log ÇIXMIRSA — kod bu block-a heç girmir
-			// (yəni ya conversation artıq mövcuddur, ya fərqli DB-dir).
-			log.Printf("🔍 YENİ CONVERSATION block-u: sender_id=%d, receiver_id=%d → spam check başlayır", senderID, receiverID)
-
-			// 🚫 SPAM KONTROLÜ: spam_bans'ta kaydı olan (deleted_at IS NULL)
-			// kullanıcı YENİ conversation başlatamaz. Sessizce başarısız olur —
-			// kullanıcıya hata gösterilmez (canSend=false, errorMsg=""),
-			// conversation oluşturulmaz.
-			banned := models.IsMessagingBanned(database.DB, senderID)
-			log.Printf("🔍 IsMessagingBanned(sender_id=%d) = %v", senderID, banned)
-			if banned {
-				log.Printf("🚫 YENİ CONVERSATION BLOKLANDI (IsMessagingBanned): sender_id=%d → mesaj GETMƏYƏCƏK, conversation YARANMAYACAQ", senderID)
-				return nil, false, "", nil
-			}
-
-			// 🚫 ACTIONS KONTROLÜ: spam_bans'ta aktiv qeydi olan istifadəçinin
-			// `actions` sütunu mesaj göndərməni qadağan edirsə (NULL, ya da
-			// массivində "message" varsa) — YENİ conversation başlada bilməz.
-			// Eyni səssiz shadow-ban davranışı (canSend=false, errorMsg="").
-			bannedByActions := models.IsMessagingBannedByActions(database.DB, senderID)
-			log.Printf("🔍 IsMessagingBannedByActions(sender_id=%d) = %v", senderID, bannedByActions)
-			if bannedByActions {
-				log.Printf("🚫 YENİ CONVERSATION BLOKLANDI (IsMessagingBannedByActions): sender_id=%d → mesaj GETMƏYƏCƏK, conversation YARANMAYACAQ", senderID)
-				return nil, false, "", nil
-			}
+			// NOT: Spam (`spam_bans`) yoxlaması artıq burada DEYİL.
+			// MessageHandler.SendMessage handler-in ən başında, conversation
+			// lookup-dan əvvəl global shadow-ban guard işləyir. Beləliklə
+			// spam istifadəçi nə yeni söhbət başlada bilir, nə də mövcud
+			// söhbətdə davam edə bilir. Bu blok yalnız verified/follow kimi
+			// qarşı tərəfin tənzimləmələrini yoxlayır.
 
 			var receiverSettings models.UserSettings
 			if err := database.DB.Where("user_id = ?", receiverID).First(&receiverSettings).Error; err == nil {

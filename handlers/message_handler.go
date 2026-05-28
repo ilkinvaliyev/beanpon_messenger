@@ -99,6 +99,42 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 		return
 	}
 
+	// 🚫 SPAM SHADOW-BAN — GLOBAL (yeni VƏ mövcud conversation üçün).
+	//
+	// `spam_bans` cədvəlində aktiv (deleted_at IS NULL) qeydi olan istifadəçi
+	// HİÇBİR söhbətdə mesaj göndərə bilməz — nə yeni söhbət başlada bilər,
+	// nə də mövcud söhbətdə davam edə bilər. Bu, ConversationHandler-dəki
+	// köhnə yoxlamadan fərqli olaraq, conversation lookup-dan ƏVVƏL,
+	// handler-in ən başında işləyir, beləliklə hər iki ssenarini bağlayır.
+	//
+	// Davranış: shadow-ban
+	//   • Göndərənə 201 sahte response qaytarılır (uydurma UUID ilə)
+	//   • DB-yə YAZILMIR
+	//   • WebSocket ilə qarşı tərəfə YAYILMIR
+	//   • Push notification GETMİR
+	//   • Moderasiya queue-ya QOYULMUR
+	//   • Conversation yaradılmır / yenilənmir
+	// Yəni spam istifadəçi göz qabağında "mesaj getdi" görür, amma sistemdə
+	// heç bir iz qalmır.
+	if models.IsMessagingBanned(database.DB, senderID.(uint)) ||
+		models.IsMessagingBannedByActions(database.DB, senderID.(uint)) {
+		log.Printf("🚫 SPAM SHADOW-BAN: sender_id=%d → receiver_id=%d mesajı bloklandı (DB yazılmadı, WS yayılmadı, push yox)",
+			senderID.(uint), req.ReceiverID)
+		c.JSON(http.StatusCreated, gin.H{
+			"message": "Mesaj başarıyla gönderildi",
+			"data": gin.H{
+				"id":          uuid.New().String(),
+				"sender_id":   senderID.(uint),
+				"receiver_id": req.ReceiverID,
+				"text":        req.Text,
+				"read":        false,
+				"created_at":  time.Now().UTC(),
+				"is_online":   h.wsHub.IsUserOnline(req.ReceiverID),
+			},
+		})
+		return
+	}
+
 	wsHubForConv := h.wsHub.(wsHubForConversation)
 
 	// Conversation kontrolü - mesaj gönderebilir mi?
