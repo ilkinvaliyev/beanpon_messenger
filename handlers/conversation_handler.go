@@ -4,6 +4,7 @@ import (
 	"beanpon_messenger/database"
 	"beanpon_messenger/models"
 	"errors"
+	"log"
 	"net/http"
 	"strconv"
 	"time"
@@ -222,11 +223,20 @@ func (h *ConversationHandler) GetOrCreateConversationWithPermission(senderID, re
 	// Conversation yoksa yeni conversation için verified kontrolü
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
+			// 🔍 DIAGNOSTIC: yeni conversation block-una girdik. Bu log
+			// production-da spam check-in çağırıldığını görünər şəkildə
+			// təsdiq edir. Bu log ÇIXMIRSA — kod bu block-a heç girmir
+			// (yəni ya conversation artıq mövcuddur, ya fərqli DB-dir).
+			log.Printf("🔍 YENİ CONVERSATION block-u: sender_id=%d, receiver_id=%d → spam check başlayır", senderID, receiverID)
+
 			// 🚫 SPAM KONTROLÜ: spam_bans'ta kaydı olan (deleted_at IS NULL)
 			// kullanıcı YENİ conversation başlatamaz. Sessizce başarısız olur —
 			// kullanıcıya hata gösterilmez (canSend=false, errorMsg=""),
 			// conversation oluşturulmaz.
-			if models.IsMessagingBanned(database.DB, senderID) {
+			banned := models.IsMessagingBanned(database.DB, senderID)
+			log.Printf("🔍 IsMessagingBanned(sender_id=%d) = %v", senderID, banned)
+			if banned {
+				log.Printf("🚫 YENİ CONVERSATION BLOKLANDI (IsMessagingBanned): sender_id=%d → mesaj GETMƏYƏCƏK, conversation YARANMAYACAQ", senderID)
 				return nil, false, "", nil
 			}
 
@@ -234,7 +244,10 @@ func (h *ConversationHandler) GetOrCreateConversationWithPermission(senderID, re
 			// `actions` sütunu mesaj göndərməni qadağan edirsə (NULL, ya da
 			// массivində "message" varsa) — YENİ conversation başlada bilməz.
 			// Eyni səssiz shadow-ban davranışı (canSend=false, errorMsg="").
-			if models.IsMessagingBannedByActions(database.DB, senderID) {
+			bannedByActions := models.IsMessagingBannedByActions(database.DB, senderID)
+			log.Printf("🔍 IsMessagingBannedByActions(sender_id=%d) = %v", senderID, bannedByActions)
+			if bannedByActions {
+				log.Printf("🚫 YENİ CONVERSATION BLOKLANDI (IsMessagingBannedByActions): sender_id=%d → mesaj GETMƏYƏCƏK, conversation YARANMAYACAQ", senderID)
 				return nil, false, "", nil
 			}
 
