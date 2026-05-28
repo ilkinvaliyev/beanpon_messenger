@@ -1,6 +1,7 @@
 package main
 
 import (
+	"beanpon_messenger/cache"
 	"beanpon_messenger/config"
 	"beanpon_messenger/database"
 	"beanpon_messenger/handlers"
@@ -25,6 +26,11 @@ func main() {
 
 	// GORM ile PostgreSQL'e bağlan
 	database.InitializePostgreSQL(cfg)
+
+	// 🚀 Redis cache layer — Laravel ilə paylaşılan spam_ban statusu üçün.
+	// REDIS_ENABLED=false olsa belə tətbiq işləyir (cache çağırışları no-op
+	// olur, DB-yə düşür). Boot dayanmır.
+	cache.Initialize(cfg.Cache)
 
 	// ✅ Conversations cədvəlinə reaksiya sütunlarını əlavə et (idempotent)
 	if err := database.DB.Exec(`

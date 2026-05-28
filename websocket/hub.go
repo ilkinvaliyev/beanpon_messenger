@@ -744,13 +744,12 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 
 		// 🚫 SPAM SHADOW-BAN — GLOBAL (yeni VƏ mövcud conversation üçün).
 		//
-		// WebSocket vasitəsilə göndərilən mesajlar üçün də eyni guard işləyir.
-		// `spam_bans`-da aktiv qeydi olan istifadəçi heç bir söhbətdə (nə yeni,
-		// nə mövcud) mesaj göndərə bilməz. Mesaj DB-yə yazılmaz, qarşı tərəfə
-		// WS ilə yayılmaz, push getmir, moderasiya queue-ya qoyulmur.
-		// Göndərənə də heç bir error mesajı qaytarılmır — tam shadow-ban.
-		if models.IsMessagingBanned(c.Hub.db, c.UserID) ||
-			models.IsMessagingBannedByActions(c.Hub.db, c.UserID) {
+		// Yalnız `actions` sütununa baxılır:
+		//   • actions = NULL                  → mesaj BLOKLANIR
+		//   • actions-da "message" var        → mesaj BLOKLANIR
+		//   • actions = ["post","story"] və s.→ mesaj GEDƏ BİLƏR (mesaja təsir yox)
+		// REST handler ilə eyni davranış.
+		if models.IsMessagingBannedByActions(c.Hub.db, c.UserID) {
 			log.Printf("🚫 SPAM SHADOW-BAN (WS): sender_id=%d → receiver_id=%d mesajı bloklandı (DB yazılmadı, WS yayılmadı)",
 				c.UserID, receiverID)
 			return

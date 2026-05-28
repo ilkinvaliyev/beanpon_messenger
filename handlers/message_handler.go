@@ -101,11 +101,16 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 
 	// 🚫 SPAM SHADOW-BAN — GLOBAL (yeni VƏ mövcud conversation üçün).
 	//
-	// `spam_bans` cədvəlində aktiv (deleted_at IS NULL) qeydi olan istifadəçi
-	// HİÇBİR söhbətdə mesaj göndərə bilməz — nə yeni söhbət başlada bilər,
-	// nə də mövcud söhbətdə davam edə bilər. Bu, ConversationHandler-dəki
-	// köhnə yoxlamadan fərqli olaraq, conversation lookup-dan ƏVVƏL,
-	// handler-in ən başında işləyir, beləliklə hər iki ssenarini bağlayır.
+	// Yalnız `actions` sütununa baxılır. Qaydalar:
+	//   • actions = NULL                          → mesaj BLOKLANIR
+	//   • actions massivində "message" var        → mesaj BLOKLANIR
+	//   • actions = ["post"], ["story"], ["post","story"] və s. (message yox)
+	//                                              → mesaj GEDƏ BİLƏR
+	//   • spam_bans-da aktiv qeyd yoxdursa        → mesaj GEDƏ BİLƏR
+	//
+	// Yəni admin "post" və ya "story" üçün ban verə bilər, bu mesajlaşmaya
+	// təsir etmir. Yalnız `actions`-da açıq şəkildə "message" varsa və ya
+	// `actions` heç təyin olunmayıbsa (NULL — "hamısı") mesajlaşma dayanır.
 	//
 	// Davranış: shadow-ban
 	//   • Göndərənə 201 sahte response qaytarılır (uydurma UUID ilə)
@@ -114,10 +119,7 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 	//   • Push notification GETMİR
 	//   • Moderasiya queue-ya QOYULMUR
 	//   • Conversation yaradılmır / yenilənmir
-	// Yəni spam istifadəçi göz qabağında "mesaj getdi" görür, amma sistemdə
-	// heç bir iz qalmır.
-	if models.IsMessagingBanned(database.DB, senderID.(uint)) ||
-		models.IsMessagingBannedByActions(database.DB, senderID.(uint)) {
+	if models.IsMessagingBannedByActions(database.DB, senderID.(uint)) {
 		log.Printf("🚫 SPAM SHADOW-BAN: sender_id=%d → receiver_id=%d mesajı bloklandı (DB yazılmadı, WS yayılmadı, push yox)",
 			senderID.(uint), req.ReceiverID)
 		c.JSON(http.StatusCreated, gin.H{

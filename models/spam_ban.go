@@ -1,11 +1,15 @@
 package models
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"strings"
+	"time"
 
 	"gorm.io/gorm"
+
+	"beanpon_messenger/cache"
 )
 
 // IsMessagingBanned kullanıcının spam ban'ı olup olmadığını kontrol eder.
@@ -28,6 +32,15 @@ import (
 //
 // spam_bans tablosu beanpon (site) tarafından yönetilir; messenger yalnızca okur.
 func IsMessagingBanned(db *gorm.DB, userID uint) bool {
+	// CACHE-FIRST: paylaşılan spam_ban payload-undan "Banned" sahəsini oxu.
+	// Cache HIT-də DB-yə getmirik.
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	if payload, hit, _ := cache.GetSpamBan(ctx, userID); hit && payload != nil {
+		return payload.Banned
+	}
+
+	// DB FALLBACK
 	var count int64
 	err := db.Table("spam_bans").
 		Where("user_id = ?", userID).
@@ -65,6 +78,19 @@ func IsMessagingBanned(db *gorm.DB, userID uint) bool {
 // alınır, fail-open: false qaytarırıq ki, müvəqqəti problem bütün yeni
 // söhbətləri kilitləməsin.
 func IsMessagingBannedByActions(db *gorm.DB, userID uint) bool {
+	// ──── CACHE-FIRST LOOKUP ──────────────────────────────────────
+	// Laravel SharedSpamBanCache::forget() banUser/unbanUser zamanı bu key-i
+	// yenidən yazır. Buradakı oxuma demək olar ki, hər zaman HIT olur —
+	// yalnız ban statusu yeni dəyişib və TTL-də olmayan halda DB-yə düşür.
+	// Cache disable və ya circuit open olduqda da DB fallback-i tetiklenir.
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	if payload, hit, _ := cache.GetSpamBan(ctx, userID); hit && payload != nil {
+		return payload.BlocksMessaging()
+	}
+
+	// ──── DB FALLBACK ─────────────────────────────────────────────
 	type spamRow struct {
 		Actions *string `gorm:"column:actions"`
 	}
@@ -81,32 +107,55 @@ func IsMessagingBannedByActions(db *gorm.DB, userID uint) bool {
 		return false
 	}
 
-	// 🔍 DİAQNOSTİK LOG — funksiyanın nə oxuduğunu və nə qərar verdiyini göstərir.
-	log.Printf("🔍 IsMessagingBannedByActions: user_id=%d, aktiv spam_bans sətir sayı=%d", userID, len(rows))
-
-	// Aktiv qeyd yoxdur — mesaj gedə bilər.
+	// Aktiv qeyd yoxdur — mesaj gedə bilər. Cache-ə "banned:false" yaz ki,
+	// növbəti oxuma da HIT olsun.
 	if len(rows) == 0 {
-		log.Printf("🔍 IsMessagingBannedByActions: user_id=%d → aktiv ban YOX → mesaj GEDƏ BİLƏR", userID)
+		writeSpamBanCache(userID, cache.SpamBanPayload{Banned: false})
 		return false
 	}
 
 	// İstifadəçinin birdən çox aktiv qeydi ola bilər — hər hansı biri
 	// mesajı qadağan edirsə, qadağandır.
-	for i, r := range rows {
-		actionsVal := "<nil>"
-		if r.Actions != nil {
-			actionsVal = *r.Actions
-		}
-		blocks := actionsBlocksMessaging(r.Actions)
-		log.Printf("🔍 IsMessagingBannedByActions: user_id=%d, sətir[%d] actions=%q → blokla=%v",
-			userID, i, actionsVal, blocks)
-		if blocks {
-			log.Printf("🚫 IsMessagingBannedByActions: user_id=%d → mesaj BLOKLANDI", userID)
-			return true
+	blocked := false
+	// Cache üçün təmsilçi payload — birdən çox satır varsa hər hansı birini
+	// götürürük (mesajı bloklayanı üstün tut). Laravel-in yazdığı payload
+	// kanonik versiyadır; bu sadəcə fallback warm-cache-dir.
+	cachePayload := cache.SpamBanPayload{Banned: true, Actions: nil}
+	for _, r := range rows {
+		if actionsBlocksMessaging(r.Actions) {
+			blocked = true
+			// Bloklayan satır üçün actions sahəsini cache-ə yaz (NULL ola bilər).
+			if r.Actions != nil {
+				var arr []string
+				if err := json.Unmarshal([]byte(*r.Actions), &arr); err == nil {
+					cachePayload.Actions = &arr
+				}
+			}
+			break
 		}
 	}
-	log.Printf("🔍 IsMessagingBannedByActions: user_id=%d → heç bir sətir mesajı bloklamır → mesaj GEDƏ BİLƏR", userID)
-	return false
+	if !blocked && len(rows) > 0 {
+		// Heç bir satır bloklamır — amma aktiv qeyd var (məs. yalnız "post" banlı).
+		// Cache-ə actions massivinin birini yaz (qaytarış BlocksMessaging false olsun).
+		if rows[0].Actions != nil {
+			var arr []string
+			if err := json.Unmarshal([]byte(*rows[0].Actions), &arr); err == nil {
+				cachePayload.Actions = &arr
+			}
+		}
+	}
+	writeSpamBanCache(userID, cachePayload)
+	return blocked
+}
+
+// writeSpamBanCache — DB-dən oxunan nəticəni paylaşılan Redis-ə yazır.
+// Yazma uğursuz olsa belə əsas funksionallıq pozulmur — bu sadəcə optimizasiyadır.
+func writeSpamBanCache(userID uint, payload cache.SpamBanPayload) {
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	if err := cache.SetSpamBan(ctx, userID, payload); err != nil {
+		log.Printf("writeSpamBanCache: SetSpamBan uğursuz (user_id=%d): %v", userID, err)
+	}
 }
 
 // actionsBlocksMessaging — `actions` JSON dəyəri mesaj göndərməni
