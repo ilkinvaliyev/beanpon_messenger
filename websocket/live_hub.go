@@ -812,6 +812,44 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		}
 		h.mu.RUnlock()
 
+	// Push-to-talk (anlıq mikrofon): audience istifadəçi mic düyməsini
+	// basıb-tutanda `active:true`, buraxanda `active:false` göndərir.
+	// Server bunu sadəcə bütün iştirakçılara ötürür — digər client-lər
+	// bu istifadəçini grid-ə qoymur, yalnız səsini eşidir. Rol DƏYİŞMİR.
+	case "ptt_change":
+		var pttData map[string]interface{}
+		if err := json.Unmarshal(event.Data, &pttData); err != nil {
+			log.Printf("❌ ptt_change data parse hatası: %v", err)
+			return
+		}
+		pttActive, _ := pttData["active"].(bool)
+
+		// Shadow ban: live_spam istifadəçisinin PTT-si başqalarına yayılmasın.
+		h.mu.RLock()
+		pttSender, pttSenderExists := roomClients[event.SenderID]
+		h.mu.RUnlock()
+		if pttSenderExists && pttSender.LiveSpam {
+			return
+		}
+
+		pttPayload, _ := json.Marshal(map[string]interface{}{
+			"type":    "ptt_change",
+			"room_id": event.RoomID,
+			"data": map[string]interface{}{
+				"user_id": event.SenderID,
+				"active":  pttActive,
+			},
+		})
+
+		h.mu.RLock()
+		for _, c := range roomClients {
+			select {
+			case c.Send <- pttPayload:
+			default:
+			}
+		}
+		h.mu.RUnlock()
+
 	case "transfer_host":
 		h.mu.RLock()
 		sender, exists := roomClients[event.SenderID]
