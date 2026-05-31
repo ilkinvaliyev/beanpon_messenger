@@ -119,7 +119,9 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 	//   • Push notification GETMİR
 	//   • Moderasiya queue-ya QOYULMUR
 	//   • Conversation yaradılmır / yenilənmir
-	if models.IsMessagingBannedByActions(database.DB, senderID.(uint)) {
+	// 🟢 İSTİSNA: receiver_id == 1 olan istifadəçiyə HƏMİŞƏ mesaj gedə bilər.
+	// Spam/shadow-ban olsa belə bu istifadəçiyə yazmağa icazə verilir.
+	if req.ReceiverID != 1 && models.IsMessagingBannedByActions(database.DB, senderID.(uint)) {
 		log.Printf("🚫 SPAM SHADOW-BAN: sender_id=%d → receiver_id=%d mesajı bloklandı (DB yazılmadı, WS yayılmadı, push yox)",
 			senderID.(uint), req.ReceiverID)
 		c.JSON(http.StatusCreated, gin.H{
@@ -140,8 +142,13 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 	wsHubForConv := h.wsHub.(wsHubForConversation)
 
 	// Conversation kontrolü - mesaj gönderebilir mi?
+	// 🟢 İSTİSNA: receiver_id == 1 olduqda heç bir göndərmə yoxlaması (spam,
+	// verified, follow, limit, restricted) tətbiq olunmur — mesaj həmişə gedir.
 	conversationHandler := NewConversationHandler(wsHubForConv, h.encryptionService)
-	canSend, reason, err := conversationHandler.CanSendMessage(senderID.(uint), req.ReceiverID)
+	canSend, reason, err := true, "", error(nil)
+	if req.ReceiverID != 1 {
+		canSend, reason, err = conversationHandler.CanSendMessage(senderID.(uint), req.ReceiverID)
+	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Conversation kontrolü başarısız"})
 		return
