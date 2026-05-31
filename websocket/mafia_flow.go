@@ -2,8 +2,45 @@ package websocket
 
 import (
 	"encoding/json"
+	"fmt"
 	"time"
 )
+
+// mafiaHandlePlayerLeft — oyunçu canlıdan çıxanda/çıxarılanda çağrılır.
+// Oyunçu sağ idisə → ölü sayılır, kartı hamıya açılır, chat-a yazılır,
+// qalib yenidən yoxlanır. Oyun yoxdursa / artıq ölübsə heç nə etmir.
+func (h *LiveHub) mafiaHandlePlayerLeft(roomID, userID uint) {
+	game, ok := loadGame(roomID)
+	if !ok || game.Phase == MafiaPhaseEnded {
+		return
+	}
+	p := game.findPlayer(userID)
+	if p == nil || !p.Alive {
+		return
+	}
+
+	p.Alive = false
+	uid := p.UserID
+	game.History = append(game.History, MafiaHistoryEntry{
+		Day:     game.DayNumber,
+		Event:   "left",
+		UserID:  &uid,
+		Role:    p.Role,
+		Message: fmt.Sprintf("%s oyundan çıxdı. (%s)", p.Name, roleLabel(p.Role)),
+	})
+
+	// Don çıxıbsa → yenidən təyin et
+	g := game
+	g.reassignDonIfNeeded()
+
+	saveGame(roomID, game)
+	h.broadcastPublicState(roomID, game, "mafia_phase_changed")
+	h.systemChatMessage(roomID,
+		fmt.Sprintf("%s oyundan çıxdı — rolu: %s", p.Name, roleLabel(p.Role)))
+
+	// Qalib yarandısa oyunu bitir
+	h.checkAndFinish(roomID, game)
+}
 
 // ============================================================================
 // MAFIA OYUNU — Axın idarəsi (mərhələ keçidi + WS event handle + timer)

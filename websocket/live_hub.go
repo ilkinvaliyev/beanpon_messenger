@@ -174,6 +174,12 @@ func (h *LiveHub) Run() {
 				})
 			}
 
+			// MAFIA: oyunçu canlıdan çıxsa/çıxarılsa → oyunda ölü sayılır,
+			// kartı hamıya açılır. (Host çıxanda oyun onsuz da bitir — aşağıda.)
+			if client.Role != "host" {
+				go h.mafiaHandlePlayerLeft(client.RoomID, client.UserID)
+			}
+
 			if client.Role == "host" {
 				err := database.DB.Exec("UPDATE live_rooms SET status = 'ended', ended_at = NOW() WHERE id = ?", client.RoomID).Error
 				if err != nil {
