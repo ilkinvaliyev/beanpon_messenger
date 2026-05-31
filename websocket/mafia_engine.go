@@ -27,7 +27,8 @@ const (
 
 // Oyunçu sayı limitləri
 const (
-	MafiaMinPlayers = 5
+	// MafiaMinPlayers = 5 // ← normal limit (test bitəndə bunu aç, aşağıdakını sil)
+	MafiaMinPlayers = 3 // TEST: müvəqqəti 3 nəfər
 	MafiaMaxPlayers = 12
 )
 
@@ -57,6 +58,9 @@ type roleCount struct {
 
 // rolesByPlayerCount — oyunçu sayına görə sabit rol cədvəli (plan §1).
 var rolesByPlayerCount = map[int]roleCount{
+	// TEST: 3-4 nəfər (müvəqqəti). Normal limit 5 olanda bunları silə bilərsən.
+	3:  {mafia: 1, don: 0, detective: 1, citizen: 1},
+	4:  {mafia: 1, don: 0, detective: 1, citizen: 2},
 	5:  {mafia: 1, don: 0, detective: 1, citizen: 3},
 	6:  {mafia: 1, don: 0, detective: 1, citizen: 4},
 	7:  {mafia: 1, don: 1, detective: 1, citizen: 4},
