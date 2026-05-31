@@ -62,8 +62,13 @@ func (h *LiveHub) advancePhase(roomID uint) {
 	switch game.Phase {
 
 	case MafiaPhaseIntro:
-		// Kart mərhələsi bitdi → gecəyə keç
-		h.enterNight(roomID, game)
+		// Tanışlıq bitdi → ƏVVƏLCƏ GÜNDÜZ (müzakirə + səsvermə), gecə YOX.
+		// Mafialar artıq bir-birini tanıdı; oyun gündüz müzakirə ilə başlayır,
+		// ilk gecə yalnız ilk gündüzün səsverməsindən sonra gəlir.
+		if game.DayNumber == 0 {
+			game.DayNumber = 1
+		}
+		h.enterDay(roomID, game)
 
 	case MafiaPhaseNight:
 		// Gecə bitdi → hərəkətləri hesabla, sabahı elan et
@@ -300,7 +305,11 @@ func (h *LiveHub) handleMafiaEvent(event *LiveMessageEvent) {
 		h.broadcastPublicState(event.RoomID, game, "mafia_phase_changed")
 		// Hamı hazırsa erkən gecəyə keç
 		if game.allReady() {
-			h.enterNight(event.RoomID, game)
+			// Tanışlıqdan sonra ƏVVƏLCƏ gündüz (gecə yox).
+			if game.DayNumber == 0 {
+				game.DayNumber = 1
+			}
+			h.enterDay(event.RoomID, game)
 		}
 
 	case "mafia_night_action":
