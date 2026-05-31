@@ -235,14 +235,42 @@ func (h *LiveHub) StartMafia(c *gin.Context) {
 	})
 }
 
+// roleImages — mafia_roles table-ından key→image_path xəritəsini oxuyur
+// və S3 tam URL-ə çevirir (PrependS3URL). Şəkil yoxdursa key buraxılır.
+func roleImages() map[string]string {
+	var rows []struct {
+		Key       string
+		ImagePath *string
+	}
+	database.DB.
+		Table("mafia_roles").
+		Select("key, image_path").
+		Where("is_active = ?", true).
+		Scan(&rows)
+
+	out := make(map[string]string, len(rows))
+	for _, r := range rows {
+		if r.ImagePath == nil || *r.ImagePath == "" {
+			continue
+		}
+		if full := utils.PrependS3URL(r.ImagePath); full != nil {
+			out[r.Key] = *full
+		}
+	}
+	return out
+}
+
 // sendRoleAssignments — hər oyunçuya öz kartını fərdi göndərir.
 // Mafialara komanda yoldaşları da bildirilir (plan §3).
 func (h *LiveHub) sendRoleAssignments(roomID uint, g *MafiaGame) {
+	images := roleImages()
+
 	for _, p := range g.Players {
 		payloadMap := map[string]interface{}{
 			"role":        p.Role,
 			"role_label":  roleLabel(p.Role),
 			"description": roleDescription(p.Role),
+			"image":       images[p.Role], // kart şəkli (S3 URL, yoxdursa "")
 		}
 		// Mafiadırsa komanda yoldaşlarını da göndər
 		if g.isMafiaRole(p.Role) {
@@ -256,6 +284,7 @@ func (h *LiveHub) sendRoleAssignments(roomID uint, g *MafiaGame) {
 					"user_id": tp.UserID,
 					"name":    tp.Name,
 					"role":    tp.Role, // mafia / don
+					"image":   images[tp.Role],
 				})
 			}
 			payloadMap["mafia_team"] = teammates
