@@ -126,6 +126,22 @@ func (h *LiveHub) Run() {
 				}(client.RoomID, client.UserID, joinData)
 			}
 
+			// MAFIA: otaqda aktiv mafia oyunu varsa, qoşulan adama fərdi
+			// maskalanmış vəziyyəti göndər (reconnect olan oyunçu öz rolunu,
+			// yeni girən izləyici yalnız ümumi şəkli görür — buildPublicState).
+			go func(roomID, userID uint) {
+				if game, ok := loadGame(roomID); ok && game.Phase != MafiaPhaseEnded {
+					state := game.buildPublicState(userID)
+					data, _ := json.Marshal(state)
+					payload, _ := json.Marshal(map[string]interface{}{
+						"type":    "mafia_state_sync",
+						"room_id": roomID,
+						"data":    json.RawMessage(data),
+					})
+					h.sendToUser(roomID, userID, payload)
+				}
+			}(client.RoomID, client.UserID)
+
 		case client := <-h.Unregister:
 			h.mu.Lock()
 			var count int
@@ -271,6 +287,14 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 	h.mu.RUnlock()
 
 	if !ok {
+		return
+	}
+
+	// MAFIA: oyun event-ləri ayrı handler-ə yönləndirilir (mafia_flow.go).
+	switch event.Type {
+	case "mafia_ready", "mafia_night_action", "mafia_vote",
+		"mafia_defense_end", "mafia_cancel":
+		h.handleMafiaEvent(event)
 		return
 	}
 
@@ -516,6 +540,27 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		// danışma istəyi HEÇ KİMƏ göndərilmir (host da daxil olmaqla).
 		// Sender-ə də heç bir cavab dönmür — sanki istək çıxıb gedib.
 		if senderExists && senderClient.LiveSpam {
+			return
+		}
+
+		// MAFIA: oyun davam edərkən kimsə yayıma qoşula bilməz. Host-a
+		// təklif GETMİR; istəyən adama "oyun davam edir" bildirişi gedir.
+		if game, ok := loadGame(event.RoomID); ok && game.Phase != MafiaPhaseEnded {
+			denyData, _ := json.Marshal(map[string]interface{}{
+				"reason": "Hazırda mafia oyunu davam edir, qoşula bilməzsiniz.",
+				"code":   "MAFIA_IN_PROGRESS",
+			})
+			denyPayload, _ := json.Marshal(map[string]interface{}{
+				"type":    "broadcast_request_denied",
+				"room_id": event.RoomID,
+				"data":    json.RawMessage(denyData),
+			})
+			if senderExists {
+				select {
+				case senderClient.Send <- denyPayload:
+				default:
+				}
+			}
 			return
 		}
 

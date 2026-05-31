@@ -75,6 +75,7 @@ func main() {
 	// 2. YENİ SİSTEM: Canlı Yayın Odaları (Live) Hub'ı
 	liveHub := websocket.NewLiveHub()
 	go liveHub.Run()
+	go liveHub.RunMafiaTimer() // Mafia oyunu mərhələ taymeri
 
 	// 3. RAVE Hub'ı
 	raveHub := websocket.NewRaveHub()
@@ -182,6 +183,7 @@ func main() {
 		api.GET("/live-rooms/:room_id/messages", liveHub.GetLiveRoomMessages)
 		api.GET("/live-rooms/:room_id/reactions", liveHub.GetLiveRoomReactions)
 		api.POST("/live-rooms/:room_id/ask-question", liveHub.AskQuestion)
+		api.POST("/live-rooms/:room_id/mafia/start", liveHub.StartMafia)
 
 		// ── WebSocket bilgi endpoint'leri ────────────────────────────────
 		api.GET("/online-users", func(c *gin.Context) {
