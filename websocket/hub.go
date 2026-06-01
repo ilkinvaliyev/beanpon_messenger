@@ -32,6 +32,22 @@ type Client struct {
 	Send           chan []byte
 	Hub            *Hub
 	ActiveChatWith *uint
+
+	// closeOnce — `Send` kanalının YALNIZ bir dəfə bağlanmasını təmin edir.
+	// Əvvəllər həm registerClient (köhnə bağlantı atılarkən), həm də
+	// unregisterClient eyni kanalı bağlaya bilirdi → ikiqat close panic →
+	// goroutine ölür → həmin user-in soketi səssizcə qopurdu. İndi bütün
+	// close-lar bu Once üzərindən keçir (idempotent).
+	closeOnce sync.Once
+}
+
+// closeSend `Send` kanalını təhlükəsiz (idempotent) bağlayır. İstənilən
+// qədər çağırıla bilər, yalnız ilki effekt edir — beləliklə ikiqat close
+// panic-i mümkün deyil.
+func (c *Client) closeSend() {
+	c.closeOnce.Do(func() {
+		close(c.Send)
+	})
 }
 
 // Hub tüm client'ları yönetir
@@ -134,11 +150,10 @@ func (h *Hub) registerClient(client *Client) {
 
 	if existingClient, exists := h.clients[client.UserID]; exists {
 		delete(h.clients, existingClient.UserID)
-		select {
-		case <-existingClient.Send:
-		default:
-			close(existingClient.Send)
-		}
+		// DİQQƏT: Köhnə client-in `Send` kanalını BURADA bağlamırıq.
+		// Yalnız soketi bağlayırıq — bu, köhnə client-in readPump-ını qıracaq,
+		// o da defer-də `unregister`-ə gedəcək və `Send` orada (closeSend ilə)
+		// təhlükəsiz bağlanacaq. Beləliklə kanal yalnız BİR yerdən bağlanır.
 		existingClient.Conn.Close()
 		//log.Printf("Kullanıcı %d eski bağlantısı temizlendi", client.UserID)
 	}
@@ -164,25 +179,31 @@ func (h *Hub) unregisterClient(client *Client) {
 	h.mutex.Lock()
 	defer h.mutex.Unlock()
 
-	if _, exists := h.clients[client.UserID]; exists {
+	// Identity yoxlaması: map-dəki client məhz BU client-dirmi?
+	// Reconnect zamanı köhnə client soketi bağlanıb gec `unregister`-ə gələ
+	// bilər, amma `clients[UserID]` artıq YENİ client-ə işarə edir. Köhnə
+	// client yeni client-i map-dən silməməli və yeni user-i offline
+	// göstərməməlidir. Yalnız öz `Send` kanalını bağlamalıdır.
+	current, exists := h.clients[client.UserID]
+
+	if exists && current == client {
+		// Bu, hazırkı aktiv client-dir — tam təmizlik.
 		delete(h.clients, client.UserID)
 
 		h.setUserOffline(client.UserID)
 
-		select {
-		case <-client.Send:
-		default:
-			close(client.Send)
-		}
+		client.closeSend()
 
-		err := client.Conn.Close()
-		if err != nil {
-			return
-		}
+		_ = client.Conn.Close()
 		//log.Printf("Kullanıcı %d WebSocket'ten ayrıldı", client.UserID)
 
 		// Kullanıcı offline durumunu diğer kullanıcılara bildir
 		h.broadcastUserStatus(client.UserID, "offline")
+	} else {
+		// Köhnə/əvəz olunmuş client — yeni bağlantıya toxunma, yalnız
+		// öz kanalını və soketini təmizlə.
+		client.closeSend()
+		_ = client.Conn.Close()
 	}
 }
 
