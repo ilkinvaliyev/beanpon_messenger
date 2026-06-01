@@ -795,9 +795,11 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		}
 		h.mu.RUnlock()
 
-	// HOST canlı otaqdakı chat tarixini hər kəs üçün təmizləyir.
-	// Yalnız host icazəlidir. Server tərəfdə də mesajları silirik ki,
-	// sonradan tarixçə endpoint-dən gələn list də təmiz olsun.
+	// HOST canlı otaqdakı chat-i hər kəs üçün təmizləyir.
+	// Yalnız host icazəlidir. Mesajlar DB-dən SİLİNMİR — yalnız
+	// live_rooms.chat_cleared_at = NOW() yazılır. Tarixçə endpoint-i
+	// bu vaxtdan sonrakı mesajları qaytarır, ona görə pull-to-refresh
+	// edənlər də boş chat görür, data isə DB-də qalır.
 	case "clear_chat":
 		h.mu.RLock()
 		sender, exists := roomClients[event.SenderID]
@@ -806,11 +808,9 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 			return
 		}
 
-		// Hard-delete bütün otaq mesajlarını. (live_room_messages
-		// modelində `deleted_at` sütunu yoxdur — soft-delete dəstəyi
-		// də yoxdur, ona görə hard delete edirik.)
+		// Soft-clear: kəsmə nöqtəsini qeyd et (DELETE yox).
 		go database.DB.Exec(
-			"DELETE FROM live_room_messages WHERE live_room_id = ?",
+			"UPDATE live_rooms SET chat_cleared_at = NOW() WHERE id = ?",
 			event.RoomID,
 		)
 
@@ -1140,10 +1140,11 @@ func (h *LiveHub) ForceEndRoom(c *gin.Context) {
 }
 
 // ClearChat — Filament admin paneldən çağrılır.
-// Canlı otaqdakı bütün chat tarixçəsini hər kəs üçün təmizləyir.
+// Canlı otaqdakı chat-i hər kəs üçün təmizləyir.
 // Host-un WS üzərindən göndərdiyi "clear_chat" event-i ilə eyni nəticə:
-// mesajlar DB-dən hard-delete edilir və otağa "chat_cleared" yayılır,
-// client-lər yerli state-lərini sıfırlayır.
+// mesajlar DB-dən SİLİNMİR — yalnız live_rooms.chat_cleared_at = NOW()
+// yazılır və otağa "chat_cleared" yayılır. Client-lər yerli state-lərini
+// sıfırlayır, tarixçə endpoint-i isə bu vaxtdan sonrakı mesajları qaytarır.
 func (h *LiveHub) ClearChat(c *gin.Context) {
 	roomIDStr := c.Param("room_id")
 	roomID, err := strconv.ParseUint(roomIDStr, 10, 32)
@@ -1152,15 +1153,13 @@ func (h *LiveHub) ClearChat(c *gin.Context) {
 		return
 	}
 
-	// Hard-delete bütün otaq mesajlarını. (live_room_messages
-	// modelində `deleted_at` sütunu yoxdur — soft-delete dəstəyi
-	// də yoxdur, ona görə hard delete edirik.) Sinxron icra edirik
-	// ki, cavab qaytarmadan əvvəl DB həqiqətən təmizlənsin.
+	// Soft-clear: kəsmə nöqtəsini qeyd et (DELETE yox). Sinxron icra
+	// edirik ki, cavab qaytarmadan əvvəl DB həqiqətən yenilənsin.
 	if err := database.DB.Exec(
-		"DELETE FROM live_room_messages WHERE live_room_id = ?",
+		"UPDATE live_rooms SET chat_cleared_at = NOW() WHERE id = ?",
 		uint(roomID),
 	).Error; err != nil {
-		log.Printf("❌ ClearChat DB silmə xətası (room %d): %v", roomID, err)
+		log.Printf("❌ ClearChat DB yeniləmə xətası (room %d): %v", roomID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to clear chat"})
 		return
 	}

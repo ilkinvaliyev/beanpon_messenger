@@ -278,6 +278,15 @@ func (h *LiveHub) GetLiveRoomMessages(c *gin.Context) {
 		Joins("LEFT JOIN users ru ON ru.id = rm.sender_id").
 		Joins("LEFT JOIN profiles rp ON rp.user_id = rm.sender_id").
 		Where("lm.live_room_id = ?", roomID).
+		// Soft-clear kəsmə nöqtəsi: host/admin chat-i təmizləyibsə,
+		// yalnız o vaxtdan SONRA yaranan mesajları qaytar. Mesajlar
+		// DB-də qalır, sadəcə tarixçədə görünmür (chat_cleared_at NULL
+		// olduqda bu şərt heç bir mesajı filtrləmir).
+		Where(`(
+			SELECT lr.chat_cleared_at FROM live_rooms lr WHERE lr.id = lm.live_room_id
+		) IS NULL OR lm.created_at > (
+			SELECT lr.chat_cleared_at FROM live_rooms lr WHERE lr.id = lm.live_room_id
+		)`).
 		Order("lm.id DESC").
 		Limit(limit + 1)
 

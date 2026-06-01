@@ -21,9 +21,14 @@ type LiveRoom struct {
 	MaxBroadcasters    int              `json:"max_broadcasters"`
 	PeakViewerCount    int              `json:"peak_viewer_count"`
 	ActiveGame         *json.RawMessage `json:"active_game" gorm:"type:jsonb"`
-	CreatedAt          time.Time        `json:"created_at"`
-	UpdatedAt          time.Time        `json:"updated_at"`
-	DeletedAt          *time.Time       `json:"deleted_at" gorm:"index"`
+	// ChatClearedAt — host/admin "clear chat" edəndə bu vaxta NOW() yazılır.
+	// Mesajlar DB-dən SİLİNMİR; tarixçə endpoint-i yalnız bu vaxtdan SONRA
+	// yaranan mesajları qaytarır, beləliklə chat hər kəs üçün boş görünür,
+	// data isə DB-də qalır.
+	ChatClearedAt *time.Time `json:"chat_cleared_at" gorm:"column:chat_cleared_at"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
+	DeletedAt     *time.Time `json:"deleted_at" gorm:"index"`
 }
 
 // LiveRoomParticipant - Laravel'deki 'live_room_participants' (Sadece okuma amaçlı)
