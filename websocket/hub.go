@@ -999,6 +999,19 @@ func (h *Hub) sendPushNotification(senderID, receiverID uint, message, msgType s
 			return
 		}
 
+		// Receiver söhbəti arxivləyibsə push GÖNDƏRMƏ (arxiv = səssiz,
+		// Telegram davranışı). Per-user: yalnız receiver-in öz arxiv bayrağı.
+		var isArchivedByReceiver bool
+		if conversation.User1ID == receiverID {
+			isArchivedByReceiver = conversation.User1Archived
+		} else {
+			isArchivedByReceiver = conversation.User2Archived
+		}
+		if isArchivedByReceiver {
+			log.Printf("🗄️ Kullanıcı %d konuşmayı arşivlemiş, notification gönderilmiyor", receiverID)
+			return
+		}
+
 		// Receiver'ın mute durumunu kontrol et
 		var isMuted bool
 		var mutedUntil *time.Time

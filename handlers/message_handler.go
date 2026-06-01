@@ -690,6 +690,9 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 	}
 
 	statusFilter := c.DefaultQuery("status", "all")
+	// archived filtri: "false" (default) → yalnız arxivlənməmiş; "true" →
+	// yalnız arxivlənmiş; "all" → hamısı. Per-user (cari istifadəçiyə görə).
+	archivedFilter := c.DefaultQuery("archived", "false")
 
 	var conversations []struct {
 		OtherUserID        uint      `json:"other_user_id"`
@@ -705,6 +708,7 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 		MyMessageCount     *int  `json:"my_message_count"`
 		OtherMessageCount  *int  `json:"other_message_count"`
 		AmIMuted           *bool `json:"am_i_muted"`
+		AmIArchived        *bool `json:"am_i_archived"`
 		AmIRestricted      *bool `json:"am_i_restricted"`
 		IsOtherMuted       *bool `json:"is_other_muted"`
 		IsOtherRestricted  *bool `json:"is_other_restricted"`
@@ -753,6 +757,34 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 		extraParams = append(extraParams, userID)
 	} else if statusFilter == "restricted" {
 		statusWhereClause = "AND COALESCE(conv.status, 'active') = 'restricted'"
+	}
+
+	// Arxiv filtri (per-user). Default: arxivlənmişləri GİZLƏT.
+	//   archived=false → yalnız arxivlənməmiş (əsas siyahı)
+	//   archived=true  → yalnız arxivlənmiş (arxiv səhifəsi)
+	//   archived=all   → filtr yox
+	// QEYD: Bu WHERE statusWhereClause-dan SONRA query-yə əlavə olunur, ona görə
+	// parametrləri də extraParams-a status parametrindən SONRA əlavə edirik.
+	archivedWhereClause := ""
+	if archivedFilter == "true" {
+		archivedWhereClause = `
+        AND CASE
+            WHEN conv.user1_id = ? THEN conv.user1_archived
+            WHEN conv.user2_id = ? THEN conv.user2_archived
+            ELSE FALSE
+        END = TRUE
+    `
+		extraParams = append(extraParams, userID, userID)
+	} else if archivedFilter != "all" {
+		// default "false": arxivlənmişləri çıxar
+		archivedWhereClause = `
+        AND COALESCE(CASE
+            WHEN conv.user1_id = ? THEN conv.user1_archived
+            WHEN conv.user2_id = ? THEN conv.user2_archived
+            ELSE FALSE
+        END, FALSE) = FALSE
+    `
+		extraParams = append(extraParams, userID, userID)
 	}
 
 	query := `
@@ -812,12 +844,17 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
             WHEN conv.user2_id = ? THEN conv.user1_message_count
             ELSE NULL
         END as other_message_count,
-        CASE 
+        CASE
             WHEN conv.user1_id = ? THEN conv.user1_muted
             WHEN conv.user2_id = ? THEN conv.user2_muted
             ELSE NULL
         END as am_i_muted,
-        CASE 
+        CASE
+            WHEN conv.user1_id = ? THEN conv.user1_archived
+            WHEN conv.user2_id = ? THEN conv.user2_archived
+            ELSE FALSE
+        END as am_i_archived,
+        CASE
             WHEN conv.user1_id = ? THEN conv.user1_restricted
             WHEN conv.user2_id = ? THEN conv.user2_restricted
             ELSE NULL
@@ -851,15 +888,23 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
     LEFT JOIN conversations conv ON (
         (conv.user1_id = LEAST(?, lm.other_user_id) AND conv.user2_id = GREATEST(?, lm.other_user_id))
     )
-    WHERE lm.rn = 1 ` + statusWhereClause + `
+    WHERE lm.rn = 1 ` + statusWhereClause + archivedWhereClause + `
     ORDER BY lm.created_at DESC
     `
 
+	// Parametr sırası query-dəki ? ardıcıllığı ilə DƏQİQ uyğundur:
+	//  CTE: other_user_id CASE, is_from_me, PARTITION, WHERE sender, WHERE recv,
+	//       is_deleted CASE  → 6
+	//  unread_counts WHERE receiver  → 1 (cəmi yuxarıda 5+1 kimi yazılıb)
+	//  SELECT CASE-lər: my_count(2), other_count(2), am_i_muted(2),
+	//       am_i_archived(2) ← YENİ, am_i_restricted(2), is_other_muted(2),
+	//       is_other_restricted(2) = 14
+	//  JOIN LEAST/GREATEST: 2
 	params := []interface{}{
 		userID, userID, userID, userID, userID,
 		userID,
 		userID,
-		userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID,
+		userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID,
 		userID, userID,
 	}
 	params = append(params, extraParams...)
@@ -903,6 +948,7 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 		}
 
 		isMutedByMe := conv.AmIMuted != nil && *conv.AmIMuted
+		isArchivedByMe := conv.AmIArchived != nil && *conv.AmIArchived
 
 		// Əgər tərəflərdən biri digərini bloklayıbsa, online statusu göstərilməməlidir.
 		isOnline := false
@@ -928,12 +974,14 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 			"unread_count":             conv.UnreadCount,
 			"is_online":                isOnline,
 			"conversation_active":      conversationActive,
+			"is_archived_by_me":        isArchivedByMe,
 			"conversation": gin.H{
 				"id":                   conv.ConversationID,
 				"status":               conv.ConversationStatus,
 				"type":                 conversationType,
 				"can_send_message":     canSendMessage,
 				"is_muted_by_me":       isMutedByMe,
+				"is_archived_by_me":    isArchivedByMe,
 				"am_i_restricted":      conv.AmIRestricted,
 				"is_other_muted":       conv.IsOtherMuted,
 				"is_other_restricted":  conv.IsOtherRestricted,

@@ -488,6 +488,89 @@ func (h *ConversationHandler) UnmuteConversation(c *gin.Context) {
 	})
 }
 
+// ArchiveConversation — söhbəti istifadəçinin ÖZÜ üçün arxivləyir (per-user).
+// A arxivləyəndə yalnız A-nın siyahısından gizlənir; B-də normal qalır.
+// Arxivləyən şəxsə gələn mesajlar üçün push notification göndərilmir
+// (bax: message_handler / hub.go push məntiqi).
+func (h *ConversationHandler) ArchiveConversation(c *gin.Context) {
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	otherUserID, err := strconv.ParseUint(c.Param("other_user_id"), 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz kullanıcı ID"})
+		return
+	}
+
+	conversation, err := h.GetOrCreateConversation(userID.(uint), uint(otherUserID))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Conversation bulunamadı"})
+		return
+	}
+
+	now := time.Now()
+	if userID.(uint) == conversation.User1ID {
+		conversation.User1Archived = true
+		conversation.User1ArchivedAt = &now
+	} else {
+		conversation.User2Archived = true
+		conversation.User2ArchivedAt = &now
+	}
+
+	if err := database.DB.Save(conversation).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Arşivleme başarısız"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":     "Konuşma arşivlendi",
+		"archived":    true,
+		"archived_at": now,
+	})
+}
+
+// UnarchiveConversation — söhbəti arxivdən çıxarır (per-user).
+func (h *ConversationHandler) UnarchiveConversation(c *gin.Context) {
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	otherUserID, err := strconv.ParseUint(c.Param("other_user_id"), 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz kullanıcı ID"})
+		return
+	}
+
+	conversation, err := h.GetOrCreateConversation(userID.(uint), uint(otherUserID))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Conversation bulunamadı"})
+		return
+	}
+
+	if userID.(uint) == conversation.User1ID {
+		conversation.User1Archived = false
+		conversation.User1ArchivedAt = nil
+	} else {
+		conversation.User2Archived = false
+		conversation.User2ArchivedAt = nil
+	}
+
+	if err := database.DB.Save(conversation).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Arşivden çıkarma başarısız"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":  "Konuşma arşivden çıkarıldı",
+		"archived": false,
+	})
+}
+
 // GetConversationDetails conversation detaylarını getir
 func (h *ConversationHandler) GetConversationDetails(c *gin.Context) {
 	userID, exists := c.Get("user_id")

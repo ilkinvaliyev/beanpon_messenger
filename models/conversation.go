@@ -31,12 +31,20 @@ type Conversation struct {
 	User2MutedAt         *time.Time `json:"user2_muted_at"`
 	User1MutedUntil      *time.Time `json:"user1_muted_until"`
 	User2MutedUntil      *time.Time `json:"user2_muted_until"`
-	User1Restricted      bool       `json:"user1_restricted" gorm:"default:false"`
-	User2Restricted      bool       `json:"user2_restricted" gorm:"default:false"`
-	RestrictionReason    *string    `json:"restriction_reason" gorm:"type:text"`
-	TotalMessagesCount   int        `json:"total_messages_count" gorm:"default:0"`
-	StatusChangedAt      *time.Time `json:"status_changed_at"`
-	FollowHistory        *string    `json:"follow_history" gorm:"type:jsonb"`
+	// Arxiv — per-user (mute pattern-i ilə eyni). A söhbəti arxivləyəndə
+	// yalnız A-nın siyahısından gizlənir, B-də normal qalır. Üstəlik,
+	// arxivləyən şəxsə (məs. A) gələn mesajlar üçün push notification
+	// göndərilmir (Telegram-ın "arxiv = səssiz" davranışı).
+	User1Archived      bool       `json:"user1_archived" gorm:"default:false"`
+	User2Archived      bool       `json:"user2_archived" gorm:"default:false"`
+	User1ArchivedAt    *time.Time `json:"user1_archived_at"`
+	User2ArchivedAt    *time.Time `json:"user2_archived_at"`
+	User1Restricted    bool       `json:"user1_restricted" gorm:"default:false"`
+	User2Restricted    bool       `json:"user2_restricted" gorm:"default:false"`
+	RestrictionReason  *string    `json:"restriction_reason" gorm:"type:text"`
+	TotalMessagesCount int        `json:"total_messages_count" gorm:"default:0"`
+	StatusChangedAt    *time.Time `json:"status_changed_at"`
+	FollowHistory      *string    `json:"follow_history" gorm:"type:jsonb"`
 
 	// ✅ YENİ: Screenshot Disable
 	User1ScreenshotDisabled   bool       `json:"user1_screenshot_disabled" gorm:"default:false"`

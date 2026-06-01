@@ -44,6 +44,19 @@ func main() {
 		log.Printf("✅ conversations reaction sütunları hazırdır")
 	}
 
+	// ✅ Conversations cədvəlinə arxiv sütunlarını əlavə et (idempotent, per-user)
+	if err := database.DB.Exec(`
+		ALTER TABLE conversations
+		ADD COLUMN IF NOT EXISTS user1_archived BOOLEAN NOT NULL DEFAULT FALSE,
+		ADD COLUMN IF NOT EXISTS user2_archived BOOLEAN NOT NULL DEFAULT FALSE,
+		ADD COLUMN IF NOT EXISTS user1_archived_at TIMESTAMPTZ,
+		ADD COLUMN IF NOT EXISTS user2_archived_at TIMESTAMPTZ
+	`).Error; err != nil {
+		log.Printf("⚠️ conversations arxiv sütunları əlavə edilə bilmədi: %v", err)
+	} else {
+		log.Printf("✅ conversations arxiv sütunları hazırdır")
+	}
+
 	// Servisleri başlat
 	encryptionService := services.NewEncryptionService(cfg.AESKey)
 
@@ -152,6 +165,8 @@ func main() {
 
 		// ── DM: Conversation yönetimi ────────────────────────────────────
 		api.GET("/conversations/:other_user_id/details", conversationHandler.GetConversationDetails)
+		api.POST("/conversations/:other_user_id/archive", conversationHandler.ArchiveConversation)
+		api.POST("/conversations/:other_user_id/unarchive", conversationHandler.UnarchiveConversation)
 		api.POST("/conversations/:other_user_id/mute", conversationHandler.MuteConversation)
 
 		api.POST("/conversations/:other_user_id/unmute", conversationHandler.UnmuteConversation)
