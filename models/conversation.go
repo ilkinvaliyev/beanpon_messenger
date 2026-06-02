@@ -42,10 +42,14 @@ type Conversation struct {
 	// Pin (sabitləmə) — per-user. A pin edəndə yalnız A-nın siyahısında ən
 	// yuxarı gəlir, B-də normal sırada qalır. Bir neçə söhbət pin oluna bilər;
 	// PinnedAt-a görə sıralanır (ən son pin → ən yuxarı).
-	User1Pinned        bool       `json:"user1_pinned" gorm:"default:false"`
-	User2Pinned        bool       `json:"user2_pinned" gorm:"default:false"`
-	User1PinnedAt      *time.Time `json:"user1_pinned_at"`
-	User2PinnedAt      *time.Time `json:"user2_pinned_at"`
+	User1Pinned   bool       `json:"user1_pinned" gorm:"default:false"`
+	User2Pinned   bool       `json:"user2_pinned" gorm:"default:false"`
+	User1PinnedAt *time.Time `json:"user1_pinned_at"`
+	User2PinnedAt *time.Time `json:"user2_pinned_at"`
+	// Nickname (ləqəb) — per-user, birtərəfli. User1Nickname = user1-in qarşı
+	// tərəf (user2) üçün qoyduğu ad (yalnız user1 görür). Boş → əsl ad.
+	User1Nickname      *string    `json:"user1_nickname" gorm:"type:varchar(60)"`
+	User2Nickname      *string    `json:"user2_nickname" gorm:"type:varchar(60)"`
 	User1Restricted    bool       `json:"user1_restricted" gorm:"default:false"`
 	User2Restricted    bool       `json:"user2_restricted" gorm:"default:false"`
 	RestrictionReason  *string    `json:"restriction_reason" gorm:"type:text"`

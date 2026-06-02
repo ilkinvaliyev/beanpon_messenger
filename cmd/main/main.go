@@ -72,6 +72,19 @@ func main() {
 		log.Printf("✅ conversations pin sütunları hazırdır")
 	}
 
+	// ✅ Conversations cədvəlinə nickname (ləqəb) sütunları — per-user,
+	// birtərəfli. user1_nickname = user1-in user2 üçün qoyduğu ad (yalnız
+	// user1 görür). idempotent.
+	if err := database.DB.Exec(`
+		ALTER TABLE conversations
+		ADD COLUMN IF NOT EXISTS user1_nickname VARCHAR(60),
+		ADD COLUMN IF NOT EXISTS user2_nickname VARCHAR(60)
+	`).Error; err != nil {
+		log.Printf("⚠️ conversations nickname sütunları əlavə edilə bilmədi: %v", err)
+	} else {
+		log.Printf("✅ conversations nickname sütunları hazırdır")
+	}
+
 	// Servisleri başlat
 	encryptionService := services.NewEncryptionService(cfg.AESKey)
 
@@ -185,6 +198,8 @@ func main() {
 		api.POST("/conversations/:other_user_id/unarchive", conversationHandler.UnarchiveConversation)
 		api.POST("/conversations/:other_user_id/pin", conversationHandler.PinConversation)
 		api.POST("/conversations/:other_user_id/unpin", conversationHandler.UnpinConversation)
+		api.POST("/conversations/:other_user_id/nickname", conversationHandler.SetNickname)
+		api.DELETE("/conversations/:other_user_id/nickname", conversationHandler.ClearNickname)
 		api.POST("/conversations/:other_user_id/mute", conversationHandler.MuteConversation)
 
 		api.POST("/conversations/:other_user_id/unmute", conversationHandler.UnmuteConversation)

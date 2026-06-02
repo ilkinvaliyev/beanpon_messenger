@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -650,6 +651,102 @@ func (h *ConversationHandler) UnpinConversation(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Konuşma sabitlemeden çıkarıldı",
 		"pinned":  false,
+	})
+}
+
+// SetNickname — istifadəçi qarşı tərəf üçün ləqəb təyin edir (per-user,
+// birtərəfli). YALNIZ təyin edən şəxs bu ləqəbi görür. Body: {"nickname":"..."}.
+// Boş və ya yalnız boşluqdursa → ləqəb təmizlənir (əsl ada qayıdır).
+func (h *ConversationHandler) SetNickname(c *gin.Context) {
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	otherUserID, err := strconv.ParseUint(c.Param("other_user_id"), 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz kullanıcı ID"})
+		return
+	}
+
+	var body struct {
+		Nickname string `json:"nickname"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz istek"})
+		return
+	}
+
+	// Trim + uzunluq limiti (sütun varchar(60)).
+	name := strings.TrimSpace(body.Nickname)
+	if len([]rune(name)) > 60 {
+		name = string([]rune(name)[:60])
+	}
+
+	conversation, err := h.GetOrCreateConversation(userID.(uint), uint(otherUserID))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Conversation bulunamadı"})
+		return
+	}
+
+	// Boşdursa nil (təmizlə), əks halda dəyər.
+	var val *string
+	if name != "" {
+		val = &name
+	}
+	if userID.(uint) == conversation.User1ID {
+		conversation.User1Nickname = val
+	} else {
+		conversation.User2Nickname = val
+	}
+
+	if err := database.DB.Save(conversation).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Takma ad kaydedilemedi"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":  "Takma ad güncellendi",
+		"nickname": val, // null → təmizləndi
+	})
+}
+
+// ClearNickname — ləqəbi silir (əsl ada qaytarır). SetNickname boş body ilə
+// də eyni işi görür; bu ayrıca endpoint rahatlıq üçündür.
+func (h *ConversationHandler) ClearNickname(c *gin.Context) {
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	otherUserID, err := strconv.ParseUint(c.Param("other_user_id"), 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz kullanıcı ID"})
+		return
+	}
+
+	conversation, err := h.GetOrCreateConversation(userID.(uint), uint(otherUserID))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Conversation bulunamadı"})
+		return
+	}
+
+	if userID.(uint) == conversation.User1ID {
+		conversation.User1Nickname = nil
+	} else {
+		conversation.User2Nickname = nil
+	}
+
+	if err := database.DB.Save(conversation).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Takma ad silinemedi"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":  "Takma ad silindi",
+		"nickname": nil,
 	})
 }
 
