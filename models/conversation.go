@@ -48,8 +48,13 @@ type Conversation struct {
 	User2PinnedAt *time.Time `json:"user2_pinned_at"`
 	// Nickname (ləqəb) — per-user, birtərəfli. User1Nickname = user1-in qarşı
 	// tərəf (user2) üçün qoyduğu ad (yalnız user1 görür). Boş → əsl ad.
-	User1Nickname      *string    `json:"user1_nickname" gorm:"type:varchar(60)"`
-	User2Nickname      *string    `json:"user2_nickname" gorm:"type:varchar(60)"`
+	User1Nickname *string `json:"user1_nickname" gorm:"type:varchar(60)"`
+	User2Nickname *string `json:"user2_nickname" gorm:"type:varchar(60)"`
+	// Çat fonu (wallpaper) — per-user, konkret söhbət üçün. User1WallpaperID =
+	// user1-in BU söhbət üçün seçdiyi wallpaper ID-si (Laravel chat_wallpapers).
+	// NULL → qlobal seçim (user_settings), o da NULL-dursa default.
+	User1WallpaperID   *uint      `json:"user1_wallpaper_id"`
+	User2WallpaperID   *uint      `json:"user2_wallpaper_id"`
 	User1Restricted    bool       `json:"user1_restricted" gorm:"default:false"`
 	User2Restricted    bool       `json:"user2_restricted" gorm:"default:false"`
 	RestrictionReason  *string    `json:"restriction_reason" gorm:"type:text"`

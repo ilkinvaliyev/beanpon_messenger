@@ -832,6 +832,7 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 		AmIPinned          *bool      `json:"am_i_pinned"`
 		PinnedAt           *time.Time `json:"pinned_at"`
 		MyNickname         *string    `json:"my_nickname"`
+		MyWallpaperID      *uint      `json:"my_wallpaper_id"`
 		AmIRestricted      *bool      `json:"am_i_restricted"`
 		IsOtherMuted       *bool      `json:"is_other_muted"`
 		IsOtherRestricted  *bool      `json:"is_other_restricted"`
@@ -993,6 +994,11 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
             ELSE NULL
         END as my_nickname,
         CASE
+            WHEN conv.user1_id = ? THEN conv.user1_wallpaper_id
+            WHEN conv.user2_id = ? THEN conv.user2_wallpaper_id
+            ELSE NULL
+        END as my_wallpaper_id,
+        CASE
             WHEN conv.user1_id = ? THEN conv.user1_restricted
             WHEN conv.user2_id = ? THEN conv.user2_restricted
             ELSE NULL
@@ -1049,16 +1055,17 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 	//       am_i_archived(2), am_i_pinned(2) ← YENİ, pinned_at(2) ← YENİ,
 	//       am_i_restricted(2), is_other_muted(2), is_other_restricted(2) = 18
 	//  SELECT CASE-lər: my_count(2), other_count(2), am_i_muted(2),
-	//       am_i_archived(2), am_i_pinned(2), pinned_at(2), my_nickname(2) ← YENİ,
-	//       am_i_restricted(2), is_other_muted(2), is_other_restricted(2) = 20
-	//  CTE(6)+unread(1)+SELECT(20)+JOIN(2) = 29 static
+	//       am_i_archived(2), am_i_pinned(2), pinned_at(2), my_nickname(2),
+	//       my_wallpaper_id(2) ← YENİ, am_i_restricted(2), is_other_muted(2),
+	//       is_other_restricted(2) = 22
+	//  CTE(6)+unread(1)+SELECT(22)+JOIN(2) = 31 static
 	//  (sonra: extraParams = status+archived WHERE)
 	//  ORDER BY: pin CASE(2) + pinned_at CASE(2) = 4
 	params := []interface{}{
 		userID, userID, userID, userID, userID,
 		userID,
 		userID,
-		userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID,
+		userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID,
 		userID, userID,
 	}
 	params = append(params, extraParams...)
@@ -1138,6 +1145,7 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 			"is_pinned_by_me":          isPinnedByMe,
 			"pinned_at":                conv.PinnedAt,
 			"my_nickname":              conv.MyNickname,
+			"my_wallpaper_id":          conv.MyWallpaperID,
 			"conversation": gin.H{
 				"id":                   conv.ConversationID,
 				"status":               conv.ConversationStatus,
@@ -1147,6 +1155,7 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 				"is_archived_by_me":    isArchivedByMe,
 				"is_pinned_by_me":      isPinnedByMe,
 				"my_nickname":          conv.MyNickname,
+				"my_wallpaper_id":      conv.MyWallpaperID,
 				"am_i_restricted":      conv.AmIRestricted,
 				"is_other_muted":       conv.IsOtherMuted,
 				"is_other_restricted":  conv.IsOtherRestricted,

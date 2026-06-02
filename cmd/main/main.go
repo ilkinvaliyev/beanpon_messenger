@@ -85,6 +85,19 @@ func main() {
 		log.Printf("✅ conversations nickname sütunları hazırdır")
 	}
 
+	// ✅ Conversations cədvəlinə per-conversation çat fonu (wallpaper) seçimi.
+	// user1_wallpaper_id = user1-in BU söhbət üçün seçdiyi Laravel wallpaper ID.
+	// NULL → qlobal seçim (user_settings), o da NULL → default. idempotent.
+	if err := database.DB.Exec(`
+		ALTER TABLE conversations
+		ADD COLUMN IF NOT EXISTS user1_wallpaper_id BIGINT,
+		ADD COLUMN IF NOT EXISTS user2_wallpaper_id BIGINT
+	`).Error; err != nil {
+		log.Printf("⚠️ conversations wallpaper sütunları əlavə edilə bilmədi: %v", err)
+	} else {
+		log.Printf("✅ conversations wallpaper sütunları hazırdır")
+	}
+
 	// Servisleri başlat
 	encryptionService := services.NewEncryptionService(cfg.AESKey)
 
@@ -200,6 +213,8 @@ func main() {
 		api.POST("/conversations/:other_user_id/unpin", conversationHandler.UnpinConversation)
 		api.POST("/conversations/:other_user_id/nickname", conversationHandler.SetNickname)
 		api.DELETE("/conversations/:other_user_id/nickname", conversationHandler.ClearNickname)
+		api.POST("/conversations/:other_user_id/wallpaper", conversationHandler.SetWallpaper)
+		api.DELETE("/conversations/:other_user_id/wallpaper", conversationHandler.ClearWallpaper)
 		api.POST("/conversations/:other_user_id/mute", conversationHandler.MuteConversation)
 
 		api.POST("/conversations/:other_user_id/unmute", conversationHandler.UnmuteConversation)

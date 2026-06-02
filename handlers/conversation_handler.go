@@ -750,6 +750,92 @@ func (h *ConversationHandler) ClearNickname(c *gin.Context) {
 	})
 }
 
+// SetWallpaper — istifadəçi BU söhbət üçün çat fonu (wallpaper) seçir
+// (per-user). Body: {"wallpaper_id": 5}. Yalnız seçim ID-si saxlanır;
+// wallpaper-in özü Laravel-də. YALNIZ seçən şəxsin çatına təsir edir.
+func (h *ConversationHandler) SetWallpaper(c *gin.Context) {
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	otherUserID, err := strconv.ParseUint(c.Param("other_user_id"), 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz kullanıcı ID"})
+		return
+	}
+
+	var body struct {
+		WallpaperID uint `json:"wallpaper_id"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || body.WallpaperID == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz istek"})
+		return
+	}
+
+	conversation, err := h.GetOrCreateConversation(userID.(uint), uint(otherUserID))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Conversation bulunamadı"})
+		return
+	}
+
+	wid := body.WallpaperID
+	if userID.(uint) == conversation.User1ID {
+		conversation.User1WallpaperID = &wid
+	} else {
+		conversation.User2WallpaperID = &wid
+	}
+
+	if err := database.DB.Save(conversation).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Duvar kağıdı kaydedilemedi"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":      "Duvar kağıdı güncellendi",
+		"wallpaper_id": wid,
+	})
+}
+
+// ClearWallpaper — bu söhbət üçün wallpaper seçimini sıfırlayır (qlobal/default
+// görünür).
+func (h *ConversationHandler) ClearWallpaper(c *gin.Context) {
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	otherUserID, err := strconv.ParseUint(c.Param("other_user_id"), 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz kullanıcı ID"})
+		return
+	}
+
+	conversation, err := h.GetOrCreateConversation(userID.(uint), uint(otherUserID))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Conversation bulunamadı"})
+		return
+	}
+
+	if userID.(uint) == conversation.User1ID {
+		conversation.User1WallpaperID = nil
+	} else {
+		conversation.User2WallpaperID = nil
+	}
+
+	if err := database.DB.Save(conversation).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Duvar kağıdı silinemedi"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":      "Duvar kağıdı sıfırlandı",
+		"wallpaper_id": nil,
+	})
+}
+
 // GetConversationDetails conversation detaylarını getir
 func (h *ConversationHandler) GetConversationDetails(c *gin.Context) {
 	userID, exists := c.Get("user_id")
