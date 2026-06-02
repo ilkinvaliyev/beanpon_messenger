@@ -278,6 +278,121 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 	})
 }
 
+// BroadcastMessage — eyni mətni bir neçə (maks 20) istifadəçiyə TOPLU göndərir.
+// Hər alıcı üçün ayrıca mesaj yaradılır (SendMessage ilə eyni addımlar: icazə
+// yoxlaması, şifrələmə, conversation update, WS yayımı, push, moderasiya).
+// Bir alıcı uğursuz olsa (məs. spam/icazə yox) digərləri davam edir.
+func (h *MessageHandler) BroadcastMessage(c *gin.Context) {
+	senderIDVal, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+	senderID := senderIDVal.(uint)
+
+	var req struct {
+		ReceiverIDs []uint `json:"receiver_ids" binding:"required"`
+		Text        string `json:"text" binding:"required"`
+		Type        string `json:"type,omitempty"`
+		Silent      bool   `json:"silent,omitempty"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Dedup + özünü çıxar + maks 20 limiti.
+	seen := map[uint]bool{}
+	var targets []uint
+	for _, id := range req.ReceiverIDs {
+		if id == 0 || id == senderID || seen[id] {
+			continue
+		}
+		seen[id] = true
+		targets = append(targets, id)
+		if len(targets) >= 20 {
+			break
+		}
+	}
+	if len(targets) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçerli alıcı yok"})
+		return
+	}
+
+	wsHubForConv := h.wsHub.(wsHubForConversation)
+	conversationHandler := NewConversationHandler(wsHubForConv, h.encryptionService)
+
+	var sentTo []uint
+	for _, receiverID := range targets {
+		if models.IsBlocked(database.DB, senderID, receiverID) {
+			continue
+		}
+		if receiverID != 1 && models.IsMessagingBannedByActions(database.DB, senderID) {
+			continue // shadow-ban: səssizcə atla
+		}
+		if receiverID != 1 {
+			canSend, _, cErr := conversationHandler.CanSendMessage(senderID, receiverID)
+			if cErr != nil || !canSend {
+				continue
+			}
+		}
+
+		encryptedText, encErr := h.encryptionService.EncryptMessage(req.Text)
+		if encErr != nil {
+			continue
+		}
+
+		rid := receiverID
+		message := models.Message{
+			ID:            uuid.New().String(),
+			SenderID:      senderID,
+			ReceiverID:    &rid,
+			EncryptedText: encryptedText,
+			Read:          false,
+			CreatedAt:     time.Now().UTC(),
+			UpdatedAt:     time.Now().UTC(),
+		}
+		if err := database.DB.Create(&message).Error; err != nil {
+			continue
+		}
+
+		if err := conversationHandler.UpdateConversationOnMessage(senderID, receiverID); err != nil {
+			log.Printf("Broadcast conversation güncellemesi başarısız (rcv=%d): %v", receiverID, err)
+		}
+
+		h.wsHub.HandleNewMessage(
+			message.SenderID,
+			*message.ReceiverID,
+			message.ID,
+			req.Text,
+			req.Type,
+			message.CreatedAt,
+			nil,
+			nil,
+			"active",
+			req.Silent,
+		)
+
+		if h.moderationQueue != nil && (req.Type == "" || req.Type == "text") {
+			h.moderationQueue.Enqueue(services.ModerationJob{
+				MessageID:  message.ID,
+				SenderID:   message.SenderID,
+				ReceiverID: receiverID,
+				PlainText:  req.Text,
+				CreatedAt:  message.CreatedAt,
+			})
+		}
+
+		sentTo = append(sentTo, receiverID)
+	}
+
+	c.JSON(http.StatusCreated, gin.H{
+		"message": "Toplu mesaj gönderildi",
+		"sent_to": sentTo,
+		"count":   len(sentTo),
+	})
+}
+
 func (h *MessageHandler) GetMessages(c *gin.Context) {
 	userID, exists := c.Get("user_id")
 	if !exists {

@@ -138,6 +138,7 @@ func main() {
 	{
 		// ── DM: Mesaj operasyonları ──────────────────────────────────────
 		api.POST("/messages", messageHandler.SendMessage)
+		api.POST("/messages/broadcast", messageHandler.BroadcastMessage)
 		api.GET("/messages/:user_id", messageHandler.GetMessages)
 		api.PUT("/messages/:message_id/read", messageHandler.MarkAsRead)
 		api.PUT("/messages/:message_id", messageHandler.EditMessage)
