@@ -1096,7 +1096,10 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 
 		isMutedByMe := conv.AmIMuted != nil && *conv.AmIMuted
 		isArchivedByMe := conv.AmIArchived != nil && *conv.AmIArchived
-		isPinnedByMe := conv.AmIPinned != nil && *conv.AmIPinned
+		// Pin = pinned_at dolu (NULL deyil). AmIPinned (*bool) bəzi hallarda
+		// GORM Raw scan-da nil qaldığı üçün birbaşa PinnedAt-dan hesablayırıq —
+		// PinnedAt həmişə düzgün scan olunur (dolu/NULL).
+		isPinnedByMe := conv.PinnedAt != nil
 
 		// Əgər tərəflərdən biri digərini bloklayıbsa, online statusu göstərilməməlidir.
 		isOnline := false
@@ -1125,10 +1128,6 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 			"is_archived_by_me":        isArchivedByMe,
 			"is_pinned_by_me":          isPinnedByMe,
 			"pinned_at":                conv.PinnedAt,
-			// 🔍 DEBUG (pin): SQL-dən scan olunan xam am_i_pinned dəyəri.
-			// Deploy-un yeni kod olduğunu təsdiq edir. Nil olarsa scan problemi.
-			"_debug_am_i_pinned_raw": conv.AmIPinned,
-			"_debug_pin_logic":       "is_not_null_v2",
 			"conversation": gin.H{
 				"id":                   conv.ConversationID,
 				"status":               conv.ConversationStatus,
