@@ -977,8 +977,8 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
             ELSE FALSE
         END as am_i_archived,
         CASE
-            WHEN conv.user1_id = ? THEN conv.user1_pinned
-            WHEN conv.user2_id = ? THEN conv.user2_pinned
+            WHEN conv.user1_id = ? THEN (conv.user1_pinned_at IS NOT NULL)
+            WHEN conv.user2_id = ? THEN (conv.user2_pinned_at IS NOT NULL)
             ELSE FALSE
         END as am_i_pinned,
         CASE
@@ -1023,8 +1023,8 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
     WHERE lm.rn = 1 ` + statusWhereClause + archivedWhereClause + `
     ORDER BY
         CASE
-            WHEN conv.user1_id = ? THEN conv.user1_pinned
-            WHEN conv.user2_id = ? THEN conv.user2_pinned
+            WHEN conv.user1_id = ? THEN (conv.user1_pinned_at IS NOT NULL)
+            WHEN conv.user2_id = ? THEN (conv.user2_pinned_at IS NOT NULL)
             ELSE FALSE
         END DESC,
         CASE
