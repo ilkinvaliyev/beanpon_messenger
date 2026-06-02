@@ -824,15 +824,17 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 		UnreadCount        int       `json:"unread_count"`
 		ConversationStatus string    `json:"conversation_status"`
 
-		ConversationID     *uint `json:"conversation_id"`
-		MyMessageCount     *int  `json:"my_message_count"`
-		OtherMessageCount  *int  `json:"other_message_count"`
-		AmIMuted           *bool `json:"am_i_muted"`
-		AmIArchived        *bool `json:"am_i_archived"`
-		AmIRestricted      *bool `json:"am_i_restricted"`
-		IsOtherMuted       *bool `json:"is_other_muted"`
-		IsOtherRestricted  *bool `json:"is_other_restricted"`
-		MaxPendingMessages *int  `json:"max_pending_messages"`
+		ConversationID     *uint      `json:"conversation_id"`
+		MyMessageCount     *int       `json:"my_message_count"`
+		OtherMessageCount  *int       `json:"other_message_count"`
+		AmIMuted           *bool      `json:"am_i_muted"`
+		AmIArchived        *bool      `json:"am_i_archived"`
+		AmIPinned          *bool      `json:"am_i_pinned"`
+		PinnedAt           *time.Time `json:"pinned_at"`
+		AmIRestricted      *bool      `json:"am_i_restricted"`
+		IsOtherMuted       *bool      `json:"is_other_muted"`
+		IsOtherRestricted  *bool      `json:"is_other_restricted"`
+		MaxPendingMessages *int       `json:"max_pending_messages"`
 
 		OtherUserName       string  `json:"other_user_name"`
 		OtherUserUsername   string  `json:"other_user_username"`
@@ -975,6 +977,16 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
             ELSE FALSE
         END as am_i_archived,
         CASE
+            WHEN conv.user1_id = ? THEN conv.user1_pinned
+            WHEN conv.user2_id = ? THEN conv.user2_pinned
+            ELSE FALSE
+        END as am_i_pinned,
+        CASE
+            WHEN conv.user1_id = ? THEN conv.user1_pinned_at
+            WHEN conv.user2_id = ? THEN conv.user2_pinned_at
+            ELSE NULL
+        END as pinned_at,
+        CASE
             WHEN conv.user1_id = ? THEN conv.user1_restricted
             WHEN conv.user2_id = ? THEN conv.user2_restricted
             ELSE NULL
@@ -1009,7 +1021,18 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
         (conv.user1_id = LEAST(?, lm.other_user_id) AND conv.user2_id = GREATEST(?, lm.other_user_id))
     )
     WHERE lm.rn = 1 ` + statusWhereClause + archivedWhereClause + `
-    ORDER BY lm.created_at DESC
+    ORDER BY
+        CASE
+            WHEN conv.user1_id = ? THEN conv.user1_pinned
+            WHEN conv.user2_id = ? THEN conv.user2_pinned
+            ELSE FALSE
+        END DESC,
+        CASE
+            WHEN conv.user1_id = ? THEN conv.user1_pinned_at
+            WHEN conv.user2_id = ? THEN conv.user2_pinned_at
+            ELSE NULL
+        END DESC NULLS LAST,
+        lm.created_at DESC
     `
 
 	// Parametr sırası query-dəki ? ardıcıllığı ilə DƏQİQ uyğundur:
@@ -1017,17 +1040,21 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 	//       is_deleted CASE  → 6
 	//  unread_counts WHERE receiver  → 1 (cəmi yuxarıda 5+1 kimi yazılıb)
 	//  SELECT CASE-lər: my_count(2), other_count(2), am_i_muted(2),
-	//       am_i_archived(2) ← YENİ, am_i_restricted(2), is_other_muted(2),
-	//       is_other_restricted(2) = 14
+	//       am_i_archived(2), am_i_pinned(2) ← YENİ, pinned_at(2) ← YENİ,
+	//       am_i_restricted(2), is_other_muted(2), is_other_restricted(2) = 18
 	//  JOIN LEAST/GREATEST: 2
+	//  (sonra: extraParams = status+archived WHERE)
+	//  ORDER BY: pin CASE(2) ← YENİ + pinned_at CASE(2) ← YENİ = 4
 	params := []interface{}{
 		userID, userID, userID, userID, userID,
 		userID,
 		userID,
-		userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID,
+		userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID, userID,
 		userID, userID,
 	}
 	params = append(params, extraParams...)
+	// ORDER BY parametrləri (WHERE/extraParams-dan SONRA query mətnində gəlir).
+	params = append(params, userID, userID, userID, userID)
 
 	err := database.DB.Raw(query, params...).Scan(&conversations).Error
 	if err != nil {
@@ -1069,6 +1096,7 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 
 		isMutedByMe := conv.AmIMuted != nil && *conv.AmIMuted
 		isArchivedByMe := conv.AmIArchived != nil && *conv.AmIArchived
+		isPinnedByMe := conv.AmIPinned != nil && *conv.AmIPinned
 
 		// Əgər tərəflərdən biri digərini bloklayıbsa, online statusu göstərilməməlidir.
 		isOnline := false
@@ -1095,6 +1123,8 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 			"is_online":                isOnline,
 			"conversation_active":      conversationActive,
 			"is_archived_by_me":        isArchivedByMe,
+			"is_pinned_by_me":          isPinnedByMe,
+			"pinned_at":                conv.PinnedAt,
 			"conversation": gin.H{
 				"id":                   conv.ConversationID,
 				"status":               conv.ConversationStatus,
@@ -1102,6 +1132,7 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 				"can_send_message":     canSendMessage,
 				"is_muted_by_me":       isMutedByMe,
 				"is_archived_by_me":    isArchivedByMe,
+				"is_pinned_by_me":      isPinnedByMe,
 				"am_i_restricted":      conv.AmIRestricted,
 				"is_other_muted":       conv.IsOtherMuted,
 				"is_other_restricted":  conv.IsOtherRestricted,

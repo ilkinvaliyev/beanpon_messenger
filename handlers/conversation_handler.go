@@ -571,6 +571,88 @@ func (h *ConversationHandler) UnarchiveConversation(c *gin.Context) {
 	})
 }
 
+// PinConversation — söhbəti istifadəçinin ÖZÜ üçün pin edir (per-user).
+// A pin edəndə yalnız A-nın siyahısında ən yuxarı gəlir; B-də normal sırada
+// qalır. Bir neçə söhbət eyni anda pin oluna bilər (pinned_at-a görə sıralanır).
+func (h *ConversationHandler) PinConversation(c *gin.Context) {
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	otherUserID, err := strconv.ParseUint(c.Param("other_user_id"), 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz kullanıcı ID"})
+		return
+	}
+
+	conversation, err := h.GetOrCreateConversation(userID.(uint), uint(otherUserID))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Conversation bulunamadı"})
+		return
+	}
+
+	now := time.Now()
+	if userID.(uint) == conversation.User1ID {
+		conversation.User1Pinned = true
+		conversation.User1PinnedAt = &now
+	} else {
+		conversation.User2Pinned = true
+		conversation.User2PinnedAt = &now
+	}
+
+	if err := database.DB.Save(conversation).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Sabitleme başarısız"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":   "Konuşma sabitlendi",
+		"pinned":    true,
+		"pinned_at": now,
+	})
+}
+
+// UnpinConversation — söhbəti pin-dən çıxarır (per-user).
+func (h *ConversationHandler) UnpinConversation(c *gin.Context) {
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	otherUserID, err := strconv.ParseUint(c.Param("other_user_id"), 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz kullanıcı ID"})
+		return
+	}
+
+	conversation, err := h.GetOrCreateConversation(userID.(uint), uint(otherUserID))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Conversation bulunamadı"})
+		return
+	}
+
+	if userID.(uint) == conversation.User1ID {
+		conversation.User1Pinned = false
+		conversation.User1PinnedAt = nil
+	} else {
+		conversation.User2Pinned = false
+		conversation.User2PinnedAt = nil
+	}
+
+	if err := database.DB.Save(conversation).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Sabitlemeden çıkarma başarısız"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Konuşma sabitlemeden çıkarıldı",
+		"pinned":  false,
+	})
+}
+
 // GetConversationDetails conversation detaylarını getir
 func (h *ConversationHandler) GetConversationDetails(c *gin.Context) {
 	userID, exists := c.Get("user_id")

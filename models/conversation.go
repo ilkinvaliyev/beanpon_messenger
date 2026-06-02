@@ -35,10 +35,17 @@ type Conversation struct {
 	// yalnız A-nın siyahısından gizlənir, B-də normal qalır. Üstəlik,
 	// arxivləyən şəxsə (məs. A) gələn mesajlar üçün push notification
 	// göndərilmir (Telegram-ın "arxiv = səssiz" davranışı).
-	User1Archived      bool       `json:"user1_archived" gorm:"default:false"`
-	User2Archived      bool       `json:"user2_archived" gorm:"default:false"`
-	User1ArchivedAt    *time.Time `json:"user1_archived_at"`
-	User2ArchivedAt    *time.Time `json:"user2_archived_at"`
+	User1Archived   bool       `json:"user1_archived" gorm:"default:false"`
+	User2Archived   bool       `json:"user2_archived" gorm:"default:false"`
+	User1ArchivedAt *time.Time `json:"user1_archived_at"`
+	User2ArchivedAt *time.Time `json:"user2_archived_at"`
+	// Pin (sabitləmə) — per-user. A pin edəndə yalnız A-nın siyahısında ən
+	// yuxarı gəlir, B-də normal sırada qalır. Bir neçə söhbət pin oluna bilər;
+	// PinnedAt-a görə sıralanır (ən son pin → ən yuxarı).
+	User1Pinned        bool       `json:"user1_pinned" gorm:"default:false"`
+	User2Pinned        bool       `json:"user2_pinned" gorm:"default:false"`
+	User1PinnedAt      *time.Time `json:"user1_pinned_at"`
+	User2PinnedAt      *time.Time `json:"user2_pinned_at"`
 	User1Restricted    bool       `json:"user1_restricted" gorm:"default:false"`
 	User2Restricted    bool       `json:"user2_restricted" gorm:"default:false"`
 	RestrictionReason  *string    `json:"restriction_reason" gorm:"type:text"`

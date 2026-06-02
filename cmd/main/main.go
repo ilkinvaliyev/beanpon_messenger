@@ -57,6 +57,21 @@ func main() {
 		log.Printf("✅ conversations arxiv sütunları hazırdır")
 	}
 
+	// ✅ Conversations cədvəlinə pin (sabitləmə) sütunlarını əlavə et
+	// (idempotent, per-user). Pin olunmuş söhbət istifadəçinin siyahısında ən
+	// yuxarı gəlir; bir neçə söhbət pin oluna bilər, pinned_at-a görə sıralanır.
+	if err := database.DB.Exec(`
+		ALTER TABLE conversations
+		ADD COLUMN IF NOT EXISTS user1_pinned BOOLEAN NOT NULL DEFAULT FALSE,
+		ADD COLUMN IF NOT EXISTS user2_pinned BOOLEAN NOT NULL DEFAULT FALSE,
+		ADD COLUMN IF NOT EXISTS user1_pinned_at TIMESTAMPTZ,
+		ADD COLUMN IF NOT EXISTS user2_pinned_at TIMESTAMPTZ
+	`).Error; err != nil {
+		log.Printf("⚠️ conversations pin sütunları əlavə edilə bilmədi: %v", err)
+	} else {
+		log.Printf("✅ conversations pin sütunları hazırdır")
+	}
+
 	// Servisleri başlat
 	encryptionService := services.NewEncryptionService(cfg.AESKey)
 
@@ -168,6 +183,8 @@ func main() {
 		api.GET("/conversations/:other_user_id/details", conversationHandler.GetConversationDetails)
 		api.POST("/conversations/:other_user_id/archive", conversationHandler.ArchiveConversation)
 		api.POST("/conversations/:other_user_id/unarchive", conversationHandler.UnarchiveConversation)
+		api.POST("/conversations/:other_user_id/pin", conversationHandler.PinConversation)
+		api.POST("/conversations/:other_user_id/unpin", conversationHandler.UnpinConversation)
 		api.POST("/conversations/:other_user_id/mute", conversationHandler.MuteConversation)
 
 		api.POST("/conversations/:other_user_id/unmute", conversationHandler.UnmuteConversation)
