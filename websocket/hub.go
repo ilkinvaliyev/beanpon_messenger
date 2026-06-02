@@ -265,7 +265,7 @@ func (h *Hub) SendToMultipleUsers(userIDs []uint, messageType string, data inter
 }
 
 // HandleNewMessage yeni mesajı handle et ve WebSocket üzerinden yayınla
-func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, msgType string, createdAt time.Time, replyToMessageID *string, storyID *uint, conversationStatus string) {
+func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, msgType string, createdAt time.Time, replyToMessageID *string, storyID *uint, conversationStatus string, silent bool) {
 	messageData := map[string]interface{}{
 		"id":                  messageID,
 		"sender_id":           senderID,
@@ -337,6 +337,14 @@ func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, ms
 	h.sendConversationUpdate(senderID, receiverID, messageData)
 
 	go h.SendUnreadCountUpdate(receiverID)
+
+	// 🔕 SƏSSİZ GÖNDƏRMƏ: göndərən "səssiz göndər" seçibsə, mesaj normal çatır
+	// (DB + WS + unread), AMMA qarşı tərəfə push notification GETMİR.
+	if silent {
+		log.Printf("🔕 Səssiz mesaj: sender=%d → receiver=%d, push göndərilmir",
+			senderID, receiverID)
+		return
+	}
 
 	// 🎯 Sadece active conversation'larda notification gönder
 	if conversationStatus == "active" {
@@ -811,8 +819,9 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 			conversationStatus = conversation.Status
 		}
 
-		// HandleNewMessage'a status geç
-		c.Hub.HandleNewMessage(c.UserID, receiverID, messageID, content, msgType, createdAt, replyToMessageID, storyID, conversationStatus)
+		// HandleNewMessage'a status geç. WS yolu səssiz göndərməni dəstəkləmir
+		// (yalnız REST), ona görə silent=false.
+		c.Hub.HandleNewMessage(c.UserID, receiverID, messageID, content, msgType, createdAt, replyToMessageID, storyID, conversationStatus, false)
 
 		// DB yazma
 		go func() {

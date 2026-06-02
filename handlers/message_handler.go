@@ -29,7 +29,7 @@ type MessageHandler struct {
 		DecryptMessage(encryptedText string) (string, error)
 	}
 	wsHub interface {
-		HandleNewMessage(senderID, receiverID uint, messageID, content, msgType string, createdAt time.Time, replyToMessageID *string, storyID *uint, conversationStatus string) // conversationStatus eklendi
+		HandleNewMessage(senderID, receiverID uint, messageID, content, msgType string, createdAt time.Time, replyToMessageID *string, storyID *uint, conversationStatus string, silent bool) // conversationStatus + silent eklendi
 		HandleMessageRead(messageID string, senderID, readerID uint)
 		IsUserOnline(userID uint) bool
 		SendToUser(userID uint, messageType string, data interface{})
@@ -42,7 +42,7 @@ func NewMessageHandler(encryptionService interface {
 	EncryptMessage(plainText string) (string, error)
 	DecryptMessage(encryptedText string) (string, error)
 }, wsHub interface {
-	HandleNewMessage(senderID, receiverID uint, messageID, content, msgType string, createdAt time.Time, replyToMessageID *string, storyID *uint, conversationStatus string) // conversationStatus eklendi
+	HandleNewMessage(senderID, receiverID uint, messageID, content, msgType string, createdAt time.Time, replyToMessageID *string, storyID *uint, conversationStatus string, silent bool) // conversationStatus + silent eklendi
 	HandleMessageRead(messageID string, senderID, readerID uint)
 	IsUserOnline(userID uint) bool
 	SendToUser(userID uint, messageType string, data interface{})
@@ -80,6 +80,10 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 		Type             string  `json:"type,omitempty"`
 		StoryID          *uint   `json:"story_id,omitempty"` // BU SATIRI EKLE
 		ReplyToMessageID *string `json:"reply_to_message_id,omitempty"`
+		// Səssiz göndərmə: true olduqda qarşı tərəfə push notification GETMİR
+		// (mesaj normal çatır, WS yayılır). Opsional — köhnə client-lər
+		// göndərməsə false olur (adi davranış).
+		Silent bool `json:"silent,omitempty"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -241,6 +245,7 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 		req.ReplyToMessageID, // YENİ parametre
 		req.StoryID,
 		"active",
+		req.Silent, // səssiz göndərmə → push getməsin
 	)
 
 	// 🔍 MODERASIYA — mesaj şifrələnib göndərildi, indi arxa planda analizə
