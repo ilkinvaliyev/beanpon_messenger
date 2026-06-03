@@ -237,39 +237,51 @@ func (h *GroupHandler) LeaveGroup(c *gin.Context) {
 		return
 	}
 
-	// Owner son kişiyse grubu dağıt
-	if participant.Role == "owner" {
+	// Admin/owner çıxır və BAŞQA admin/owner YOXDURSA → qrup SİLİNİR
+	// (istifadəçi tələbi: idarəçisiz qrup qalmasın). Üzvlərə group_deleted
+	// göndərilir — Flutter siyahıdan çıxarır və çatı bağlayır.
+	if participant.Role == "owner" || participant.Role == "admin" {
 		var adminCount int64
 		database.DB.Model(&models.ConversationParticipant{}).
 			Where("conversation_id = ? AND role IN ('owner','admin') AND user_id != ? AND left_at IS NULL AND deleted_at IS NULL",
 				conversationID, userID).Count(&adminCount)
 
 		if adminCount == 0 {
-			// Başka admin/owner yok — ownership transfer et veya grubu kapat
-			// Şimdilik: ilk member'ı admin yap
-			var firstMember models.ConversationParticipant
-			err = database.DB.Where("conversation_id = ? AND user_id != ? AND left_at IS NULL AND deleted_at IS NULL",
-				conversationID, userID).
-				Order("joined_at ASC").First(&firstMember).Error
-			if err == nil {
-				database.DB.Model(&firstMember).Update("role", "admin")
-				h.wsHub.SendToUser(firstMember.UserID, "group_role_changed", gin.H{
-					"conversation_id": conversationID,
-					"new_role":        "admin",
-					"reason":          "owner_left",
-				})
-			}
+			now := time.Now()
+			// Çıxan adminin participant qeydini bağla.
+			database.DB.Model(&participant).Update("left_at", now)
+
+			// Qalan üzvlərə xəbər ver (siyahı silinmədən ƏVVƏL götürülür).
+			memberIDs := getGroupParticipantIDs(conversationID)
+
+			// Qrupu soft-delete et.
+			database.DB.Model(&models.Conversation{}).
+				Where("id = ?", conversationID).
+				Update("deleted_at", now)
+
+			h.wsHub.SendToMultipleUsers(memberIDs, "group_deleted", gin.H{
+				"conversation_id": conversationID,
+				"reason":          "admin_left",
+			})
+
+			c.JSON(http.StatusOK, gin.H{"message": "Grup kapatıldı", "group_deleted": true})
+			return
 		}
 	}
 
 	now := time.Now()
 	database.DB.Model(&participant).Update("left_at", now)
 
+	// Çıxanın adı — Flutter çatda "X qrupu tərk etdi" sistem sətri göstərsin.
+	var leaverUsername string
+	database.DB.Raw(`SELECT username FROM users WHERE id = ?`, userID).Scan(&leaverUsername)
+
 	// Diğer üyelere bildir
 	memberIDs := getGroupParticipantIDs(conversationID)
 	h.wsHub.SendToMultipleUsers(memberIDs, "group_member_left", gin.H{
 		"conversation_id": conversationID,
 		"user_id":         userID,
+		"username":        leaverUsername,
 		"left_at":         now,
 	})
 
@@ -402,6 +414,121 @@ func (h *GroupHandler) UnarchiveGroup(c *gin.Context) {
 		})
 
 	c.JSON(http.StatusOK, gin.H{"message": "Arxivdən çıxarıldı", "is_archived": false})
+}
+
+// POST /api/v1/groups/:conversation_id/clear — söhbəti təmizlə.
+// Body: {"mode": "me" | "all"}
+//
+//	me  — yalnız özüm üçün: participant.cleared_at = now (server mesajlara
+//	      toxunmur; GetGroupMessages cleared_at-dan sonrakıları qaytarır).
+//	all — yalnız admin/owner: bütün mesajlar soft-delete + group_chat_cleared
+//	      WS event (hamının çatı boşalır).
+func (h *GroupHandler) ClearGroupChat(c *gin.Context) {
+	userID := c.MustGet("user_id").(uint)
+	convID, _ := strconv.ParseUint(c.Param("conversation_id"), 10, 32)
+	conversationID := uint(convID)
+
+	var body struct {
+		Mode string `json:"mode"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || (body.Mode != "me" && body.Mode != "all") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "mode 'me' veya 'all' olmalı"})
+		return
+	}
+
+	var me models.ConversationParticipant
+	err := database.DB.Where(
+		"conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL",
+		conversationID, userID,
+	).First(&me).Error
+	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Bu grubun üyesi değilsiniz"})
+		return
+	}
+
+	now := time.Now()
+
+	if body.Mode == "all" {
+		// Yalnız admin/owner hamı üçün təmizləyə bilər.
+		if me.Role != "owner" && me.Role != "admin" {
+			c.JSON(http.StatusForbidden, gin.H{"error": "Yalnızca yöneticiler herkes için temizleyebilir"})
+			return
+		}
+		// Bütün mesajları soft-delete et.
+		database.DB.Model(&models.Message{}).
+			Where("conversation_id = ? AND deleted_at IS NULL", conversationID).
+			Update("deleted_at", now)
+
+		// Üzvlərə bildir — Flutter çatı boşaldır + lokal cache təmizləyir.
+		memberIDs := getGroupParticipantIDs(conversationID)
+		h.wsHub.SendToMultipleUsers(memberIDs, "group_chat_cleared", gin.H{
+			"conversation_id": conversationID,
+			"cleared_by":      userID,
+			"mode":            "all",
+		})
+
+		c.JSON(http.StatusOK, gin.H{"message": "Sohbet herkes için temizlendi", "mode": "all"})
+		return
+	}
+
+	// mode == "me": yalnız özüm üçün — cleared_at qoy.
+	database.DB.Model(&me).Update("cleared_at", now)
+	c.JSON(http.StatusOK, gin.H{"message": "Sohbet sizin için temizlendi", "mode": "me"})
+}
+
+// POST /api/v1/groups/:conversation_id/wallpaper — qrup çatı üçün fon (per-user).
+// Body: {"wallpaper_id": <int|null>} — null/0 = sıfırla (qlobal/default görünür).
+// Seçim conversation_participants.chat_wallpaper_id-də saxlanır, yalnız bu
+// istifadəçiyə təsir edir.
+func (h *GroupHandler) SetGroupWallpaper(c *gin.Context) {
+	userID := c.MustGet("user_id").(uint)
+	convID, err := strconv.ParseUint(c.Param("conversation_id"), 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz conversation_id"})
+		return
+	}
+	conversationID := uint(convID)
+
+	var body struct {
+		WallpaperID *uint `json:"wallpaper_id"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz istek"})
+		return
+	}
+
+	var me models.ConversationParticipant
+	err = database.DB.Where(
+		"conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL",
+		conversationID, userID,
+	).First(&me).Error
+	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Bu grubun üyesi değilsiniz"})
+		return
+	}
+
+	// null və ya 0 → sıfırla (NULL).
+	if body.WallpaperID == nil || *body.WallpaperID == 0 {
+		if err := database.DB.Model(&me).Update("chat_wallpaper_id", nil).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Duvar kağıdı kaydedilemedi"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"message":           "Duvar kağıdı sıfırlandı",
+			"chat_wallpaper_id": nil,
+		})
+		return
+	}
+
+	if err := database.DB.Model(&me).Update("chat_wallpaper_id", *body.WallpaperID).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Duvar kağıdı kaydedilemedi"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":           "Duvar kağıdı güncellendi",
+		"chat_wallpaper_id": *body.WallpaperID,
+	})
 }
 
 // POST /api/v1/groups/:conversation_id/kick/:user_id
@@ -757,6 +884,7 @@ func (h *GroupHandler) GetGroupDetail(c *gin.Context) {
 		"member_count":    memberCount,
 		"my_role":         me.Role,
 		"is_muted":        me.IsMuted,
+		"my_wallpaper_id": me.ChatWallpaperID,
 		"invite_token":    inviteToken,
 		"member_previews": previews,
 		"created_at":      conv.CreatedAt,

@@ -17,6 +17,8 @@ type ConversationParticipant struct {
 	PinnedAt           *time.Time     `json:"pinned_at"`
 	IsArchived         bool           `json:"is_archived" gorm:"default:false"`
 	ArchivedAt         *time.Time     `json:"archived_at"`
+	ClearedAt          *time.Time     `json:"cleared_at"`
+	ChatWallpaperID    *uint          `json:"chat_wallpaper_id"`
 	IsRestricted       bool           `json:"is_restricted" gorm:"default:false"`
 	ScreenshotDisabled bool           `json:"screenshot_disabled" gorm:"default:false"`
 	LastReadAt         *time.Time     `json:"last_read_at"`

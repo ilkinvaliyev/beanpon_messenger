@@ -253,12 +253,19 @@ func main() {
 		api.POST("/groups/:conversation_id/unpin", groupHandler.UnpinGroup)
 		api.POST("/groups/:conversation_id/archive", groupHandler.ArchiveGroup)
 		api.POST("/groups/:conversation_id/unarchive", groupHandler.UnarchiveGroup)
+		api.POST("/groups/:conversation_id/wallpaper", groupHandler.SetGroupWallpaper)
+		api.POST("/groups/:conversation_id/clear", groupHandler.ClearGroupChat)
 		api.PUT("/groups/:conversation_id", groupHandler.UpdateGroup)
 
 		// ── GROUP: Mesajlar ──────────────────────────────────────────────
 		api.POST("/groups/:conversation_id/messages", groupMsgHandler.SendGroupMessage)
 		api.GET("/groups/:conversation_id/messages", groupMsgHandler.GetGroupMessages)
+		api.GET("/groups/:conversation_id/starred", groupMsgHandler.GetGroupStarred)
 		api.GET("/groups/messages/:message_id/reads", groupMsgHandler.GetMessageReads)
+		api.DELETE("/groups/messages/:message_id", groupMsgHandler.DeleteGroupMessage)
+		api.PUT("/groups/messages/:message_id", groupMsgHandler.EditGroupMessage)
+		api.POST("/groups/messages/:message_id/star", groupMsgHandler.ToggleGroupStar)
+		api.POST("/groups/messages/:message_id/reaction", groupMsgHandler.SetGroupReaction)
 
 		// ── Live yayın ───────────────────────────────────────────────────
 		api.GET("/live-rooms/:room_id/messages", liveHub.GetLiveRoomMessages)
@@ -357,6 +364,9 @@ func main() {
 				"online_users",
 				"new_group_message",
 				"group_message_read",
+				"group_message_deleted",
+				"group_message_edited",
+				"group_reaction_updated",
 				"group_member_joined",
 				"group_member_left",
 				"group_member_kicked",
