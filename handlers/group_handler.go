@@ -484,6 +484,9 @@ func (h *GroupHandler) GetMembers(c *gin.Context) {
 
 	for i := range members {
 		members[i].IsOnline = h.wsHub.IsUserOnline(members[i].UserID)
+		// Profil şəkli nisbi yol gəlir — tam URL-ə çevir (Flutter birbaşa
+		// göstərə bilsin). PrependBaseURL nil-safe-dir.
+		members[i].ProfileImage = utils.PrependBaseURL(members[i].ProfileImage)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -692,6 +695,12 @@ func (h *GroupHandler) AddMembers(c *gin.Context) {
 	).First(&me).Error
 	if err != nil {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Bu grubun üyesi değilsiniz"})
+		return
+	}
+
+	// Yalnız admin/owner üzv əlavə edə bilər.
+	if me.Role != "owner" && me.Role != "admin" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Yalnızca yöneticiler üye ekleyebilir"})
 		return
 	}
 

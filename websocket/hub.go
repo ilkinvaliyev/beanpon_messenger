@@ -1254,6 +1254,26 @@ func (h *Hub) handleGroupTyping(userID uint, data interface{}, isTyping bool) {
 	}
 	conversationID := uint(convFloat)
 
+	// Action: "typing" (default) və ya "recording" (səs yazır). Flutter
+	// data-da göndərə bilər; göndərməsə typing sayılır.
+	action := "typing"
+	if a, ok := dataMap["action"].(string); ok && a == "recording" {
+		action = "recording"
+	}
+
+	// Yazanın adı/avatarı — çatda inline göstərmək üçün (avatar + "X yazır").
+	var sender struct {
+		Name         string  `gorm:"column:name"`
+		Username     string  `gorm:"column:username"`
+		ProfileImage *string `gorm:"column:profile_image"`
+	}
+	h.db.Raw(`
+		SELECT u.name, u.username, p.profile_image
+		FROM users u
+		LEFT JOIN profiles p ON p.user_id = u.id
+		WHERE u.id = ?
+	`, userID).Scan(&sender)
+
 	// Qrupun aktiv üzvlərini çək (left_at IS NULL).
 	var memberIDs []uint
 	h.db.Model(&models.ConversationParticipant{}).
@@ -1268,6 +1288,10 @@ func (h *Hub) handleGroupTyping(userID uint, data interface{}, isTyping bool) {
 			"conversation_id": conversationID,
 			"user_id":         userID,
 			"typing":          isTyping,
+			"action":          action,
+			"sender_name":     sender.Name,
+			"sender_username": sender.Username,
+			"sender_avatar":   utils.PrependBaseURL(sender.ProfileImage),
 		})
 	}
 }
