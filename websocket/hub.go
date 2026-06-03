@@ -679,11 +679,12 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 		c.sendMessage(response)
 
 	case "typing":
-		// Yazıyor durumunu karşı tarafa bildir
+		// Yazıyor durumunu karşı tarafa bildir (action: text yazma)
 		if msg.ReceiverID > 0 {
 			c.Hub.SendToUser(msg.ReceiverID, "user_typing", map[string]interface{}{
 				"user_id": c.UserID,
 				"typing":  true,
+				"action":  "typing",
 			})
 		}
 
@@ -693,6 +694,28 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 			c.Hub.SendToUser(msg.ReceiverID, "user_typing", map[string]interface{}{
 				"user_id": c.UserID,
 				"typing":  false,
+				"action":  "typing",
+			})
+		}
+
+	case "recording":
+		// Səs mesajı yazır (mic basılı tutub) — qarşı tərəfə bildir.
+		// Eyni user_typing event-i, amma action: recording.
+		if msg.ReceiverID > 0 {
+			c.Hub.SendToUser(msg.ReceiverID, "user_typing", map[string]interface{}{
+				"user_id": c.UserID,
+				"typing":  true,
+				"action":  "recording",
+			})
+		}
+
+	case "recording_stop":
+		// Səs yazmağı dayandırdı (buraxdı/ləğv etdi).
+		if msg.ReceiverID > 0 {
+			c.Hub.SendToUser(msg.ReceiverID, "user_typing", map[string]interface{}{
+				"user_id": c.UserID,
+				"typing":  false,
+				"action":  "recording",
 			})
 		}
 

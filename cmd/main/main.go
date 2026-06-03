@@ -338,6 +338,8 @@ func main() {
 				"ping",
 				"typing",
 				"typing_stop",
+				"recording",
+				"recording_stop",
 				"get_online_users",
 			},
 			"broadcasted_message_types": []string{
