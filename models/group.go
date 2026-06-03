@@ -13,6 +13,10 @@ type ConversationParticipant struct {
 	Nickname           *string        `json:"nickname" gorm:"type:varchar(255)"`
 	IsMuted            bool           `json:"is_muted" gorm:"default:false"`
 	MutedUntil         *time.Time     `json:"muted_until"`
+	IsPinned           bool           `json:"is_pinned" gorm:"default:false"`
+	PinnedAt           *time.Time     `json:"pinned_at"`
+	IsArchived         bool           `json:"is_archived" gorm:"default:false"`
+	ArchivedAt         *time.Time     `json:"archived_at"`
 	IsRestricted       bool           `json:"is_restricted" gorm:"default:false"`
 	ScreenshotDisabled bool           `json:"screenshot_disabled" gorm:"default:false"`
 	LastReadAt         *time.Time     `json:"last_read_at"`

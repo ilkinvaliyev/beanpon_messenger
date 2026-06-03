@@ -335,6 +335,75 @@ func (h *GroupHandler) UnmuteGroup(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Grup sesi açıldı"})
 }
 
+// POST /api/v1/groups/:conversation_id/pin — qrupu sabitlə (per-user).
+func (h *GroupHandler) PinGroup(c *gin.Context) {
+	userID := c.MustGet("user_id").(uint)
+	convID, _ := strconv.ParseUint(c.Param("conversation_id"), 10, 32)
+	conversationID := uint(convID)
+
+	now := time.Now()
+	database.DB.Model(&models.ConversationParticipant{}).
+		Where("conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL", conversationID, userID).
+		Updates(map[string]interface{}{
+			"is_pinned": true,
+			"pinned_at": now,
+		})
+
+	c.JSON(http.StatusOK, gin.H{"message": "Grup sabitləndi", "is_pinned": true})
+}
+
+// POST /api/v1/groups/:conversation_id/unpin
+func (h *GroupHandler) UnpinGroup(c *gin.Context) {
+	userID := c.MustGet("user_id").(uint)
+	convID, _ := strconv.ParseUint(c.Param("conversation_id"), 10, 32)
+	conversationID := uint(convID)
+
+	database.DB.Model(&models.ConversationParticipant{}).
+		Where("conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL", conversationID, userID).
+		Updates(map[string]interface{}{
+			"is_pinned": false,
+			"pinned_at": nil,
+		})
+
+	c.JSON(http.StatusOK, gin.H{"message": "Sabitləmə götürüldü", "is_pinned": false})
+}
+
+// POST /api/v1/groups/:conversation_id/archive — qrupu arxivlə (per-user).
+func (h *GroupHandler) ArchiveGroup(c *gin.Context) {
+	userID := c.MustGet("user_id").(uint)
+	convID, _ := strconv.ParseUint(c.Param("conversation_id"), 10, 32)
+	conversationID := uint(convID)
+
+	now := time.Now()
+	database.DB.Model(&models.ConversationParticipant{}).
+		Where("conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL", conversationID, userID).
+		Updates(map[string]interface{}{
+			"is_archived": true,
+			"archived_at": now,
+			// Arxivlə eyni zamanda pin götürülür (DM davranışı ilə uyğun).
+			"is_pinned": false,
+			"pinned_at": nil,
+		})
+
+	c.JSON(http.StatusOK, gin.H{"message": "Grup arxivləndi", "is_archived": true})
+}
+
+// POST /api/v1/groups/:conversation_id/unarchive
+func (h *GroupHandler) UnarchiveGroup(c *gin.Context) {
+	userID := c.MustGet("user_id").(uint)
+	convID, _ := strconv.ParseUint(c.Param("conversation_id"), 10, 32)
+	conversationID := uint(convID)
+
+	database.DB.Model(&models.ConversationParticipant{}).
+		Where("conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL", conversationID, userID).
+		Updates(map[string]interface{}{
+			"is_archived": false,
+			"archived_at": nil,
+		})
+
+	c.JSON(http.StatusOK, gin.H{"message": "Arxivdən çıxarıldı", "is_archived": false})
+}
+
 // POST /api/v1/groups/:conversation_id/kick/:user_id
 func (h *GroupHandler) KickMember(c *gin.Context) {
 	requesterID := c.MustGet("user_id").(uint)
@@ -499,8 +568,20 @@ func (h *GroupHandler) GetMembers(c *gin.Context) {
 }
 
 // GET /api/v1/groups - kullanıcının gruplarını listele
+// Query: archived=false (default, arxivlənmişlər gizli) | true (yalnız arxiv) | all
 func (h *GroupHandler) GetMyGroups(c *gin.Context) {
 	userID := c.MustGet("user_id").(uint)
+	archivedFilter := c.DefaultQuery("archived", "false")
+
+	archivedWhere := ""
+	switch archivedFilter {
+	case "true":
+		archivedWhere = "AND COALESCE(cp.is_archived, false) = true"
+	case "all":
+		archivedWhere = ""
+	default:
+		archivedWhere = "AND COALESCE(cp.is_archived, false) = false"
+	}
 
 	var groups []struct {
 		ConversationID     uint       `json:"conversation_id"`
@@ -508,6 +589,9 @@ func (h *GroupHandler) GetMyGroups(c *gin.Context) {
 		GroupAvatar        *string    `json:"group_avatar"`
 		MyRole             string     `json:"my_role"`
 		IsMuted            bool       `json:"is_muted"`
+		IsPinned           bool       `json:"is_pinned"`
+		PinnedAt           *time.Time `json:"pinned_at"`
+		IsArchived         bool       `json:"is_archived"`
 		MemberCount        int        `json:"member_count"`
 		LastMessageAt      *time.Time `json:"last_message_at"`
 		UnreadCount        int        `json:"unread_count"`
@@ -516,13 +600,16 @@ func (h *GroupHandler) GetMyGroups(c *gin.Context) {
 	}
 
 	database.DB.Raw(`
-		SELECT 
+		SELECT
 			c.id as conversation_id,
 			c.group_name,
 			c.group_avatar,
 			cp.role as my_role,
 			cp.is_muted,
-			(SELECT COUNT(*) FROM conversation_participants cp2 
+			COALESCE(cp.is_pinned, false) as is_pinned,
+			cp.pinned_at,
+			COALESCE(cp.is_archived, false) as is_archived,
+			(SELECT COUNT(*) FROM conversation_participants cp2
 			 WHERE cp2.conversation_id = c.id AND cp2.left_at IS NULL AND cp2.deleted_at IS NULL) as member_count,
 			c.last_message_at,
 			(SELECT COUNT(*) FROM messages m
@@ -552,7 +639,11 @@ func (h *GroupHandler) GetMyGroups(c *gin.Context) {
 		  AND cp.deleted_at IS NULL
 		  AND c.chat_type = 'group'
 		  AND c.deleted_at IS NULL
-		ORDER BY c.last_message_at DESC NULLS LAST
+		  `+archivedWhere+`
+		ORDER BY
+			COALESCE(cp.is_pinned, false) DESC,
+			cp.pinned_at DESC NULLS LAST,
+			c.last_message_at DESC NULLS LAST
 	`, userID, userID, userID, userID, userID).Scan(&groups)
 
 	for i := range groups {

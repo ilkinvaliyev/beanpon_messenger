@@ -249,6 +249,10 @@ func main() {
 		api.POST("/groups/:conversation_id/members", groupHandler.AddMembers)
 		api.POST("/groups/:conversation_id/mute", groupHandler.MuteGroup)
 		api.POST("/groups/:conversation_id/unmute", groupHandler.UnmuteGroup)
+		api.POST("/groups/:conversation_id/pin", groupHandler.PinGroup)
+		api.POST("/groups/:conversation_id/unpin", groupHandler.UnpinGroup)
+		api.POST("/groups/:conversation_id/archive", groupHandler.ArchiveGroup)
+		api.POST("/groups/:conversation_id/unarchive", groupHandler.UnarchiveGroup)
 		api.PUT("/groups/:conversation_id", groupHandler.UpdateGroup)
 
 		// ── GROUP: Mesajlar ──────────────────────────────────────────────
