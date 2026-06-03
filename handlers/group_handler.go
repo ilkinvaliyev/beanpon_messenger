@@ -3,6 +3,7 @@ package handlers
 import (
 	"beanpon_messenger/database"
 	"beanpon_messenger/models"
+	"beanpon_messenger/utils"
 	"crypto/rand"
 	"encoding/hex"
 	"net/http"
