@@ -98,6 +98,18 @@ func main() {
 		log.Printf("✅ conversations wallpaper sütunları hazırdır")
 	}
 
+	// ✅ Messages cədvəlinə ulduzlu mesaj (star) sütunları — per-user.
+	// starred_by_sender/receiver. idempotent.
+	if err := database.DB.Exec(`
+		ALTER TABLE messages
+		ADD COLUMN IF NOT EXISTS starred_by_sender BOOLEAN NOT NULL DEFAULT FALSE,
+		ADD COLUMN IF NOT EXISTS starred_by_receiver BOOLEAN NOT NULL DEFAULT FALSE
+	`).Error; err != nil {
+		log.Printf("⚠️ messages star sütunları əlavə edilə bilmədi: %v", err)
+	} else {
+		log.Printf("✅ messages star sütunları hazırdır")
+	}
+
 	// Servisleri başlat
 	encryptionService := services.NewEncryptionService(cfg.AESKey)
 
@@ -184,6 +196,7 @@ func main() {
 		api.PUT("/messages/:message_id/read", messageHandler.MarkAsRead)
 		api.PUT("/messages/:message_id", messageHandler.EditMessage)
 		api.DELETE("/messages/:message_id", messageHandler.DeleteMessage)
+		api.POST("/messages/:message_id/star", messageHandler.ToggleStar)
 
 		// Batch mark-as-read — bir söhbətdəki bütün okunmamış mesajları
 		// (qarşı tərəfdən gələnləri) eyni anda okundu işarələ. Native
@@ -215,6 +228,7 @@ func main() {
 		api.DELETE("/conversations/:other_user_id/nickname", conversationHandler.ClearNickname)
 		api.POST("/conversations/:other_user_id/wallpaper", conversationHandler.SetWallpaper)
 		api.DELETE("/conversations/:other_user_id/wallpaper", conversationHandler.ClearWallpaper)
+		api.GET("/conversations/:other_user_id/starred", messageHandler.GetStarredMessages)
 		api.POST("/conversations/:other_user_id/mute", conversationHandler.MuteConversation)
 
 		api.POST("/conversations/:other_user_id/unmute", conversationHandler.UnmuteConversation)

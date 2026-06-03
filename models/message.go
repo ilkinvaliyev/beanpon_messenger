@@ -16,17 +16,21 @@ type Message struct {
 	EncryptedText    string  `json:"encrypted_text" gorm:"type:text;not null"`
 	EncryptedAESKey  *string `json:"encrypted_aes_key" gorm:"type:text"`
 	//Type             string     `json:"type" gorm:"default:'text'"`
-	IsEdited            bool           `json:"is_edited" gorm:"default:false"`
-	IsDeletedBySender   bool           `json:"is_deleted_by_sender" gorm:"default:false"`
-	IsDeletedByReceiver bool           `json:"is_deleted_by_receiver" gorm:"default:false"`
-	Delivered           bool           `json:"delivered" gorm:"default:false"`
-	Read                bool           `json:"read" gorm:"default:false"`
-	ReadAt              *time.Time     `json:"read_at"`
-	SenderReaction      *string        `json:"sender_reaction" gorm:"type:varchar(10)"`
-	ReceiverReaction    *string        `json:"receiver_reaction" gorm:"type:varchar(10)"`
-	CreatedAt           time.Time      `json:"created_at"`
-	UpdatedAt           time.Time      `json:"updated_at"`
-	DeletedAt           gorm.DeletedAt `json:"deleted_at" gorm:"index"`
+	IsEdited            bool       `json:"is_edited" gorm:"default:false"`
+	IsDeletedBySender   bool       `json:"is_deleted_by_sender" gorm:"default:false"`
+	IsDeletedByReceiver bool       `json:"is_deleted_by_receiver" gorm:"default:false"`
+	Delivered           bool       `json:"delivered" gorm:"default:false"`
+	Read                bool       `json:"read" gorm:"default:false"`
+	ReadAt              *time.Time `json:"read_at"`
+	SenderReaction      *string    `json:"sender_reaction" gorm:"type:varchar(10)"`
+	ReceiverReaction    *string    `json:"receiver_reaction" gorm:"type:varchar(10)"`
+	// Ulduzlu mesaj — per-user (reaction patterni). StarredBySender = göndərən
+	// ulduzlayıb, StarredByReceiver = alıcı ulduzlayıb. Hər tərəf öz ulduzunu görür.
+	StarredBySender   bool           `json:"starred_by_sender" gorm:"default:false"`
+	StarredByReceiver bool           `json:"starred_by_receiver" gorm:"default:false"`
+	CreatedAt         time.Time      `json:"created_at"`
+	UpdatedAt         time.Time      `json:"updated_at"`
+	DeletedAt         gorm.DeletedAt `json:"deleted_at" gorm:"index"`
 
 	// İlişkiler
 	Sender         User     `json:"sender" gorm:"foreignKey:SenderID"`

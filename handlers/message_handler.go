@@ -422,6 +422,8 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 		IsEdited             bool       `gorm:"column:is_edited"` // ← YENİ
 		SenderReaction       *string    `gorm:"column:sender_reaction"`
 		ReceiverReaction     *string    `gorm:"column:receiver_reaction"`
+		StarredBySender      bool       `gorm:"column:starred_by_sender"`
+		StarredByReceiver    bool       `gorm:"column:starred_by_receiver"`
 		CreatedAt            time.Time  `gorm:"column:created_at"`
 		UpdatedAt            time.Time  `gorm:"column:updated_at"`
 		ReplyToMessageText   *string    `gorm:"column:reply_to_message_text"`
@@ -489,6 +491,7 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 			"is_edited":           msg.IsEdited, // ← YENİ
 			"sender_reaction":     msg.SenderReaction,
 			"receiver_reaction":   msg.ReceiverReaction,
+			"is_starred_by_me":    starredByUser(userID.(uint), msg.SenderID, msg.StarredBySender, msg.StarredByReceiver),
 			"created_at":          msg.CreatedAt,
 			"updated_at":          msg.UpdatedAt,
 		}
@@ -1284,6 +1287,146 @@ func (h *MessageHandler) DeleteMessage(c *gin.Context) {
 	})
 }
 
+// ToggleStar — mesajı ulduzla/ulduzdan çıxar (per-user, toggle).
+// POST /api/v1/messages/:message_id/star
+func (h *MessageHandler) ToggleStar(c *gin.Context) {
+	userIDVal, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+	userID := userIDVal.(uint)
+
+	messageID := c.Param("message_id")
+
+	var message models.Message
+	if err := database.DB.Where("id = ?", messageID).First(&message).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Mesaj tapılmadı"})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Veritabanı xətası"})
+		}
+		return
+	}
+
+	// Yalnız söhbətin tərəfi ulduzlaya bilər.
+	isSender := userID == message.SenderID
+	isReceiver := message.ReceiverID != nil && userID == *message.ReceiverID
+	if !isSender && !isReceiver {
+		c.JSON(http.StatusForbidden, gin.H{"error": "İcazən yoxdur"})
+		return
+	}
+
+	// Toggle per-user.
+	var newVal bool
+	if isSender {
+		message.StarredBySender = !message.StarredBySender
+		newVal = message.StarredBySender
+	} else {
+		message.StarredByReceiver = !message.StarredByReceiver
+		newVal = message.StarredByReceiver
+	}
+	message.UpdatedAt = time.Now().UTC()
+
+	if err := database.DB.Save(&message).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ulduzlama uğursuz oldu"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":    "OK",
+		"message_id": message.ID,
+		"is_starred": newVal,
+	})
+}
+
+// GetStarredMessages — bu söhbətdə MƏNİM ulduzladığım mesajlar.
+// GET /api/v1/conversations/:other_user_id/starred
+//
+// KRİTİK fallback: mesaj göstərilir yalnız əgər (1) mən ulduzlamışam,
+// (2) mən silməmişəm, VƏ (3) GÖNDƏRƏN onu silməyib (mesajın sahibi silsə,
+// ulduzlayan da görməməlidir). Şəkil/sender info da qaytarılır.
+func (h *MessageHandler) GetStarredMessages(c *gin.Context) {
+	userIDVal, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+	userID := userIDVal.(uint)
+
+	otherUserID, err := strconv.ParseUint(c.Param("other_user_id"), 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz kullanıcı ID"})
+		return
+	}
+
+	var rows []struct {
+		ID                 string    `gorm:"column:id"`
+		SenderID           uint      `gorm:"column:sender_id"`
+		ReceiverID         uint      `gorm:"column:receiver_id"`
+		EncryptedText      string    `gorm:"column:encrypted_text"`
+		IsEdited           bool      `gorm:"column:is_edited"`
+		CreatedAt          time.Time `gorm:"column:created_at"`
+		SenderName         string    `gorm:"column:sender_name"`
+		SenderUsername     string    `gorm:"column:sender_username"`
+		SenderProfileImage *string   `gorm:"column:sender_profile_image"`
+	}
+
+	// Per-user ulduz + per-user silmə + GÖNDƏRƏN silməyib.
+	query := `
+		SELECT
+			m.id, m.sender_id, m.receiver_id, m.encrypted_text, m.is_edited, m.created_at,
+			u.name as sender_name, u.username as sender_username, p.profile_image as sender_profile_image
+		FROM messages m
+		LEFT JOIN users u ON u.id = m.sender_id
+		LEFT JOIN profiles p ON p.user_id = m.sender_id
+		WHERE ((m.sender_id = ? AND m.receiver_id = ?) OR (m.sender_id = ? AND m.receiver_id = ?))
+		  AND (
+		    CASE WHEN m.sender_id = ? THEN m.starred_by_sender ELSE m.starred_by_receiver END
+		  ) = TRUE
+		  AND (
+		    CASE WHEN m.sender_id = ? THEN m.is_deleted_by_sender ELSE m.is_deleted_by_receiver END
+		  ) = FALSE
+		  AND m.is_deleted_by_sender = FALSE
+		  AND m.deleted_at IS NULL
+		ORDER BY m.created_at DESC
+	`
+
+	if err := database.DB.Raw(query,
+		userID, otherUserID, otherUserID, userID,
+		userID, // ulduz CASE
+		userID, // mənim silmə CASE
+	).Scan(&rows).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ulduzlu mesajlar alınamadı"})
+		return
+	}
+
+	var result []gin.H
+	for _, r := range rows {
+		decrypted, derr := h.encryptionService.DecryptMessage(r.EncryptedText)
+		if derr != nil {
+			decrypted = "Mesaj çözülemedi"
+		}
+		result = append(result, gin.H{
+			"id":                   r.ID,
+			"sender_id":            r.SenderID,
+			"receiver_id":          r.ReceiverID,
+			"text":                 decrypted,
+			"is_edited":            r.IsEdited,
+			"is_starred_by_me":     true,
+			"created_at":           r.CreatedAt,
+			"sender_name":          r.SenderName,
+			"sender_username":      r.SenderUsername,
+			"sender_profile_image": utils.PrependBaseURL(r.SenderProfileImage),
+		})
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"messages": result,
+		"total":    len(result),
+	})
+}
+
 // DELETE /api/v1/conversations/:other_user_id/clear  body: { "delete_type": "me" | "both" }
 func (h *MessageHandler) ClearConversation(c *gin.Context) {
 	u, ok := c.Get("user_id")
@@ -1670,4 +1813,13 @@ LIMIT ? OFFSET ?`
 	c.JSON(http.StatusOK, gin.H{
 		"data": rows,
 	})
+}
+
+// starredByUser — istifadəçi bu mesajı ulduzlayıbmı (per-user). userID mesajın
+// göndəricisidirsə StarredBySender, yoxsa (alıcıdırsa) StarredByReceiver.
+func starredByUser(userID, senderID uint, starredBySender, starredByReceiver bool) bool {
+	if userID == senderID {
+		return starredBySender
+	}
+	return starredByReceiver
 }
