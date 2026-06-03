@@ -90,8 +90,10 @@ type GroupMessageResponse struct {
 }
 
 type MessageReadDetail struct {
-	UserID   uint      `json:"user_id"`
-	Username string    `json:"username"`
-	Avatar   *string   `json:"avatar"`
-	ReadAt   time.Time `json:"read_at"`
+	UserID     uint      `json:"user_id"`
+	Name       string    `json:"name"`
+	Username   string    `json:"username"`
+	IsVerified bool      `json:"is_verified"`
+	Avatar     *string   `json:"avatar"`
+	ReadAt     time.Time `json:"read_at"`
 }

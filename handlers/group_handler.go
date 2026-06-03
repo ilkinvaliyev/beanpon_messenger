@@ -453,6 +453,7 @@ func (h *GroupHandler) GetMembers(c *gin.Context) {
 		UserID       uint       `json:"user_id"`
 		Name         string     `json:"name"`
 		Username     string     `json:"username"`
+		IsVerified   bool       `json:"is_verified"`
 		ProfileImage *string    `json:"profile_image"`
 		Role         string     `json:"role"`
 		JoinedAt     *time.Time `json:"joined_at"`
@@ -460,10 +461,11 @@ func (h *GroupHandler) GetMembers(c *gin.Context) {
 	}
 
 	database.DB.Raw(`
-		SELECT 
+		SELECT
 			cp.user_id,
 			u.name,
 			u.username,
+			u.is_verified,
 			p.profile_image,
 			cp.role,
 			cp.joined_at

@@ -336,9 +336,11 @@ func (h *GroupMessageHandler) GetMessageReads(c *gin.Context) {
 
 	var reads []models.MessageReadDetail
 	database.DB.Raw(`
-		SELECT 
+		SELECT
 			mr.user_id,
+			u.name,
 			u.username,
+			u.is_verified,
 			p.profile_image as avatar,
 			mr.read_at
 		FROM message_reads mr
@@ -348,6 +350,11 @@ func (h *GroupMessageHandler) GetMessageReads(c *gin.Context) {
 		  AND mr.user_id != ?
 		ORDER BY mr.read_at ASC
 	`, messageID, msg.SenderID).Scan(&reads)
+
+	// Avatar nisbi yol gəlir — tam URL-ə çevir (Flutter birbaşa göstərsin).
+	for i := range reads {
+		reads[i].Avatar = utils.PrependBaseURL(reads[i].Avatar)
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"reads": reads,
