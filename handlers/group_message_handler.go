@@ -22,6 +22,7 @@ type GroupMessageHandler struct {
 		IsUserOnline(userID uint) bool
 		SendToUser(userID uint, messageType string, data interface{})
 		SendToMultipleUsers(userIDs []uint, messageType string, data interface{})
+		SendGroupPushNotification(conversationID, senderID uint, groupName, message string, memberIDs []uint)
 	}
 }
 
@@ -34,6 +35,7 @@ func NewGroupMessageHandler(
 		IsUserOnline(userID uint) bool
 		SendToUser(userID uint, messageType string, data interface{})
 		SendToMultipleUsers(userIDs []uint, messageType string, data interface{})
+		SendGroupPushNotification(conversationID, senderID uint, groupName, message string, memberIDs []uint)
 	},
 ) *GroupMessageHandler {
 	return &GroupMessageHandler{
@@ -123,10 +125,11 @@ func (h *GroupMessageHandler) SendGroupMessage(c *gin.Context) {
 	var senderInfo struct {
 		Name         string  `json:"name"`
 		Username     string  `json:"username"`
+		IsVerified   bool    `json:"is_verified"`
 		ProfileImage *string `json:"profile_image"`
 	}
 	database.DB.Raw(`
-		SELECT u.name, u.username, p.profile_image
+		SELECT u.name, u.username, u.is_verified, p.profile_image
 		FROM users u
 		LEFT JOIN profiles p ON p.user_id = u.id
 		WHERE u.id = ?
@@ -156,6 +159,7 @@ func (h *GroupMessageHandler) SendGroupMessage(c *gin.Context) {
 		"sender_id":           senderID,
 		"sender_name":         senderInfo.Name,
 		"sender_username":     senderInfo.Username,
+		"sender_is_verified":  senderInfo.IsVerified,
 		"sender_avatar":       utils.PrependBaseURL(senderInfo.ProfileImage),
 		"text":                req.Text,
 		"reply_to_message_id": req.ReplyToMessageID,
@@ -163,6 +167,24 @@ func (h *GroupMessageHandler) SendGroupMessage(c *gin.Context) {
 		"created_at":          now.UTC().Format(time.RFC3339),
 	}
 	h.wsHub.SendToMultipleUsers(memberIDs, "new_group_message", wsPayload)
+
+	// Push notification: mute olmayan üzvlərə (göndərən xaric). Mute yoxlaması
+	// burada (Go) edilir; Laravel sadəcə verilən siyahıya FCM göndərir.
+	var pushTargets []uint
+	database.DB.Model(&models.ConversationParticipant{}).
+		Where("conversation_id = ? AND user_id != ? AND left_at IS NULL AND deleted_at IS NULL", conversationID, senderID).
+		Where("is_muted = false OR (muted_until IS NOT NULL AND muted_until < ?)", now).
+		Pluck("user_id", &pushTargets)
+
+	if len(pushTargets) > 0 {
+		// Qrup adı (bildiriş başlığı üçün).
+		var groupName string
+		database.DB.Table("conversations").
+			Where("id = ?", conversationID).
+			Select("COALESCE(group_name, '')").
+			Scan(&groupName)
+		h.wsHub.SendGroupPushNotification(conversationID, senderID, groupName, req.Text, pushTargets)
+	}
 
 	c.JSON(http.StatusCreated, gin.H{
 		"message": "Mesaj gönderildi",
@@ -199,6 +221,7 @@ func (h *GroupMessageHandler) GetGroupMessages(c *gin.Context) {
 		SenderID         uint      `gorm:"column:sender_id"`
 		SenderName       string    `gorm:"column:sender_name"`
 		SenderUsername   string    `gorm:"column:sender_username"`
+		SenderIsVerified bool      `gorm:"column:sender_is_verified"`
 		SenderAvatar     *string   `gorm:"column:sender_avatar"`
 		EncryptedText    string    `gorm:"column:encrypted_text"`
 		ReplyToMessageID *string   `gorm:"column:reply_to_message_id"`
@@ -209,11 +232,12 @@ func (h *GroupMessageHandler) GetGroupMessages(c *gin.Context) {
 	}
 
 	database.DB.Raw(`
-		SELECT 
+		SELECT
 			m.id,
 			m.sender_id,
 			u.name as sender_name,
 			u.username as sender_username,
+			u.is_verified as sender_is_verified,
 			p.profile_image as sender_avatar,
 			m.encrypted_text,
 			m.reply_to_message_id,
@@ -248,6 +272,7 @@ func (h *GroupMessageHandler) GetGroupMessages(c *gin.Context) {
 			"sender_id":           msg.SenderID,
 			"sender_name":         msg.SenderName,
 			"sender_username":     msg.SenderUsername,
+			"sender_is_verified":  msg.SenderIsVerified,
 			"sender_avatar":       utils.PrependBaseURL(msg.SenderAvatar),
 			"text":                text,
 			"reply_to_message_id": msg.ReplyToMessageID,

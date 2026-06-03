@@ -1026,6 +1026,62 @@ func (c *Client) writePump() {
 	}
 }
 
+// SendGroupPushNotification qrup mesajı üçün push notification göndərir (async).
+// memberIDs — mute olmayan üzvlər (göndərən onsuz da Go tərəfdə çıxarılıb, amma
+// Laravel də sender_id-ni təhlükəsizlik üçün siyahıdan çıxarır). Laravel
+// `/notification/new-group-message` endpoint-i hamısına FCM göndərir.
+func (h *Hub) SendGroupPushNotification(conversationID, senderID uint, groupName, message string, memberIDs []uint) {
+	go func() {
+		if len(memberIDs) == 0 {
+			return
+		}
+		if h.config.CloudToken == "" {
+			log.Printf("❌ CloudToken boş! (qrup push)")
+			return
+		}
+		if h.config.BackendUrl == "" {
+			log.Printf("❌ BackendUrl boş! (qrup push)")
+			return
+		}
+
+		url := h.config.BackendUrl + "/notification/new-group-message"
+		payload := map[string]interface{}{
+			"receiver_ids":    memberIDs,
+			"sender_id":       senderID,
+			"conversation_id": conversationID,
+			"group_name":      groupName,
+			"message":         message,
+		}
+
+		jsonData, err := json.Marshal(payload)
+		if err != nil {
+			log.Printf("❌ Qrup push payload marshal hatası: %v", err)
+			return
+		}
+
+		req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+		if err != nil {
+			log.Printf("❌ Qrup push request oluşturma hatası: %v", err)
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-api-key", h.config.CloudToken)
+
+		resp, err := h.httpClient.Do(req)
+		if err != nil {
+			log.Printf("❌ Qrup push göndərmə hatası: %v", err)
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode == 200 {
+			log.Printf("✅ Qrup push göndərildi: conv=%d sender=%d → %d üzv", conversationID, senderID, len(memberIDs))
+		} else {
+			log.Printf("❌ Qrup push uğursuz, status: %d", resp.StatusCode)
+		}
+	}()
+}
+
 // sendPushNotification push notification göndər (async)
 func (h *Hub) sendPushNotification(senderID, receiverID uint, message, msgType string) {
 	go func() {

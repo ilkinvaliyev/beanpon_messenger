@@ -930,22 +930,24 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
                 PARTITION BY CASE WHEN sender_id = ? THEN receiver_id ELSE sender_id END 
                 ORDER BY created_at DESC
             ) as rn
-        FROM messages 
+        FROM messages
         WHERE (sender_id = ? OR receiver_id = ?)
+        AND conversation_id IS NULL
         AND (
-            CASE 
+            CASE
                 WHEN sender_id = ? THEN is_deleted_by_sender = false
                 ELSE is_deleted_by_receiver = false
             END
         )
     ),
     unread_counts AS (
-        SELECT 
+        SELECT
             sender_id as other_user_id,
             COUNT(*) as unread_count
-        FROM messages 
-        WHERE receiver_id = ? AND read = false 
+        FROM messages
+        WHERE receiver_id = ? AND read = false
         AND is_deleted_by_receiver = false
+        AND conversation_id IS NULL
         GROUP BY sender_id
     )
     SELECT 
