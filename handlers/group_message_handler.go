@@ -283,9 +283,10 @@ func (h *GroupMessageHandler) GetGroupMessages(c *gin.Context) {
 		if msg.ReplyToMessageID != nil && msg.ReplyText != nil {
 			replyText, _ := h.encryptionService.DecryptMessage(*msg.ReplyText)
 			item["reply_to_message"] = gin.H{
-				"id":        *msg.ReplyToMessageID,
-				"sender_id": msg.ReplyToSenderID,
-				"text":      replyText,
+				"id":         *msg.ReplyToMessageID,
+				"sender_id":  msg.ReplyToSenderID,
+				"text":       replyText,
+				"created_at": msg.CreatedAt, // reply-də də tarix (Flutter parse crash olmasın)
 			}
 		}
 
