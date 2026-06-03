@@ -797,6 +797,7 @@ func (h *GroupHandler) UpdateGroup(c *gin.Context) {
 	var body struct {
 		Name        *string `json:"name"`
 		Description *string `json:"description"`
+		Avatar      *string `json:"avatar"` // S3 URL (Laravel-dən yüklənib gəlir)
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -809,6 +810,14 @@ func (h *GroupHandler) UpdateGroup(c *gin.Context) {
 	}
 	if body.Description != nil {
 		updates["group_desc"] = *body.Description
+	}
+	// Avatar: boş string göndərilsə silinir (NULL), dolu URL set edilir.
+	if body.Avatar != nil {
+		if *body.Avatar == "" {
+			updates["group_avatar"] = nil
+		} else {
+			updates["group_avatar"] = *body.Avatar
+		}
 	}
 
 	if len(updates) == 0 {

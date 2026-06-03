@@ -719,6 +719,14 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 			})
 		}
 
+	case "group_typing":
+		// Qrupda yazma — həmin qrupun digər üzvlərinə bildir.
+		c.Hub.handleGroupTyping(c.UserID, msg.Data, true)
+
+	case "group_typing_stop":
+		// Qrupda yazmağı dayandırdı.
+		c.Hub.handleGroupTyping(c.UserID, msg.Data, false)
+
 	case "get_online_users":
 		// Online kullanıcı listesini gönder
 		onlineUsers := c.Hub.GetConnectedUsers()
@@ -1173,6 +1181,39 @@ func (h *Hub) SendUnreadCountUpdate(userID uint) {
 	})
 
 	log.Printf("Okunmamış mesaj sayısı gönderildi: User %d, Count: %d", userID, count)
+}
+
+// handleGroupTyping qrupda yazma/dayandırma siqnalını həmin qrupun digər
+// aktiv üzvlərinə yayır. data içindən conversation_id çıxarılır (JSON number
+// → float64). DM "typing" ilə simmetrikdir, amma tək receiver yerine qrup
+// üzvlərinə (göndərən istisna) göndərilir.
+func (h *Hub) handleGroupTyping(userID uint, data interface{}, isTyping bool) {
+	dataMap, ok := data.(map[string]interface{})
+	if !ok {
+		return
+	}
+	convFloat, ok := dataMap["conversation_id"].(float64)
+	if !ok || convFloat <= 0 {
+		return
+	}
+	conversationID := uint(convFloat)
+
+	// Qrupun aktiv üzvlərini çək (left_at IS NULL).
+	var memberIDs []uint
+	h.db.Model(&models.ConversationParticipant{}).
+		Where("conversation_id = ? AND left_at IS NULL AND deleted_at IS NULL", conversationID).
+		Pluck("user_id", &memberIDs)
+
+	for _, mid := range memberIDs {
+		if mid == userID {
+			continue // göndərənə qaytarma
+		}
+		h.SendToUser(mid, "group_typing", map[string]interface{}{
+			"conversation_id": conversationID,
+			"user_id":         userID,
+			"typing":          isTyping,
+		})
+	}
 }
 
 // handleAddReaction mesaja reaction ekle
