@@ -238,6 +238,10 @@ func (h *GroupMessageHandler) GetGroupMessages(c *gin.Context) {
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
 	offset := (page - 1) * limit
 
+	// peek=true — ÖNİZLƏMƏ rejimi (uzun-bas preview): mesajlar OXUNDU
+	// İŞARƏLƏNMİR. WhatsApp davranışı — peek görüldü sayılmır.
+	peek := c.DefaultQuery("peek", "false") == "true"
+
 	// Yeni qoşulan üzv KÖHNƏ mesajları görmür: yalnız joined_at-dan SONRAKI
 	// mesajlar. JoinedAt null-dursa (köhnə qeydlər) participant created_at
 	// fallback. cleared_at varsa ("söhbəti təmizlə — özüm üçün") ondan sonrakı.
@@ -307,7 +311,10 @@ func (h *GroupMessageHandler) GetGroupMessages(c *gin.Context) {
 		LIMIT ? OFFSET ?
 	`, userID, conversationID, joinedAtFilter, me.ClearedAt, userID, userID, limit, offset).Scan(&messages)
 
-	go h.markGroupMessagesRead(userID, conversationID)
+	// peek rejimində OXUNDU işarələnmir (önizləmə görüldü sayılmır).
+	if !peek {
+		go h.markGroupMessagesRead(userID, conversationID)
+	}
 
 	// Reaksiyalar — N+1 yox: səhifədəki bütün mesaj id-ləri üçün BİR sorğu,
 	// sonra Go-da map ilə mesajlara paylanır.

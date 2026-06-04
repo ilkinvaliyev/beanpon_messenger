@@ -410,6 +410,10 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
 	offset := (page - 1) * limit
 
+	// peek=true — ÖNİZLƏMƏ rejimi (uzun-bas preview): mesajlar OXUNDU
+	// İŞARƏLƏNMİR. WhatsApp davranışı — peek görüldü sayılmır.
+	peek := c.DefaultQuery("peek", "false") == "true"
+
 	var messages []struct {
 		ID                   string     `gorm:"column:id"`
 		SenderID             uint       `gorm:"column:sender_id"`
@@ -544,7 +548,10 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 		responseMessages = append(responseMessages, responseMessage)
 	}
 
-	go h.markReceivedMessagesAsRead(userID.(uint), uint(otherUserID))
+	// peek rejimində OXUNDU işarələnmir (önizləmə görüldü sayılmır).
+	if !peek {
+		go h.markReceivedMessagesAsRead(userID.(uint), uint(otherUserID))
+	}
 
 	var totalCount int64
 	countQuery := `
