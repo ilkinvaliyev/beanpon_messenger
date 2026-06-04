@@ -190,23 +190,25 @@ func (h *GroupMessageHandler) SendGroupMessage(c *gin.Context) {
 	}
 	h.wsHub.SendToMultipleUsers(memberIDs, "new_group_message", wsPayload)
 
-	// Push notification: mute olmayan üzvlərə (göndərən xaric). Mute yoxlaması
-	// burada (Go) edilir; Laravel sadəcə verilən siyahıya FCM göndərir.
-	var pushTargets []uint
-	database.DB.Model(&models.ConversationParticipant{}).
-		Where("conversation_id = ? AND user_id != ? AND left_at IS NULL AND deleted_at IS NULL", conversationID, senderID).
-		Where("is_muted = false OR (muted_until IS NOT NULL AND muted_until < ?)", now).
-		Pluck("user_id", &pushTargets)
-
-	if len(pushTargets) > 0 {
-		// Qrup adı (bildiriş başlığı üçün).
-		var groupName string
-		database.DB.Table("conversations").
-			Where("id = ?", conversationID).
-			Select("COALESCE(group_name, '')").
-			Scan(&groupName)
-		h.wsHub.SendGroupPushNotification(conversationID, senderID, groupName, req.Text, pushTargets)
-	}
+	// Push notification (FCM) — MÜVƏQQƏTİ SÖNDÜRÜLÜB (istifadəçi istəyi).
+	// Geri qaytarmaq üçün bu bloku comment-dən çıxar. Laravel endpoint
+	// (/notification/new-group-message) və hub.SendGroupPushNotification
+	// toxunulmaz qalır.
+	// var pushTargets []uint
+	// database.DB.Model(&models.ConversationParticipant{}).
+	// 	Where("conversation_id = ? AND user_id != ? AND left_at IS NULL AND deleted_at IS NULL", conversationID, senderID).
+	// 	Where("is_muted = false OR (muted_until IS NOT NULL AND muted_until < ?)", now).
+	// 	Pluck("user_id", &pushTargets)
+	//
+	// if len(pushTargets) > 0 {
+	// 	// Qrup adı (bildiriş başlığı üçün).
+	// 	var groupName string
+	// 	database.DB.Table("conversations").
+	// 		Where("id = ?", conversationID).
+	// 		Select("COALESCE(group_name, '')").
+	// 		Scan(&groupName)
+	// 	h.wsHub.SendGroupPushNotification(conversationID, senderID, groupName, req.Text, pushTargets)
+	// }
 
 	c.JSON(http.StatusCreated, gin.H{
 		"message": "Mesaj gönderildi",
