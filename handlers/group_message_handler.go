@@ -66,10 +66,11 @@ func (h *GroupMessageHandler) SendGroupMessage(c *gin.Context) {
 		return
 	}
 
-	// Grup üyesi ve kısıtlı değil mi?
+	// Grup üyesi ve kısıtlı değil mi? PENDING dəvət (hələ qəbul etməyib)
+	// mesaj YAZA BİLMƏZ.
 	var participant models.ConversationParticipant
 	err = database.DB.Where(
-		"conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL",
+		"conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL AND COALESCE(invite_status, 'active') = 'active'",
 		conversationID, senderID,
 	).First(&participant).Error
 	if err != nil {
@@ -242,9 +243,10 @@ func (h *GroupMessageHandler) GetGroupMessages(c *gin.Context) {
 	}
 	conversationID := uint(convID)
 
+	// PENDING dəvət (hələ qəbul etməyib) mesajları OXUYA BİLMƏZ.
 	var me models.ConversationParticipant
 	err = database.DB.Where(
-		"conversation_id = ? AND user_id = ? AND deleted_at IS NULL",
+		"conversation_id = ? AND user_id = ? AND deleted_at IS NULL AND COALESCE(invite_status, 'active') = 'active'",
 		conversationID, userID,
 	).First(&me).Error
 	if err != nil {
@@ -548,9 +550,10 @@ func (h *GroupMessageHandler) findGroupMessage(c *gin.Context, messageID string,
 		return msg, false
 	}
 
+	// PENDING dəvət mesaj əməliyyatları edə bilməz.
 	var me models.ConversationParticipant
 	err = database.DB.Where(
-		"conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL",
+		"conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL AND COALESCE(invite_status, 'active') = 'active'",
 		*msg.ConversationID, userID,
 	).First(&me).Error
 	if err != nil {

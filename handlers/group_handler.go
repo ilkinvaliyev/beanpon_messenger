@@ -4,10 +4,14 @@ import (
 	"beanpon_messenger/database"
 	"beanpon_messenger/models"
 	"beanpon_messenger/utils"
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"time"
 
@@ -58,6 +62,126 @@ func getGroupParticipantIDs(conversationID uint) []uint {
 		Where("conversation_id = ? AND left_at IS NULL AND deleted_at IS NULL", conversationID).
 		Pluck("user_id", &ids)
 	return ids
+}
+
+// sendGroupInvitePush — "X sizi Y qrupuna dəvət etdi" FCM push-u Laravel
+// üzərindən (`/notification/group-invite`). Laravel həm FCM göndərir, həm
+// notifications cədvəlinə yazır (bildirimlər səhifəsində görünsün).
+// Qeyri-bloklayıcı (goroutine-də çağırılır), xəta yalnız loglanır.
+func (h *GroupHandler) sendGroupInvitePush(inviterID, conversationID uint, groupName string, receiverIDs []uint) {
+	backendURL := os.Getenv("BACKEND_URL")
+	cloudToken := os.Getenv("CLOUD_TOKEN")
+	if backendURL == "" || cloudToken == "" || len(receiverIDs) == 0 {
+		return
+	}
+
+	payload := map[string]interface{}{
+		"receiver_ids":    receiverIDs,
+		"inviter_id":      inviterID,
+		"conversation_id": conversationID,
+		"group_name":      groupName,
+	}
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+
+	req, err := http.NewRequest("POST", backendURL+"/notification/group-invite",
+		bytes.NewBuffer(jsonData))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", cloudToken)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("❌ Qrup dəvət push xətası: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		log.Printf("❌ Qrup dəvət push uğursuz, status: %d", resp.StatusCode)
+	}
+}
+
+// POST /api/v1/groups/:conversation_id/invite/accept
+// PENDING dəvəti QƏBUL et → tam üzv (invite_status='active'). Bütün üzvlərə
+// group_member_joined WS event-i (mövcud "qatıldı" axını ilə eyni).
+func (h *GroupHandler) AcceptInvite(c *gin.Context) {
+	userID := c.MustGet("user_id").(uint)
+	convID, err := strconv.ParseUint(c.Param("conversation_id"), 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz conversation_id"})
+		return
+	}
+	conversationID := uint(convID)
+
+	var p models.ConversationParticipant
+	err = database.DB.Where(
+		"conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL AND invite_status = 'pending'",
+		conversationID, userID,
+	).First(&p).Error
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Bekleyen davet bulunamadı"})
+		return
+	}
+
+	now := time.Now()
+	if err := database.DB.Model(&p).Updates(map[string]interface{}{
+		"invite_status": "active",
+		"joined_at":     now,
+	}).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Davet kabul edilemedi"})
+		return
+	}
+
+	// Üzvlərə "X qatıldı" bildir (mövcud event adı — Flutter onsuz da emal edir).
+	var username string
+	database.DB.Raw(`SELECT username FROM users WHERE id = ?`, userID).Scan(&username)
+	memberIDs := getGroupParticipantIDs(conversationID)
+	h.wsHub.SendToMultipleUsers(memberIDs, "group_member_joined", gin.H{
+		"conversation_id": conversationID,
+		"user_id":         userID,
+		"username":        username,
+	})
+
+	var groupName string
+	database.DB.Table("conversations").
+		Where("id = ?", conversationID).
+		Select("COALESCE(group_name, '')").Scan(&groupName)
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":         "Davet kabul edildi",
+		"conversation_id": conversationID,
+		"group_name":      groupName,
+		"my_role":         p.Role,
+	})
+}
+
+// POST /api/v1/groups/:conversation_id/invite/decline
+// PENDING dəvəti RƏDD et → participant sətri silinir (qrup siyahıdan çıxır).
+func (h *GroupHandler) DeclineInvite(c *gin.Context) {
+	userID := c.MustGet("user_id").(uint)
+	convID, err := strconv.ParseUint(c.Param("conversation_id"), 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz conversation_id"})
+		return
+	}
+	conversationID := uint(convID)
+
+	result := database.DB.Unscoped().Where(
+		"conversation_id = ? AND user_id = ? AND invite_status = 'pending'",
+		conversationID, userID,
+	).Delete(&models.ConversationParticipant{})
+
+	if result.RowsAffected == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Bekleyen davet bulunamadı"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Davet reddedildi"})
 }
 
 // filterInvitableUsers — qrup dəvəti İCAZƏ filtri (Laravel
@@ -191,7 +315,10 @@ func (h *GroupHandler) CreateGroup(c *gin.Context) {
 	}
 	database.DB.Create(&owner)
 
-	// Başlangıç üyelerini ekle
+	// Başlangıç üyeleri — PENDING dəvət kimi (onay axını). Üzv "Qatıl"
+	// deyənə qədər mesajları görmür; siyahıda "qrupa dəvət edildiniz"
+	// sətri görünür.
+	pendingStatus := "pending"
 	for _, memberID := range req.MemberIDs {
 		if memberID == userID {
 			continue
@@ -201,15 +328,19 @@ func (h *GroupHandler) CreateGroup(c *gin.Context) {
 			UserID:         memberID,
 			Role:           "member",
 			JoinedAt:       &now,
+			InviteStatus:   &pendingStatus,
 		}
 		database.DB.Create(&member)
 
-		// Bildirim gönder
-		h.wsHub.SendToUser(memberID, "group_added", gin.H{
+		// WS bildirimi (siyahı yenilənsin) + FCM (Laravel üzərindən).
+		h.wsHub.SendToUser(memberID, "group_invited", gin.H{
 			"conversation_id": conversation.ID,
 			"group_name":      req.Name,
-			"added_by":        userID,
+			"invited_by":      userID,
 		})
+	}
+	if len(req.MemberIDs) > 0 {
+		go h.sendGroupInvitePush(userID, conversation.ID, req.Name, req.MemberIDs)
 	}
 
 	// YARADANA da group_added göndər — ConversationsPage bu event-də qrup
@@ -916,6 +1047,7 @@ func (h *GroupHandler) GetMyGroups(c *gin.Context) {
 		GroupName          *string    `json:"group_name"`
 		GroupAvatar        *string    `json:"group_avatar"`
 		MyRole             string     `json:"my_role"`
+		InviteStatus       string     `json:"invite_status"`
 		IsMuted            bool       `json:"is_muted"`
 		IsPinned           bool       `json:"is_pinned"`
 		PinnedAt           *time.Time `json:"pinned_at"`
@@ -933,6 +1065,7 @@ func (h *GroupHandler) GetMyGroups(c *gin.Context) {
 			c.group_name,
 			c.group_avatar,
 			cp.role as my_role,
+			COALESCE(cp.invite_status, 'active') as invite_status,
 			cp.is_muted,
 			COALESCE(cp.is_pinned, false) as is_pinned,
 			cp.pinned_at,
@@ -1183,17 +1316,19 @@ func (h *GroupHandler) AddMembers(c *gin.Context) {
 				continue // zaten üye
 			}
 
-			// Daha önce ayrılmış mı?
+			// Daha önce ayrılmış mı? → PENDING dəvət kimi yenilə.
+			pendingStatus := "pending"
 			var old models.ConversationParticipant
 			err = tx.Unscoped().Where(
 				"conversation_id = ? AND user_id = ?", conversationID, uid,
 			).First(&old).Error
 			if err == nil {
 				if err := tx.Model(&old).Updates(map[string]interface{}{
-					"left_at":    nil,
-					"kicked_by":  nil,
-					"deleted_at": nil,
-					"joined_at":  now,
+					"left_at":       nil,
+					"kicked_by":     nil,
+					"deleted_at":    nil,
+					"joined_at":     now,
+					"invite_status": pendingStatus,
 				}).Error; err != nil {
 					return err
 				}
@@ -1203,6 +1338,7 @@ func (h *GroupHandler) AddMembers(c *gin.Context) {
 					UserID:         uid,
 					Role:           "member",
 					JoinedAt:       &now,
+					InviteStatus:   &pendingStatus,
 				}
 				if err := tx.Create(&participant).Error; err != nil {
 					return err
@@ -1224,12 +1360,21 @@ func (h *GroupHandler) AddMembers(c *gin.Context) {
 	}
 
 	// Bildirimlər TRANSACTION-dan SONRA (kilid tutularkən WS göndərmə).
+	// PENDING dəvət — group_invited event-i (siyahıda "dəvət edildiniz").
 	for _, uid := range added {
-		h.wsHub.SendToUser(uid, "group_added", gin.H{
+		h.wsHub.SendToUser(uid, "group_invited", gin.H{
 			"conversation_id": conversationID,
 			"group_name":      conv.GroupName,
-			"added_by":        requesterID,
+			"invited_by":      requesterID,
 		})
+	}
+	// FCM push (Laravel üzərindən): "X sizi Y qrupuna dəvət etdi".
+	if len(added) > 0 {
+		groupName := ""
+		if conv.GroupName != nil {
+			groupName = *conv.GroupName
+		}
+		go h.sendGroupInvitePush(requesterID, conversationID, groupName, added)
 	}
 
 	// Əlavə olunanların username-ləri — Flutter çatda "X qrupa qatıldı"

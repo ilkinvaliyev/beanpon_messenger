@@ -255,6 +255,9 @@ func main() {
 		api.POST("/groups/join/:token", groupHandler.JoinByToken)
 		// Dəvət linki önizləməsi — qoşulmazdan əvvəl qrup adı/avatar/üzvlər.
 		api.GET("/groups/join/:token/preview", groupHandler.PreviewByToken)
+		// Pending dəvəti qəbul et / rədd et (üzv əlavə etmə onay axını).
+		api.POST("/groups/:conversation_id/invite/accept", groupHandler.AcceptInvite)
+		api.POST("/groups/:conversation_id/invite/decline", groupHandler.DeclineInvite)
 		api.POST("/groups/:conversation_id/leave", groupHandler.LeaveGroup)
 		api.POST("/groups/:conversation_id/kick/:user_id", groupHandler.KickMember)
 		api.PUT("/groups/:conversation_id/role/:user_id", groupHandler.ChangeRole)

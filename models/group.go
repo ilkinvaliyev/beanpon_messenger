@@ -6,10 +6,15 @@ import (
 )
 
 type ConversationParticipant struct {
-	ID                 uint           `json:"id" gorm:"primaryKey"`
-	ConversationID     uint           `json:"conversation_id" gorm:"not null;index"`
-	UserID             uint           `json:"user_id" gorm:"not null;index"`
-	Role               string         `json:"role" gorm:"type:varchar(10);default:'member';check:role IN ('owner','admin','member')"`
+	ID             uint   `json:"id" gorm:"primaryKey"`
+	ConversationID uint   `json:"conversation_id" gorm:"not null;index"`
+	UserID         uint   `json:"user_id" gorm:"not null;index"`
+	Role           string `json:"role" gorm:"type:varchar(10);default:'member';check:role IN ('owner','admin','member')"`
+	// Dəvət statusu: 'active' (tam üzv) | 'pending' (dəvət edilib, hələ
+	// qəbul etməyib). Pending üzv qrupu SİYAHIDA görür amma mesajları
+	// GÖRMÜR/yaza bilmir; Qatıl → active, Rədd et → sətir silinir.
+	// NULL = köhnə qeydlər → active sayılır (migration default 'active').
+	InviteStatus       *string        `json:"invite_status" gorm:"type:varchar(10);default:'active'"`
 	Nickname           *string        `json:"nickname" gorm:"type:varchar(255)"`
 	IsMuted            bool           `json:"is_muted" gorm:"default:false"`
 	MutedUntil         *time.Time     `json:"muted_until"`
