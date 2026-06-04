@@ -1720,6 +1720,133 @@ func (h *MessageHandler) EditMessage(c *gin.Context) {
 	})
 }
 
+// MarkViewOnceOpened — ① "bir dəfə bax" media AÇILDI (DM mesajı).
+// POST /api/v1/messages/:message_id/view-once-opened
+//
+// Axın:
+//  1. Mesaj decrypt edilir, JSON-da `view_once: true` yoxlanır.
+//  2. Çağıran user `view_once_opened_by` massivinə əlavə edilir (idempotent —
+//     artıq varsa 200 + already_opened qaytarılır, təkrar yazılmır).
+//  3. Yenilənmiş JSON yenidən şifrələnib saxlanır.
+//  4. Hər iki tərəfə MÖVCUD `message_edited` WS event-i göndərilir — client-lər
+//     onsuz da bu event-də mesaj mətnini yeniləyib cache-ə yazır, beləliklə
+//     "Opened" statusu real-time sinxronlaşır və fetch-də qalıcı olur.
+//
+// Yalnız DM iştirakçıları (sender VƏ YA receiver) aça bilər. Göndərən öz
+// göndərdiyinə də bir dəfə baxa bilir (tələbə uyğun).
+func (h *MessageHandler) MarkViewOnceOpened(c *gin.Context) {
+	userIDVal, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+	userID := userIDVal.(uint)
+	messageID := c.Param("message_id")
+
+	var message models.Message
+	if err := database.DB.Where("id = ?", messageID).First(&message).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Mesaj tapılmadı"})
+		return
+	}
+
+	// Yalnız DM mesajı (qrup üçün ayrı endpoint — üzvlük yoxlanışı fərqlidir).
+	if message.ConversationID != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Qrup mesajı üçün qrup endpoint-indən istifadə edin"})
+		return
+	}
+
+	// Yalnız iştirakçılar: sender və ya receiver.
+	isParticipant := message.SenderID == userID ||
+		(message.ReceiverID != nil && *message.ReceiverID == userID)
+	if !isParticipant {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Bu mesaja giriş icazəniz yoxdur"})
+		return
+	}
+
+	newText, status, errMsg, alreadyOpened := h.applyViewOnceOpened(&message, userID)
+	if errMsg != "" {
+		c.JSON(status, gin.H{"error": errMsg})
+		return
+	}
+	if alreadyOpened {
+		c.JSON(http.StatusOK, gin.H{"message": "Artıq açılıb", "already_opened": true})
+		return
+	}
+
+	// WS — mövcud message_edited axını (client _handleMessageEdited bunu
+	// text + cache update kimi emal edir; is_edited UI etiketi view-once
+	// pill-də onsuz da görünmür).
+	editPayload := map[string]interface{}{
+		"message_id":       messageID,
+		"text":             newText,
+		"is_edited":        message.IsEdited,
+		"view_once_opened": true,
+		"opened_by":        userID,
+	}
+	h.wsHub.SendToUser(message.SenderID, "message_edited", editPayload)
+	if message.ReceiverID != nil && *message.ReceiverID != message.SenderID {
+		h.wsHub.SendToUser(*message.ReceiverID, "message_edited", editPayload)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Açıldı", "data": editPayload})
+}
+
+// applyViewOnceOpened — mesaj JSON-unu decrypt edib `view_once_opened_by`
+// massivinə userID əlavə edir, yenidən şifrələyib DB-yə yazır.
+// Qaytarır: (yeniText, httpStatus, errorMsg, alreadyOpened).
+// DM və qrup handler-ları paylaşır.
+func (h *MessageHandler) applyViewOnceOpened(message *models.Message, userID uint) (string, int, string, bool) {
+	decrypted, err := h.encryptionService.DecryptMessage(message.EncryptedText)
+	if err != nil {
+		return "", http.StatusInternalServerError, "Mesaj çözülemedi", false
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal([]byte(decrypted), &payload); err != nil {
+		return "", http.StatusBadRequest, "Bu mesaj view-once media deyil", false
+	}
+	if payload["view_once"] != true {
+		return "", http.StatusBadRequest, "Bu mesaj view-once media deyil", false
+	}
+
+	// Mövcud opened siyahısı.
+	openedBy := []uint{}
+	if raw, ok := payload["view_once_opened_by"].([]interface{}); ok {
+		for _, v := range raw {
+			if f, ok := v.(float64); ok {
+				openedBy = append(openedBy, uint(f))
+			}
+		}
+	}
+	for _, id := range openedBy {
+		if id == userID {
+			return decrypted, http.StatusOK, "", true // idempotent
+		}
+	}
+	openedBy = append(openedBy, userID)
+	payload["view_once_opened_by"] = openedBy
+
+	newTextBytes, err := json.Marshal(payload)
+	if err != nil {
+		return "", http.StatusInternalServerError, "JSON xətası", false
+	}
+	newText := string(newTextBytes)
+
+	encrypted, err := h.encryptionService.EncryptMessage(newText)
+	if err != nil {
+		return "", http.StatusInternalServerError, "Şifrələmə xətası", false
+	}
+
+	if err := database.DB.Model(message).Updates(map[string]interface{}{
+		"encrypted_text": encrypted,
+		"updated_at":     time.Now().UTC(),
+	}).Error; err != nil {
+		return "", http.StatusInternalServerError, "Mesaj yenilənə bilmədi", false
+	}
+
+	return newText, http.StatusOK, "", false
+}
+
 // GetShareRecipients — share modal-da göstəriləcək tövsiyə olunan istifadəçilər.
 // Wave/post share zamanı ilkin auditoriya `follow-list`-dən deyil, **chat
 // keçmişindən** alınır: ən son danışdığım VƏ ən çox danışdığım dostlar

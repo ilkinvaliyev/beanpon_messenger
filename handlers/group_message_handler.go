@@ -4,6 +4,7 @@ import (
 	"beanpon_messenger/database"
 	"beanpon_messenger/models"
 	"beanpon_messenger/utils"
+	"encoding/json"
 	"net/http"
 	"strconv"
 	"time"
@@ -645,6 +646,93 @@ func (h *GroupMessageHandler) EditGroupMessage(c *gin.Context) {
 		"message": "Mesaj güncellendi",
 		"data":    editPayload,
 	})
+}
+
+// POST /api/v1/groups/messages/:message_id/view-once-opened
+// ① "Bir dəfə bax" media AÇILDI (qrup mesajı). DM variantı:
+// MessageHandler.MarkViewOnceOpened. Hər üzv mediaya YALNIZ BİR DƏFƏ baxa
+// bilər — açan user mesaj JSON-undakı `view_once_opened_by` massivinə
+// yazılır (idempotent), yenidən şifrələnir və bütün üzvlərə MÖVCUD
+// `group_message_edited` WS event-i ilə yayılır (client-lər onsuz da text-i
+// yeniləyib cache-ə yazır → "Opened" statusu real-time + qalıcı).
+func (h *GroupMessageHandler) MarkGroupViewOnceOpened(c *gin.Context) {
+	userID := c.MustGet("user_id").(uint)
+	messageID := c.Param("message_id")
+
+	// findGroupMessage üzvlük yoxlanışını da edir.
+	msg, ok := h.findGroupMessage(c, messageID, userID)
+	if !ok {
+		return
+	}
+
+	decrypted, err := h.encryptionService.DecryptMessage(msg.EncryptedText)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Mesaj çözülemedi"})
+		return
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal([]byte(decrypted), &payload); err != nil || payload["view_once"] != true {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Bu mesaj view-once media deyil"})
+		return
+	}
+
+	// Mövcud opened siyahısı — idempotentlik üçün.
+	openedBy := []uint{}
+	if raw, isList := payload["view_once_opened_by"].([]interface{}); isList {
+		for _, v := range raw {
+			if f, isNum := v.(float64); isNum {
+				openedBy = append(openedBy, uint(f))
+			}
+		}
+	}
+	for _, id := range openedBy {
+		if id == userID {
+			c.JSON(http.StatusOK, gin.H{"message": "Artıq açılıb", "already_opened": true})
+			return
+		}
+	}
+	openedBy = append(openedBy, userID)
+	payload["view_once_opened_by"] = openedBy
+
+	newTextBytes, err := json.Marshal(payload)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "JSON xətası"})
+		return
+	}
+	newText := string(newTextBytes)
+
+	encrypted, err := h.encryptionService.EncryptMessage(newText)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Şifreleme hatası"})
+		return
+	}
+
+	now := time.Now()
+	if err := database.DB.Model(&models.Message{}).
+		Where("id = ?", messageID).
+		Updates(map[string]interface{}{
+			"encrypted_text": encrypted,
+			"updated_at":     now,
+		}).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Mesaj güncellenemedi"})
+		return
+	}
+
+	conversationID := *msg.ConversationID
+	editPayload := map[string]interface{}{
+		"conversation_id":  conversationID,
+		"message_id":       messageID,
+		"text":             newText,
+		"is_edited":        msg.IsEdited, // view-once açılışı "düzənləndi" etiketi YARATMIR
+		"view_once_opened": true,
+		"opened_by":        userID,
+	}
+
+	memberIDs := getGroupParticipantIDs(conversationID)
+	h.wsHub.SendToMultipleUsers(memberIDs, "group_message_edited", editPayload)
+
+	c.JSON(http.StatusOK, gin.H{"message": "Açıldı", "data": editPayload})
 }
 
 // POST /api/v1/groups/messages/:message_id/star

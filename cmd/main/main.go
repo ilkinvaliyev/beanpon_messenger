@@ -197,6 +197,9 @@ func main() {
 		api.PUT("/messages/:message_id", messageHandler.EditMessage)
 		api.DELETE("/messages/:message_id", messageHandler.DeleteMessage)
 		api.POST("/messages/:message_id/star", messageHandler.ToggleStar)
+		// ① "Bir dəfə bax" media açıldı (DM) — opened_by JSON-a yazılır,
+		// message_edited WS event-i ilə hər iki tərəfə yayılır.
+		api.POST("/messages/:message_id/view-once-opened", messageHandler.MarkViewOnceOpened)
 
 		// Batch mark-as-read — bir söhbətdəki bütün okunmamış mesajları
 		// (qarşı tərəfdən gələnləri) eyni anda okundu işarələ. Native
@@ -266,6 +269,9 @@ func main() {
 		api.PUT("/groups/messages/:message_id", groupMsgHandler.EditGroupMessage)
 		api.POST("/groups/messages/:message_id/star", groupMsgHandler.ToggleGroupStar)
 		api.POST("/groups/messages/:message_id/reaction", groupMsgHandler.SetGroupReaction)
+		// ① "Bir dəfə bax" media açıldı (qrup) — hər üzv bir dəfə;
+		// group_message_edited WS event-i ilə bütün üzvlərə yayılır.
+		api.POST("/groups/messages/:message_id/view-once-opened", groupMsgHandler.MarkGroupViewOnceOpened)
 
 		// ── Live yayın ───────────────────────────────────────────────────
 		api.GET("/live-rooms/:room_id/messages", liveHub.GetLiveRoomMessages)
