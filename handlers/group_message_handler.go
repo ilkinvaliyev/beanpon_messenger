@@ -5,6 +5,7 @@ import (
 	"beanpon_messenger/models"
 	"beanpon_messenger/utils"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
@@ -25,6 +26,8 @@ type GroupMessageHandler struct {
 		SendToUser(userID uint, messageType string, data interface{})
 		SendToMultipleUsers(userIDs []uint, messageType string, data interface{})
 		SendGroupPushNotification(conversationID, senderID uint, groupName, message string, memberIDs []uint)
+		ScheduleGroupPushNotification(conversationID, senderID uint, groupName, message, messageID string, memberIDs []uint, delay time.Duration)
+		SendDismissThreadPush(userID uint, threadID string)
 	}
 }
 
@@ -39,6 +42,8 @@ func NewGroupMessageHandler(
 		SendToUser(userID uint, messageType string, data interface{})
 		SendToMultipleUsers(userIDs []uint, messageType string, data interface{})
 		SendGroupPushNotification(conversationID, senderID uint, groupName, message string, memberIDs []uint)
+		ScheduleGroupPushNotification(conversationID, senderID uint, groupName, message, messageID string, memberIDs []uint, delay time.Duration)
+		SendDismissThreadPush(userID uint, threadID string)
 	},
 ) *GroupMessageHandler {
 	return &GroupMessageHandler{
@@ -265,39 +270,29 @@ func (h *GroupMessageHandler) SendGroupMessage(c *gin.Context) {
 		}
 	}()
 
-	// Push notification (FCM) — MÜVƏQQƏTİ SÖNDÜRÜLÜB (istifadəçi istəyi).
-	// Geri qaytarmaq üçün bu bloku comment-dən çıxar. Laravel endpoint
-	// (/notification/new-group-message) və hub.SendGroupPushNotification
-	// toxunulmaz qalır.
-	//
-	// QEYD: blok açılanda AKTİV-CHAT filtri də daxildir — qrup səhifəsi
-	// hazırda AÇIQ olan üzvlərə push GETMİR (DM-dəki IsUserInChatWith
-	// məntiqinin qrup ekvivalenti: hub.IsUserInGroupChat). Flutter onsuz da
-	// group_chat_opened / group_chat_closed WS event-lərini göndərir.
-	// var pushTargets []uint
-	// database.DB.Model(&models.ConversationParticipant{}).
-	// 	Where("conversation_id = ? AND user_id != ? AND left_at IS NULL AND deleted_at IS NULL", conversationID, senderID).
-	// 	Where("is_muted = false OR (muted_until IS NOT NULL AND muted_until < ?)", now).
-	// 	Pluck("user_id", &pushTargets)
-	//
-	// // Qrup səhifəsi açıq olanları (aktiv baxanları) siyahıdan çıxar.
-	// filteredTargets := make([]uint, 0, len(pushTargets))
-	// for _, uid := range pushTargets {
-	// 	if h.wsHub.IsUserInGroupChat(uid, conversationID) {
-	// 		continue // səhifə açıqdır — mesajı onsuz da görür, push lazımsız
-	// 	}
-	// 	filteredTargets = append(filteredTargets, uid)
-	// }
-	//
-	// if len(filteredTargets) > 0 {
-	// 	// Qrup adı (bildiriş başlığı üçün).
-	// 	var groupName string
-	// 	database.DB.Table("conversations").
-	// 		Where("id = ?", conversationID).
-	// 		Select("COALESCE(group_name, '')").
-	// 		Scan(&groupName)
-	// 	h.wsHub.SendGroupPushNotification(conversationID, senderID, groupName, req.Text, filteredTargets)
-	// }
+	// 📬 GECİKMƏLİ qrup push-u (anti-spam, Telegram yanaşması):
+	// 10 saniyə gözlə → göndərmədən əvvəl hər alıcı üçün yoxla:
+	// mesajı OXUYUB və ya qrup səhifəsi AÇIQDIRSA push GETMİR.
+	// Mute/pending dəvət filtri buradadır; aktiv-chat və read-check
+	// hub.ScheduleGroupPushNotification içində gecikmədən SONRA edilir.
+	var pushTargets []uint
+	database.DB.Model(&models.ConversationParticipant{}).
+		Where("conversation_id = ? AND user_id != ? AND left_at IS NULL AND deleted_at IS NULL", conversationID, senderID).
+		Where("COALESCE(invite_status, 'active') = 'active'").
+		Where("is_muted = false OR (muted_until IS NOT NULL AND muted_until < ?)", now).
+		Pluck("user_id", &pushTargets)
+
+	if len(pushTargets) > 0 {
+		var groupName string
+		database.DB.Table("conversations").
+			Where("id = ?", conversationID).
+			Select("COALESCE(group_name, '')").
+			Scan(&groupName)
+		h.wsHub.ScheduleGroupPushNotification(
+			conversationID, senderID, groupName, req.Text, messageID,
+			pushTargets, 10*time.Second,
+		)
+	}
 
 	c.JSON(http.StatusCreated, gin.H{
 		"message": "Mesaj gönderildi",
@@ -596,6 +591,11 @@ func (h *GroupMessageHandler) markGroupMessagesRead(userID, conversationID uint)
 			"last_read_at":         now,
 			"last_read_message_id": lastID,
 		})
+
+	// 🔕 Oxuyanın cihaz(lar)ındakı bu qrupun bildirişlərini tepsidən sil
+	// (silent dismiss push, Laravel üzərindən). thread_id formatı
+	// new-group-message payload-u ilə eyni: "group_{id}".
+	h.wsHub.SendDismissThreadPush(userID, fmt.Sprintf("group_%d", conversationID))
 
 	// Gönderenlere WebSocket ile bildir
 	memberIDs := getGroupParticipantIDs(conversationID)

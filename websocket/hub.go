@@ -1078,6 +1078,80 @@ func (c *Client) writePump() {
 	}
 }
 
+// ScheduleGroupPushNotification — GECİKMƏLİ qrup push-u (anti-spam):
+// dərhal göndərmək əvəzinə `delay` gözləyir, göndərmədən ƏVVƏL hər alıcı
+// üçün yoxlayır:
+//  1. Mesajı artıq OXUYUB? (message_reads)        → push GETMİR
+//  2. Qrup səhifəsi hazırda AÇIQDIR? (ActiveGroupChat) → push GETMİR
+//
+// Qalan alıcılara normal push gedir. Telegram/Slack yanaşması — istifadəçi
+// mesajı onsuz da görübsə telefon heç titrəmir.
+func (h *Hub) ScheduleGroupPushNotification(
+	conversationID, senderID uint,
+	groupName, message, messageID string,
+	memberIDs []uint,
+	delay time.Duration,
+) {
+	time.AfterFunc(delay, func() {
+		remaining := make([]uint, 0, len(memberIDs))
+		for _, uid := range memberIDs {
+			if uid == senderID {
+				continue
+			}
+			// Hazırda qrup səhifəsindədir — mesajı canlı görür.
+			if h.IsUserInGroupChat(uid, conversationID) {
+				continue
+			}
+			// Gecikmə pəncərəsində OXUDU — push artıq lazımsız.
+			var readCount int64
+			h.db.Table("message_reads").
+				Where("message_id = ? AND user_id = ?", messageID, uid).
+				Count(&readCount)
+			if readCount > 0 {
+				continue
+			}
+			remaining = append(remaining, uid)
+		}
+
+		if len(remaining) == 0 {
+			return // hamı oxudu/baxır — push YOX
+		}
+		h.SendGroupPushNotification(conversationID, senderID, groupName, message, remaining)
+	})
+}
+
+// SendDismissThreadPush — istifadəçi söhbəti OXUYANDA cihazındakı həmin
+// thread bildirişlərini tepsidən silmək üçün Laravel-ə silent dismiss push
+// tapşırığı göndərir (`/notification/dismiss-thread`). Qeyri-bloklayıcı.
+func (h *Hub) SendDismissThreadPush(userID uint, threadID string) {
+	go func() {
+		if h.config.CloudToken == "" || h.config.BackendUrl == "" {
+			return
+		}
+		payload := map[string]interface{}{
+			"user_id":   userID,
+			"thread_id": threadID,
+		}
+		jsonData, err := json.Marshal(payload)
+		if err != nil {
+			return
+		}
+		req, err := http.NewRequest("POST",
+			h.config.BackendUrl+"/notification/dismiss-thread",
+			bytes.NewBuffer(jsonData))
+		if err != nil {
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-api-key", h.config.CloudToken)
+		resp, err := h.httpClient.Do(req)
+		if err != nil {
+			return
+		}
+		resp.Body.Close()
+	}()
+}
+
 // SendGroupPushNotification qrup mesajı üçün push notification göndərir (async).
 // memberIDs — mute olmayan üzvlər (göndərən onsuz da Go tərəfdə çıxarılıb, amma
 // Laravel də sender_id-ni təhlükəsizlik üçün siyahıdan çıxarır). Laravel
