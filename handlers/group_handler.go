@@ -141,6 +141,16 @@ func (h *GroupHandler) CreateGroup(c *gin.Context) {
 		})
 	}
 
+	// YARADANA da group_added göndər — ConversationsPage bu event-də qrup
+	// siyahısını yeniləyir (_loadGroups). Əvvəl yalnız üzvlərə gedirdi:
+	// yaradan öz siyahısında qrupu görmürdü, kimsə mesaj yazana qədər
+	// (new_group_message gələnə qədər) görünmürdü.
+	h.wsHub.SendToUser(userID, "group_added", gin.H{
+		"conversation_id": conversation.ID,
+		"group_name":      req.Name,
+		"added_by":        userID,
+	})
+
 	c.JSON(http.StatusCreated, gin.H{
 		"message": "Grup oluşturuldu",
 		"data": gin.H{
@@ -148,6 +158,74 @@ func (h *GroupHandler) CreateGroup(c *gin.Context) {
 			"name":         req.Name,
 			"invite_token": token,
 		},
+	})
+}
+
+// GET /api/v1/groups/join/:token/preview
+// Dəvət linki ÖNİZLƏMƏSİ — qoşulmazdan ƏVVƏL qrup adı/avatar/üzv siyahısı.
+// Üzvlük TƏLƏB OLUNMUR (JWT kifayət) — link alan hər kəs kimlərin olduğunu
+// görüb "Qatıl / Qəbul etmə" qərarı verir. Heç bir yazma əməliyyatı YOXDUR.
+func (h *GroupHandler) PreviewByToken(c *gin.Context) {
+	userID := c.MustGet("user_id").(uint)
+	token := c.Param("token")
+
+	var conversation models.Conversation
+	err := database.DB.Table("conversations").
+		Where("invite_token = ? AND chat_type = 'group' AND deleted_at IS NULL", token).
+		First(&conversation).Error
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Geçersiz davet linki"})
+		return
+	}
+
+	// Token süresi kontrolü (JoinByToken ilə eyni).
+	if conversation.InviteTokenExpiresAt != nil && time.Now().After(*conversation.InviteTokenExpiresAt) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Davet linki süresi dolmuş"})
+		return
+	}
+
+	// Artıq üzvdürmü? (Flutter bilsin — "Qatıl" əvəzinə birbaşa aça bilər.)
+	var existing models.ConversationParticipant
+	alreadyMember := database.DB.Where(
+		"conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL",
+		conversation.ID, userID,
+	).First(&existing).Error == nil
+
+	// Üzv siyahısı — ad/username/avatar (preview-da göstərmək üçün).
+	var members []struct {
+		UserID       uint    `json:"user_id" gorm:"column:user_id"`
+		Name         string  `json:"name" gorm:"column:name"`
+		Username     string  `json:"username" gorm:"column:username"`
+		IsVerified   bool    `json:"is_verified" gorm:"column:is_verified"`
+		ProfileImage *string `json:"profile_image" gorm:"column:profile_image"`
+	}
+	database.DB.Raw(`
+		SELECT cp.user_id, u.name, u.username, u.is_verified, p.profile_image
+		FROM conversation_participants cp
+		JOIN users u ON u.id = cp.user_id
+		LEFT JOIN profiles p ON p.user_id = cp.user_id
+		WHERE cp.conversation_id = ? AND cp.left_at IS NULL AND cp.deleted_at IS NULL
+		ORDER BY cp.created_at ASC
+	`, conversation.ID).Scan(&members)
+
+	memberList := make([]gin.H, 0, len(members))
+	for _, m := range members {
+		memberList = append(memberList, gin.H{
+			"user_id":       m.UserID,
+			"name":          m.Name,
+			"username":      m.Username,
+			"is_verified":   m.IsVerified,
+			"profile_image": utils.PrependBaseURL(m.ProfileImage),
+		})
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"conversation_id": conversation.ID,
+		"group_name":      conversation.GroupName,
+		"avatar":          utils.PrependBaseURL(conversation.GroupAvatar),
+		"member_count":    len(memberList),
+		"already_member":  alreadyMember,
+		"members":         memberList,
 	})
 }
 
@@ -171,12 +249,24 @@ func (h *GroupHandler) JoinByToken(c *gin.Context) {
 		return
 	}
 
-	// Zaten üye mi?
+	// Zaten üye mi? → XƏTA DEYİL, uğurlu cavab (conversation_id ilə).
+	// Flutter linki açan artıq-üzv istifadəçini birbaşa qrup çatına aparır.
+	// Əvvəl 400 qaytarırdı → client "qrupa qatıla bilmədi" göstərirdi.
 	var existing models.ConversationParticipant
 	err = database.DB.Where("conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL",
 		conversation.ID, userID).First(&existing).Error
 	if err == nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Zaten bu grubun üyesisiniz"})
+		groupName := ""
+		if conversation.GroupName != nil {
+			groupName = *conversation.GroupName
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"message":         "Zaten bu grubun üyesisiniz",
+			"already_member":  true,
+			"conversation_id": conversation.ID,
+			"group_name":      groupName,
+			"my_role":         existing.Role,
+		})
 		return
 	}
 

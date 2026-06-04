@@ -32,6 +32,10 @@ type Client struct {
 	Send           chan []byte
 	Hub            *Hub
 	ActiveChatWith *uint
+	// Hazırda AÇIQ olan qrup çatı (conversation_id). DM ActiveChatWith-in
+	// qrup ekvivalenti — istifadəçi qrup səhifəsindədirsə həmin qrupun
+	// mesajları üçün FCM push GÖNDƏRİLMİR (onsuz da görür).
+	ActiveGroupChat *uint
 
 	// closeOnce — `Send` kanalının YALNIZ bir dəfə bağlanmasını təmin edir.
 	// Əvvəllər həm registerClient (köhnə bağlantı atılarkən), həm də
@@ -931,6 +935,25 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 	case "chat_closed":
 		c.Hub.SetActiveChat(c.UserID, nil)
 
+	// QRUP — DM chat_opened/chat_closed-un qrup ekvivalenti. Flutter
+	// GroupChatPage açılanda group_chat_opened, bağlananda group_chat_closed
+	// göndərir (websocket_chat_service.dart). Aktiv qrupdaykən həmin qrupun
+	// push-u GETMİR.
+	case "group_chat_opened":
+		dataMap, ok := msg.Data.(map[string]interface{})
+		if !ok {
+			return
+		}
+		convIDFloat, ok := dataMap["conversation_id"].(float64)
+		if !ok {
+			return
+		}
+		convID := uint(convIDFloat)
+		c.Hub.SetActiveGroupChat(c.UserID, &convID)
+
+	case "group_chat_closed":
+		c.Hub.SetActiveGroupChat(c.UserID, nil)
+
 	case "screenshot_protection_changed":
 		// Screenshot protection değişikliği için hiçbir şey yapmaya gerek yok
 		// Bu sadece client'tan gelebilecek bir bildirim olabilir ama
@@ -964,6 +987,35 @@ func (h *Hub) IsUserInChatWith(userID, otherUserID uint) bool {
 
 	if client, exists := h.clients[userID]; exists {
 		return client.ActiveChatWith != nil && *client.ActiveChatWith == otherUserID
+	}
+	return false
+}
+
+// SetActiveGroupChat — istifadəçinin hazırda açıq olan qrup çatını qeyd edir
+// (nil = qrup səhifəsindən çıxdı). SetActiveChat-in qrup ekvivalenti.
+func (h *Hub) SetActiveGroupChat(userID uint, conversationID *uint) {
+	h.mutex.Lock()
+	defer h.mutex.Unlock()
+
+	if client, exists := h.clients[userID]; exists {
+		client.ActiveGroupChat = conversationID
+
+		if conversationID != nil {
+			log.Printf("Kullanıcı %d aktif grup chat: %d", userID, *conversationID)
+		} else {
+			log.Printf("Kullanıcı %d grup chat'ten çıktı", userID)
+		}
+	}
+}
+
+// IsUserInGroupChat — istifadəçi hazırda BU qrupun səhifəsindədirmi?
+// True isə qrup mesajı push-u GÖNDƏRİLMİR (DM IsUserInChatWith məntiqi).
+func (h *Hub) IsUserInGroupChat(userID, conversationID uint) bool {
+	h.mutex.RLock()
+	defer h.mutex.RUnlock()
+
+	if client, exists := h.clients[userID]; exists {
+		return client.ActiveGroupChat != nil && *client.ActiveGroupChat == conversationID
 	}
 	return false
 }

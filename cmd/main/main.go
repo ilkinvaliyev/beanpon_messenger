@@ -253,6 +253,8 @@ func main() {
 		api.POST("/groups", groupHandler.CreateGroup)
 		api.GET("/groups", groupHandler.GetMyGroups)
 		api.POST("/groups/join/:token", groupHandler.JoinByToken)
+		// Dəvət linki önizləməsi — qoşulmazdan əvvəl qrup adı/avatar/üzvlər.
+		api.GET("/groups/join/:token/preview", groupHandler.PreviewByToken)
 		api.POST("/groups/:conversation_id/leave", groupHandler.LeaveGroup)
 		api.POST("/groups/:conversation_id/kick/:user_id", groupHandler.KickMember)
 		api.PUT("/groups/:conversation_id/role/:user_id", groupHandler.ChangeRole)

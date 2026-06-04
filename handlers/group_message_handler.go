@@ -21,6 +21,7 @@ type GroupMessageHandler struct {
 	}
 	wsHub interface {
 		IsUserOnline(userID uint) bool
+		IsUserInGroupChat(userID, conversationID uint) bool
 		SendToUser(userID uint, messageType string, data interface{})
 		SendToMultipleUsers(userIDs []uint, messageType string, data interface{})
 		SendGroupPushNotification(conversationID, senderID uint, groupName, message string, memberIDs []uint)
@@ -34,6 +35,7 @@ func NewGroupMessageHandler(
 	},
 	wsHub interface {
 		IsUserOnline(userID uint) bool
+		IsUserInGroupChat(userID, conversationID uint) bool
 		SendToUser(userID uint, messageType string, data interface{})
 		SendToMultipleUsers(userIDs []uint, messageType string, data interface{})
 		SendGroupPushNotification(conversationID, senderID uint, groupName, message string, memberIDs []uint)
@@ -194,20 +196,34 @@ func (h *GroupMessageHandler) SendGroupMessage(c *gin.Context) {
 	// Geri qaytarmaq üçün bu bloku comment-dən çıxar. Laravel endpoint
 	// (/notification/new-group-message) və hub.SendGroupPushNotification
 	// toxunulmaz qalır.
+	//
+	// QEYD: blok açılanda AKTİV-CHAT filtri də daxildir — qrup səhifəsi
+	// hazırda AÇIQ olan üzvlərə push GETMİR (DM-dəki IsUserInChatWith
+	// məntiqinin qrup ekvivalenti: hub.IsUserInGroupChat). Flutter onsuz da
+	// group_chat_opened / group_chat_closed WS event-lərini göndərir.
 	// var pushTargets []uint
 	// database.DB.Model(&models.ConversationParticipant{}).
 	// 	Where("conversation_id = ? AND user_id != ? AND left_at IS NULL AND deleted_at IS NULL", conversationID, senderID).
 	// 	Where("is_muted = false OR (muted_until IS NOT NULL AND muted_until < ?)", now).
 	// 	Pluck("user_id", &pushTargets)
 	//
-	// if len(pushTargets) > 0 {
+	// // Qrup səhifəsi açıq olanları (aktiv baxanları) siyahıdan çıxar.
+	// filteredTargets := make([]uint, 0, len(pushTargets))
+	// for _, uid := range pushTargets {
+	// 	if h.wsHub.IsUserInGroupChat(uid, conversationID) {
+	// 		continue // səhifə açıqdır — mesajı onsuz da görür, push lazımsız
+	// 	}
+	// 	filteredTargets = append(filteredTargets, uid)
+	// }
+	//
+	// if len(filteredTargets) > 0 {
 	// 	// Qrup adı (bildiriş başlığı üçün).
 	// 	var groupName string
 	// 	database.DB.Table("conversations").
 	// 		Where("id = ?", conversationID).
 	// 		Select("COALESCE(group_name, '')").
 	// 		Scan(&groupName)
-	// 	h.wsHub.SendGroupPushNotification(conversationID, senderID, groupName, req.Text, pushTargets)
+	// 	h.wsHub.SendGroupPushNotification(conversationID, senderID, groupName, req.Text, filteredTargets)
 	// }
 
 	c.JSON(http.StatusCreated, gin.H{
