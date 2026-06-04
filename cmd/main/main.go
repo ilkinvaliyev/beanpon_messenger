@@ -275,6 +275,9 @@ func main() {
 		api.POST("/groups/:conversation_id/wallpaper", groupHandler.SetGroupWallpaper)
 		api.POST("/groups/:conversation_id/clear", groupHandler.ClearGroupChat)
 		api.PUT("/groups/:conversation_id", groupHandler.UpdateGroup)
+		// Qrup icazələri (admin: mesaj/media/gif/səs/circle-video aç-bağla)
+		api.GET("/groups/:conversation_id/permissions", groupHandler.GetGroupPermissions)
+		api.PUT("/groups/:conversation_id/permissions", groupHandler.UpdateGroupPermissions)
 
 		// ── GROUP: Mesajlar ──────────────────────────────────────────────
 		api.POST("/groups/:conversation_id/messages", groupMsgHandler.SendGroupMessage)

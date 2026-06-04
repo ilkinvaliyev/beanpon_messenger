@@ -83,6 +83,11 @@ type Conversation struct {
 	InviteToken          *string    `json:"invite_token" gorm:"type:varchar(32);uniqueIndex"`
 	InviteTokenExpiresAt *time.Time `json:"invite_token_expires_at"`
 	MaxMembers           int        `json:"max_members" gorm:"default:50"`
+	// Qrup admin icazələri (jsonb): {"allow_text":true,"allow_media":true,
+	// "allow_gif":true,"allow_voice":true,"allow_circle_video":true}.
+	// NULL = hamısı AÇIQ (default). Yalnız admin/owner dəyişə bilər;
+	// bağlı əməliyyatı admin ÖZÜ edə bilər, digərləri 403 alır.
+	GroupPermissions *string `json:"group_permissions" gorm:"type:jsonb"`
 }
 
 type ConversationResponse struct {

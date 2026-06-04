@@ -1,3 +1,20 @@
+# Migration: conversations.group_permissions
+
+Qrup admin icazələri (mesaj/media/gif/səs/circle-video). NULL = hamısı açıq.
+
+```sql
+ALTER TABLE conversations
+  ADD COLUMN IF NOT EXISTS group_permissions jsonb;
+```
+
+Geri almaq:
+
+```sql
+ALTER TABLE conversations DROP COLUMN IF EXISTS group_permissions;
+```
+
+---
+
 # Migration: conversation_participants.invite_status
 
 Qrup dəvəti onay axını üçün. Pending üzv qrupu siyahıda görür amma mesajları

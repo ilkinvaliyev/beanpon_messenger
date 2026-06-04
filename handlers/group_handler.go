@@ -64,6 +64,120 @@ func getGroupParticipantIDs(conversationID uint) []uint {
 	return ids
 }
 
+// ── Qrup icazələri (admin ayarları) ─────────────────────────────────────────
+
+// defaultGroupPermissions — bütün əməliyyatlar AÇIQ.
+func defaultGroupPermissions() map[string]bool {
+	return map[string]bool{
+		"allow_text":         true,
+		"allow_media":        true,
+		"allow_gif":          true,
+		"allow_voice":        true,
+		"allow_circle_video": true,
+	}
+}
+
+// parseGroupPermissions — jsonb sütununu map-ə açır; NULL/bozuq → default
+// (hamısı açıq). Çatışmayan açar = true (yeni icazə əlavə olunsa köhnə
+// qruplar pozulmasın).
+func parseGroupPermissions(raw *string) map[string]bool {
+	perms := defaultGroupPermissions()
+	if raw == nil || *raw == "" {
+		return perms
+	}
+	var parsed map[string]bool
+	if err := json.Unmarshal([]byte(*raw), &parsed); err != nil {
+		return perms
+	}
+	for k, v := range parsed {
+		perms[k] = v
+	}
+	return perms
+}
+
+// GET /api/v1/groups/:conversation_id/permissions
+// Cari qrup icazələri (hər üzv oxuya bilər — UI input-u buna görə qurulur).
+func (h *GroupHandler) GetGroupPermissions(c *gin.Context) {
+	userID := c.MustGet("user_id").(uint)
+	convID, _ := strconv.ParseUint(c.Param("conversation_id"), 10, 32)
+	conversationID := uint(convID)
+
+	var me models.ConversationParticipant
+	if err := database.DB.Where(
+		"conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL",
+		conversationID, userID,
+	).First(&me).Error; err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Bu grubun üyesi değilsiniz"})
+		return
+	}
+
+	var conv models.Conversation
+	database.DB.Where("id = ?", conversationID).First(&conv)
+
+	c.JSON(http.StatusOK, gin.H{
+		"permissions": parseGroupPermissions(conv.GroupPermissions),
+		"my_role":     me.Role,
+	})
+}
+
+// PUT /api/v1/groups/:conversation_id/permissions
+// Yalnız admin/owner. Body: {"allow_text":bool,...} — yalnız göndərilən
+// açarlar dəyişir (partial update). Bütün üzvlərə group_permissions_changed
+// WS event-i yayılır (input dərhal disable/enable olsun).
+func (h *GroupHandler) UpdateGroupPermissions(c *gin.Context) {
+	userID := c.MustGet("user_id").(uint)
+	convID, _ := strconv.ParseUint(c.Param("conversation_id"), 10, 32)
+	conversationID := uint(convID)
+
+	var me models.ConversationParticipant
+	if err := database.DB.Where(
+		"conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL",
+		conversationID, userID,
+	).First(&me).Error; err != nil || (me.Role != "owner" && me.Role != "admin") {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Yalnızca yöneticiler değiştirebilir"})
+		return
+	}
+
+	var body map[string]bool
+	if err := c.ShouldBindJSON(&body); err != nil || len(body) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz body"})
+		return
+	}
+
+	var conv models.Conversation
+	database.DB.Where("id = ?", conversationID).First(&conv)
+	perms := parseGroupPermissions(conv.GroupPermissions)
+
+	allowedKeys := defaultGroupPermissions()
+	for k, v := range body {
+		if _, ok := allowedKeys[k]; ok {
+			perms[k] = v
+		}
+	}
+
+	jsonBytes, err := json.Marshal(perms)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "JSON xətası"})
+		return
+	}
+	if err := database.DB.Table("conversations").
+		Where("id = ?", conversationID).
+		Update("group_permissions", string(jsonBytes)).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Kaydedilemedi"})
+		return
+	}
+
+	// Bütün üzvlərə yay — input dərhal yenilənsin.
+	memberIDs := getGroupParticipantIDs(conversationID)
+	h.wsHub.SendToMultipleUsers(memberIDs, "group_permissions_changed", gin.H{
+		"conversation_id": conversationID,
+		"permissions":     perms,
+		"changed_by":      userID,
+	})
+
+	c.JSON(http.StatusOK, gin.H{"permissions": perms})
+}
+
 // sendGroupInvitePush — "X sizi Y qrupuna dəvət etdi" FCM push-u Laravel
 // üzərindən (`/notification/group-invite`). Laravel həm FCM göndərir, həm
 // notifications cədvəlinə yazır (bildirimlər səhifəsində görünsün).
@@ -1223,7 +1337,9 @@ func (h *GroupHandler) GetGroupDetail(c *gin.Context) {
 		"my_wallpaper_id": me.ChatWallpaperID,
 		"invite_token":    inviteToken,
 		"member_previews": previews,
-		"created_at":      conv.CreatedAt,
+		// Admin icazələri — Flutter input-u buna görə disable/enable edir.
+		"permissions": parseGroupPermissions(conv.GroupPermissions),
+		"created_at":  conv.CreatedAt,
 	})
 }
 

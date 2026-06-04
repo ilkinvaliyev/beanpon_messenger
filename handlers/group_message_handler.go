@@ -82,6 +82,46 @@ func (h *GroupMessageHandler) SendGroupMessage(c *gin.Context) {
 		return
 	}
 
+	// 🔒 QRUP İCAZƏLƏRİ (admin ayarları) — bağlı əməliyyatı yalnız
+	// admin/owner edə bilər, digərləri 403 + permission_denied kodu alır.
+	// Mesaj tipi şifrələnməmiş req.Text JSON-undan təyin olunur.
+	if participant.Role != "owner" && participant.Role != "admin" {
+		var conv models.Conversation
+		database.DB.Where("id = ?", conversationID).First(&conv)
+		perms := parseGroupPermissions(conv.GroupPermissions)
+
+		permKey := "allow_text"
+		trimmed := req.Text
+		if len(trimmed) > 0 && trimmed[0] == '{' {
+			var payload map[string]interface{}
+			if err := json.Unmarshal([]byte(trimmed), &payload); err == nil {
+				switch payload["type"] {
+				case "image":
+					permKey = "allow_media"
+				case "video":
+					if payload["is_circular_video"] == true {
+						permKey = "allow_circle_video"
+					} else {
+						permKey = "allow_media"
+					}
+				case "gif":
+					permKey = "allow_gif"
+				case "voice":
+					permKey = "allow_voice"
+				}
+			}
+		}
+
+		if !perms[permKey] {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error": "Bu işlem grup yöneticisi tarafından kapatıldı",
+				"code":  "permission_denied",
+				"perm":  permKey,
+			})
+			return
+		}
+	}
+
 	encryptedText, err := h.encryptionService.EncryptMessage(req.Text)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Şifreleme hatası"})
@@ -192,6 +232,38 @@ func (h *GroupMessageHandler) SendGroupMessage(c *gin.Context) {
 		"created_at":       now.UTC().Format(time.RFC3339),
 	}
 	h.wsHub.SendToMultipleUsers(memberIDs, "new_group_message", wsPayload)
+
+	// 📖 AVTO-OKUNDU: qrup səhifəsi hazırda AÇIQ olan üzvlər mesajı ANINDA
+	// görür → dərhal okundu işarələnir. Bunsuz səhifə açıqkən gələn mesajlar
+	// yalnız NÖVBƏTİ GetGroupMessages-də işarələnirdi — istifadəçi qrupdan
+	// çıxıb siyahıya dönəndə "oxunmamış" sayılırdı.
+	go func() {
+		readNow := time.Now()
+		for _, mid := range memberIDs {
+			if mid == senderID {
+				continue
+			}
+			if !h.wsHub.IsUserInGroupChat(mid, conversationID) {
+				continue // səhifə açıq deyil — normal unread qalır
+			}
+			read := models.MessageRead{
+				MessageID:      messageID,
+				UserID:         mid,
+				ConversationID: conversationID,
+				ReadAt:         readNow,
+				CreatedAt:      readNow,
+			}
+			database.DB.Create(&read)
+			// last_read yenilə (unread count sorğusu message_reads-ə baxır,
+			// amma participant last_read-i də tutarlı saxla).
+			database.DB.Model(&models.ConversationParticipant{}).
+				Where("conversation_id = ? AND user_id = ?", conversationID, mid).
+				Updates(map[string]interface{}{
+					"last_read_at":         readNow,
+					"last_read_message_id": messageID,
+				})
+		}
+	}()
 
 	// Push notification (FCM) — MÜVƏQQƏTİ SÖNDÜRÜLÜB (istifadəçi istəyi).
 	// Geri qaytarmaq üçün bu bloku comment-dən çıxar. Laravel endpoint
