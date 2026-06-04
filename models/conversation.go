@@ -82,7 +82,7 @@ type Conversation struct {
 	CreatedBy            *uint      `json:"created_by"`
 	InviteToken          *string    `json:"invite_token" gorm:"type:varchar(32);uniqueIndex"`
 	InviteTokenExpiresAt *time.Time `json:"invite_token_expires_at"`
-	MaxMembers           int        `json:"max_members" gorm:"default:256"`
+	MaxMembers           int        `json:"max_members" gorm:"default:50"`
 }
 
 type ConversationResponse struct {

@@ -6,12 +6,18 @@ import (
 	"beanpon_messenger/utils"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
+
+// errGroupFull — atomik limit yoxlamasında "qrup dolu" sentinel xətası.
+var errGroupFull = errors.New("group full")
 
 type GroupHandler struct {
 	wsHub interface {
@@ -64,6 +70,16 @@ func (h *GroupHandler) CreateGroup(c *gin.Context) {
 		return
 	}
 
+	// Qrup limiti: maksimum 50 nəfər (yaradan DAXİL). Yaratma zamanı ilkin
+	// üzv siyahısı da yoxlanır (yaradan + member_ids <= 50).
+	const groupMaxMembers = 50
+	if len(req.MemberIDs)+1 > groupMaxMembers {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "Grup en fazla 50 kişi olabilir",
+		})
+		return
+	}
+
 	token, err := generateInviteToken()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Token üretilemedi"})
@@ -79,7 +95,7 @@ func (h *GroupHandler) CreateGroup(c *gin.Context) {
 		"group_desc":   req.Description,
 		"created_by":   userID,
 		"invite_token": token,
-		"max_members":  256,
+		"max_members":  groupMaxMembers,
 		"status":       "active",
 		"created_at":   now,
 		"updated_at":   now,
@@ -164,31 +180,46 @@ func (h *GroupHandler) JoinByToken(c *gin.Context) {
 		return
 	}
 
-	// Üye sayısı kontrolü
-	var memberCount int64
-	database.DB.Model(&models.ConversationParticipant{}).
-		Where("conversation_id = ? AND left_at IS NULL AND deleted_at IS NULL", conversation.ID).
-		Count(&memberCount)
-	if int(memberCount) >= conversation.MaxMembers {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Grup dolu"})
-		return
-	}
-
 	now := time.Now()
 
-	// Daha önce ayrılmış mı? → güncelle
-	var old models.ConversationParticipant
-	err = database.DB.Unscoped().Where("conversation_id = ? AND user_id = ?", conversation.ID, userID).
-		First(&old).Error
-	if err == nil {
-		database.DB.Model(&old).Updates(map[string]interface{}{
-			"left_at":           nil,
-			"kicked_by":         nil,
-			"deleted_at":        nil,
-			"joined_at":         now,
-			"invite_token_used": token,
-		})
-	} else {
+	// ⚠️ ATOMİK limit yoxlaması: əvvəl COUNT→INSERT ayrı idi və paralel
+	// qoşulmalarda (link viral olanda) yarış vəziyyəti limiti aşırdı
+	// (max_members=256 ikən 800+ üzv). İndi TRANSACTION + conversation
+	// sətrində FOR UPDATE kilidi: eyni qrupa paralel join-lər sıraya düzülür,
+	// hər biri kilid altında təzə COUNT görür — limit FİZİKİ aşıla bilmir.
+	joinErr := database.DB.Transaction(func(tx *gorm.DB) error {
+		// Qrup sətrini kilidlə (digər join-lər burada gözləyir).
+		var lockedConv models.Conversation
+		if err := tx.Table("conversations").
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ?", conversation.ID).
+			First(&lockedConv).Error; err != nil {
+			return err
+		}
+
+		var memberCount int64
+		if err := tx.Model(&models.ConversationParticipant{}).
+			Where("conversation_id = ? AND left_at IS NULL AND deleted_at IS NULL", conversation.ID).
+			Count(&memberCount).Error; err != nil {
+			return err
+		}
+		if int(memberCount) >= lockedConv.MaxMembers {
+			return errGroupFull
+		}
+
+		// Daha önce ayrılmış mı? → güncelle
+		var old models.ConversationParticipant
+		err := tx.Unscoped().Where("conversation_id = ? AND user_id = ?", conversation.ID, userID).
+			First(&old).Error
+		if err == nil {
+			return tx.Model(&old).Updates(map[string]interface{}{
+				"left_at":           nil,
+				"kicked_by":         nil,
+				"deleted_at":        nil,
+				"joined_at":         now,
+				"invite_token_used": token,
+			}).Error
+		}
 		participant := models.ConversationParticipant{
 			ConversationID:  conversation.ID,
 			UserID:          userID,
@@ -196,7 +227,16 @@ func (h *GroupHandler) JoinByToken(c *gin.Context) {
 			JoinedAt:        &now,
 			InviteTokenUsed: &token,
 		}
-		database.DB.Create(&participant)
+		return tx.Create(&participant).Error
+	})
+
+	if joinErr == errGroupFull {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Grup dolu"})
+		return
+	}
+	if joinErr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gruba katılamadınız"})
+		return
 	}
 
 	// Diğer üyelere bildir
@@ -926,63 +966,92 @@ func (h *GroupHandler) AddMembers(c *gin.Context) {
 		return
 	}
 
-	// Üye sayısı kontrolü
 	var conv models.Conversation
 	database.DB.Where("id = ?", conversationID).First(&conv)
-
-	var currentCount int64
-	database.DB.Model(&models.ConversationParticipant{}).
-		Where("conversation_id = ? AND left_at IS NULL AND deleted_at IS NULL", conversationID).
-		Count(&currentCount)
-
-	if int(currentCount)+len(body.UserIDs) > conv.MaxMembers {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Grup kapasitesi aşılıyor"})
-		return
-	}
 
 	now := time.Now()
 	added := []uint{}
 
-	for _, uid := range body.UserIDs {
-		if uid == requesterID {
-			continue
+	// ⚠️ ATOMİK limit: TRANSACTION + conversation FOR UPDATE kilidi.
+	// Əvvəl COUNT→INSERT ayrı idi — paralel əlavə/qoşulmalarda yarış vəziyyəti
+	// limiti aşırdı. İndi kilid altında təzə COUNT görülür, hər insert-dən
+	// əvvəl yenidən yoxlanır (siyahının ortasında limit dolarsa qalanı atılır).
+	txErr := database.DB.Transaction(func(tx *gorm.DB) error {
+		var lockedConv models.Conversation
+		if err := tx.Table("conversations").
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ?", conversationID).
+			First(&lockedConv).Error; err != nil {
+			return err
 		}
 
-		// Zaten üye mi?
-		var existing models.ConversationParticipant
-		err := database.DB.Where(
-			"conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL",
-			conversationID, uid,
-		).First(&existing).Error
-		if err == nil {
-			continue // zaten üye
+		var currentCount int64
+		if err := tx.Model(&models.ConversationParticipant{}).
+			Where("conversation_id = ? AND left_at IS NULL AND deleted_at IS NULL", conversationID).
+			Count(&currentCount).Error; err != nil {
+			return err
+		}
+		if int(currentCount)+len(body.UserIDs) > lockedConv.MaxMembers {
+			return errGroupFull
 		}
 
-		// Daha önce ayrılmış mı?
-		var old models.ConversationParticipant
-		err = database.DB.Unscoped().Where(
-			"conversation_id = ? AND user_id = ?", conversationID, uid,
-		).First(&old).Error
-		if err == nil {
-			database.DB.Model(&old).Updates(map[string]interface{}{
-				"left_at":    nil,
-				"kicked_by":  nil,
-				"deleted_at": nil,
-				"joined_at":  now,
-			})
-		} else {
-			participant := models.ConversationParticipant{
-				ConversationID: conversationID,
-				UserID:         uid,
-				Role:           "member",
-				JoinedAt:       &now,
+		for _, uid := range body.UserIDs {
+			if uid == requesterID {
+				continue
 			}
-			database.DB.Create(&participant)
+
+			// Zaten üye mi?
+			var existing models.ConversationParticipant
+			err := tx.Where(
+				"conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL",
+				conversationID, uid,
+			).First(&existing).Error
+			if err == nil {
+				continue // zaten üye
+			}
+
+			// Daha önce ayrılmış mı?
+			var old models.ConversationParticipant
+			err = tx.Unscoped().Where(
+				"conversation_id = ? AND user_id = ?", conversationID, uid,
+			).First(&old).Error
+			if err == nil {
+				if err := tx.Model(&old).Updates(map[string]interface{}{
+					"left_at":    nil,
+					"kicked_by":  nil,
+					"deleted_at": nil,
+					"joined_at":  now,
+				}).Error; err != nil {
+					return err
+				}
+			} else {
+				participant := models.ConversationParticipant{
+					ConversationID: conversationID,
+					UserID:         uid,
+					Role:           "member",
+					JoinedAt:       &now,
+				}
+				if err := tx.Create(&participant).Error; err != nil {
+					return err
+				}
+			}
+
+			added = append(added, uid)
 		}
+		return nil
+	})
 
-		added = append(added, uid)
+	if txErr == errGroupFull {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Grup kapasitesi aşılıyor"})
+		return
+	}
+	if txErr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Üye eklenemedi"})
+		return
+	}
 
-		// Bildirim gönder
+	// Bildirimlər TRANSACTION-dan SONRA (kilid tutularkən WS göndərmə).
+	for _, uid := range added {
 		h.wsHub.SendToUser(uid, "group_added", gin.H{
 			"conversation_id": conversationID,
 			"group_name":      conv.GroupName,
