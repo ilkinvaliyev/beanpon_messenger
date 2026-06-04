@@ -407,6 +407,7 @@ func (h *GroupHandler) PreviewByToken(c *gin.Context) {
 		JOIN users u ON u.id = cp.user_id
 		LEFT JOIN profiles p ON p.user_id = cp.user_id
 		WHERE cp.conversation_id = ? AND cp.left_at IS NULL AND cp.deleted_at IS NULL
+		  AND u.deactivated_at IS NULL
 		ORDER BY cp.created_at ASC
 	`, conversation.ID).Scan(&members)
 
@@ -1003,12 +1004,13 @@ func (h *GroupHandler) GetMembers(c *gin.Context) {
 		WHERE cp.conversation_id = ?
 		  AND cp.left_at IS NULL
 		  AND cp.deleted_at IS NULL
+		  AND u.deactivated_at IS NULL
 		  AND NOT EXISTS (
 		      SELECT 1 FROM user_blocks ub
 		      WHERE (ub.blocker_id = ? AND ub.blocked_id = cp.user_id)
 		         OR (ub.blocker_id = cp.user_id AND ub.blocked_id = ?)
 		  )
-		ORDER BY 
+		ORDER BY
 			CASE cp.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END,
 			cp.joined_at ASC
 	`, conversationID, userID, userID).Scan(&members)

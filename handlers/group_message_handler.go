@@ -469,6 +469,7 @@ func (h *GroupMessageHandler) GetMessageReads(c *gin.Context) {
 		LEFT JOIN profiles p ON p.user_id = mr.user_id
 		WHERE mr.message_id = ?
 		  AND mr.user_id != ?
+		  AND u.deactivated_at IS NULL
 		ORDER BY mr.read_at ASC
 	`, messageID, msg.SenderID).Scan(&reads)
 
