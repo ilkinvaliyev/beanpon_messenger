@@ -60,6 +60,64 @@ func getGroupParticipantIDs(conversationID uint) []uint {
 	return ids
 }
 
+// filterInvitableUsers — qrup dəvəti İCAZƏ filtri (Laravel
+// users.group_invite_permission sütunu; default 'following'):
+//   - nobody    → heç kim dəvət edə bilməz (siyahıdan çıxar)
+//   - following → yalnız adayın İZLƏDİYİ adam dəvət edə bilər:
+//     follows(follower_id = aday, following_id = inviter) yoxlanır
+//   - everyone  → hər kəs dəvət edə bilər
+//
+// Qaytarır: icazəsi olan user id-ləri (sıra qorunur, inviter çıxarılır).
+// Bilinməyən/NULL dəyər 'following' kimi davranır (migration default-u).
+func filterInvitableUsers(inviterID uint, userIDs []uint) []uint {
+	if len(userIDs) == 0 {
+		return userIDs
+	}
+
+	// Adayların icazə dəyərlərini TƏK sorğu ilə oxu.
+	var rows []struct {
+		ID         uint   `gorm:"column:id"`
+		Permission string `gorm:"column:group_invite_permission"`
+	}
+	database.DB.Raw(`
+		SELECT id, COALESCE(group_invite_permission, 'following') as group_invite_permission
+		FROM users WHERE id IN ?
+	`, userIDs).Scan(&rows)
+	permByID := make(map[uint]string, len(rows))
+	for _, r := range rows {
+		permByID[r.ID] = r.Permission
+	}
+
+	// 'following' olanlar üçün: aday inviter-i izləyirmi? — TƏK sorğu.
+	// follows(follower_id = aday, following_id = inviter).
+	var followerIDs []uint
+	database.DB.Table("follows").
+		Where("following_id = ? AND follower_id IN ?", inviterID, userIDs).
+		Pluck("follower_id", &followerIDs)
+	followsInviter := make(map[uint]bool, len(followerIDs))
+	for _, id := range followerIDs {
+		followsInviter[id] = true
+	}
+
+	allowed := make([]uint, 0, len(userIDs))
+	for _, uid := range userIDs {
+		if uid == inviterID {
+			continue
+		}
+		switch permByID[uid] {
+		case "everyone":
+			allowed = append(allowed, uid)
+		case "nobody":
+			// dəvət qadağandır — atla
+		default: // 'following' (və ya bilinməyən/users-də tapılmayan)
+			if followsInviter[uid] {
+				allowed = append(allowed, uid)
+			}
+		}
+	}
+	return allowed
+}
+
 // POST /api/v1/groups
 func (h *GroupHandler) CreateGroup(c *gin.Context) {
 	userID := c.MustGet("user_id").(uint)
@@ -76,6 +134,19 @@ func (h *GroupHandler) CreateGroup(c *gin.Context) {
 	if len(req.MemberIDs)+1 > groupMaxMembers {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error": "Grup en fazla 50 kişi olabilir",
+		})
+		return
+	}
+
+	// 🔒 Dəvət icazəsi filtri (group_invite_permission):
+	//   nobody → çıxarılır; following → yaradan adayın izlədikləri arasında
+	//   deyilsə çıxarılır. Filtrdən sonra yaradan XARİC heç kim qalmırsa
+	//   qrup YARADILMIR — boş/tək nəfərlik qrup yaranmasın.
+	req.MemberIDs = filterInvitableUsers(userID, req.MemberIDs)
+	if len(req.MemberIDs) == 0 {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{
+			"error": "Seçilen kullanıcılar grup davetlerine izin vermiyor",
+			"code":  "no_invitable_members",
 		})
 		return
 	}
@@ -1053,6 +1124,18 @@ func (h *GroupHandler) AddMembers(c *gin.Context) {
 	// Yalnız admin/owner üzv əlavə edə bilər.
 	if me.Role != "owner" && me.Role != "admin" {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Yalnızca yöneticiler üye ekleyebilir"})
+		return
+	}
+
+	// 🔒 Dəvət icazəsi filtri (CreateGroup ilə eyni qayda):
+	//   nobody → çıxarılır; following → əlavə edən adayın izlədikləri
+	//   arasında deyilsə çıxarılır. Hamısı süzülürsə xəta qaytarılır.
+	body.UserIDs = filterInvitableUsers(requesterID, body.UserIDs)
+	if len(body.UserIDs) == 0 {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{
+			"error": "Seçilen kullanıcılar grup davetlerine izin vermiyor",
+			"code":  "no_invitable_members",
+		})
 		return
 	}
 
