@@ -990,11 +990,20 @@ func (h *GroupHandler) AddMembers(c *gin.Context) {
 		})
 	}
 
+	// Əlavə olunanların username-ləri — Flutter çatda "X qrupa qatıldı"
+	// sistem sətri göstərsin.
+	var addedUsernames []string
+	if len(added) > 0 {
+		database.DB.Raw(`SELECT username FROM users WHERE id IN (?)`, added).
+			Pluck("username", &addedUsernames)
+	}
+
 	// Mevcut üyelere bildir
 	memberIDs := getGroupParticipantIDs(conversationID)
 	h.wsHub.SendToMultipleUsers(memberIDs, "group_members_added", gin.H{
 		"conversation_id": conversationID,
 		"added_user_ids":  added,
+		"added_usernames": addedUsernames,
 		"added_by":        requesterID,
 	})
 

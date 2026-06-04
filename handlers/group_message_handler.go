@@ -271,7 +271,7 @@ func (h *GroupMessageHandler) GetGroupMessages(c *gin.Context) {
 		WHERE m.conversation_id = ?
 		  AND m.deleted_at IS NULL
 		  AND m.created_at >= ?
-		  AND (? IS NULL OR m.created_at > ?)
+		  AND m.created_at > COALESCE(?, '1970-01-01'::timestamptz)
 		  AND NOT EXISTS (
 		      SELECT 1 FROM user_blocks ub
 		      WHERE (ub.blocker_id = ? AND ub.blocked_id = m.sender_id)
@@ -279,7 +279,7 @@ func (h *GroupMessageHandler) GetGroupMessages(c *gin.Context) {
 		  )
 		ORDER BY m.created_at DESC
 		LIMIT ? OFFSET ?
-	`, userID, conversationID, joinedAtFilter, me.ClearedAt, me.ClearedAt, userID, userID, limit, offset).Scan(&messages)
+	`, userID, conversationID, joinedAtFilter, me.ClearedAt, userID, userID, limit, offset).Scan(&messages)
 
 	go h.markGroupMessagesRead(userID, conversationID)
 
@@ -511,9 +511,18 @@ func (h *GroupMessageHandler) DeleteGroupMessage(c *gin.Context) {
 		return
 	}
 
+	// İcazə: öz mesajı VƏ YA admin/owner (admin hər kəsin mesajını hamı
+	// üçün silə bilər).
 	if msg.SenderID != userID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Yalnız öz mesajını silə bilərsən"})
-		return
+		var me models.ConversationParticipant
+		err := database.DB.Where(
+			"conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL",
+			*msg.ConversationID, userID,
+		).First(&me).Error
+		if err != nil || (me.Role != "owner" && me.Role != "admin") {
+			c.JSON(http.StatusForbidden, gin.H{"error": "Yalnız öz mesajını silə bilərsən"})
+			return
+		}
 	}
 
 	now := time.Now()
