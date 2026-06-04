@@ -135,17 +135,34 @@ func (h *GroupMessageHandler) SendGroupMessage(c *gin.Context) {
 		WHERE u.id = ?
 	`, senderID).Scan(&senderInfo)
 
-	// Reply bilgisi
+	// Reply bilgisi — göndərənin username/avatar/verified ilə birlikdə
+	// (Flutter reply preview-da şəkil + ad + badge göstərir).
 	var replyData map[string]interface{}
 	if req.ReplyToMessageID != nil {
 		var replyMsg models.Message
 		if err := database.DB.Where("id = ?", *req.ReplyToMessageID).First(&replyMsg).Error; err == nil {
 			replyDecrypted, _ := h.encryptionService.DecryptMessage(replyMsg.EncryptedText)
+
+			var replySender struct {
+				Username     string  `gorm:"column:username"`
+				IsVerified   bool    `gorm:"column:is_verified"`
+				ProfileImage *string `gorm:"column:profile_image"`
+			}
+			database.DB.Raw(`
+				SELECT u.username, u.is_verified, p.profile_image
+				FROM users u
+				LEFT JOIN profiles p ON p.user_id = u.id
+				WHERE u.id = ?
+			`, replyMsg.SenderID).Scan(&replySender)
+
 			replyData = map[string]interface{}{
-				"id":         replyMsg.ID,
-				"sender_id":  replyMsg.SenderID,
-				"text":       replyDecrypted,
-				"created_at": replyMsg.CreatedAt,
+				"id":                 replyMsg.ID,
+				"sender_id":          replyMsg.SenderID,
+				"sender_username":    replySender.Username,
+				"sender_is_verified": replySender.IsVerified,
+				"sender_avatar":      utils.PrependBaseURL(replySender.ProfileImage),
+				"text":               replyDecrypted,
+				"created_at":         replyMsg.CreatedAt,
 			}
 		}
 	}
@@ -239,6 +256,9 @@ func (h *GroupMessageHandler) GetGroupMessages(c *gin.Context) {
 		ReplyToMessageID *string   `gorm:"column:reply_to_message_id"`
 		ReplyText        *string   `gorm:"column:reply_text"`
 		ReplyToSenderID  *uint     `gorm:"column:reply_to_sender_id"`
+		ReplyUsername    *string   `gorm:"column:reply_username"`
+		ReplyIsVerified  *bool     `gorm:"column:reply_is_verified"`
+		ReplyAvatar      *string   `gorm:"column:reply_avatar"`
 		ReadCount        int       `gorm:"column:read_count"`
 		IsEdited         bool      `gorm:"column:is_edited"`
 		IsStarredByMe    bool      `gorm:"column:is_starred_by_me"`
@@ -257,6 +277,9 @@ func (h *GroupMessageHandler) GetGroupMessages(c *gin.Context) {
 			m.reply_to_message_id,
 			reply.encrypted_text as reply_text,
 			reply.sender_id as reply_to_sender_id,
+			reply_u.username as reply_username,
+			reply_u.is_verified as reply_is_verified,
+			reply_p.profile_image as reply_avatar,
 			(SELECT COUNT(*) FROM message_reads mr WHERE mr.message_id = m.id AND mr.user_id != m.sender_id) as read_count,
 			m.is_edited,
 			EXISTS (
@@ -268,6 +291,8 @@ func (h *GroupMessageHandler) GetGroupMessages(c *gin.Context) {
 		JOIN users u ON u.id = m.sender_id
 		LEFT JOIN profiles p ON p.user_id = m.sender_id
 		LEFT JOIN messages reply ON reply.id = m.reply_to_message_id
+		LEFT JOIN users reply_u ON reply_u.id = reply.sender_id
+		LEFT JOIN profiles reply_p ON reply_p.user_id = reply.sender_id
 		WHERE m.conversation_id = ?
 		  AND m.deleted_at IS NULL
 		  AND m.created_at >= ?
@@ -339,11 +364,22 @@ func (h *GroupMessageHandler) GetGroupMessages(c *gin.Context) {
 
 		if msg.ReplyToMessageID != nil && msg.ReplyText != nil {
 			replyText, _ := h.encryptionService.DecryptMessage(*msg.ReplyText)
+			replyVerified := false
+			if msg.ReplyIsVerified != nil {
+				replyVerified = *msg.ReplyIsVerified
+			}
+			replyUsername := ""
+			if msg.ReplyUsername != nil {
+				replyUsername = *msg.ReplyUsername
+			}
 			item["reply_to_message"] = gin.H{
-				"id":         *msg.ReplyToMessageID,
-				"sender_id":  msg.ReplyToSenderID,
-				"text":       replyText,
-				"created_at": msg.CreatedAt, // reply-də də tarix (Flutter parse crash olmasın)
+				"id":                 *msg.ReplyToMessageID,
+				"sender_id":          msg.ReplyToSenderID,
+				"sender_username":    replyUsername,
+				"sender_is_verified": replyVerified,
+				"sender_avatar":      utils.PrependBaseURL(msg.ReplyAvatar),
+				"text":               replyText,
+				"created_at":         msg.CreatedAt, // reply-də də tarix (Flutter parse crash olmasın)
 			}
 		}
 
