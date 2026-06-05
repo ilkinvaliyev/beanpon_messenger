@@ -88,6 +88,10 @@ type Conversation struct {
 	// NULL = hamısı AÇIQ (default). Yalnız admin/owner dəyişə bilər;
 	// bağlı əməliyyatı admin ÖZÜ edə bilər, digərləri 403 alır.
 	GroupPermissions *string `json:"group_permissions" gorm:"type:jsonb"`
+	// 📌 Sabitlənmiş (pin) mesaj — qrupda TƏK mesaj pin oluna bilər
+	// (yenisi köhnəni əvəz edir). Yalnız admin/owner pin/unpin edir.
+	// Pin olunmuş mesaj SİLİNƏNDƏ avtomatik NULL-lanır.
+	PinnedMessageID *string `json:"pinned_message_id" gorm:"type:uuid"`
 }
 
 type ConversationResponse struct {

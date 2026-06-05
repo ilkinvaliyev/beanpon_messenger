@@ -1,3 +1,20 @@
+# Migration: conversations.pinned_message_id
+
+Qrupda sabitlənmiş (pin) mesaj. NULL = pin yoxdur.
+
+```sql
+ALTER TABLE conversations
+  ADD COLUMN IF NOT EXISTS pinned_message_id uuid;
+```
+
+Geri almaq:
+
+```sql
+ALTER TABLE conversations DROP COLUMN IF EXISTS pinned_message_id;
+```
+
+---
+
 # Migration: conversations.group_permissions
 
 Qrup admin icazələri (mesaj/media/gif/səs/circle-video). NULL = hamısı açıq.

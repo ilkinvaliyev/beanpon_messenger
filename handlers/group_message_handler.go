@@ -4,10 +4,14 @@ import (
 	"beanpon_messenger/database"
 	"beanpon_messenger/models"
 	"beanpon_messenger/utils"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -50,6 +54,47 @@ func NewGroupMessageHandler(
 		encryptionService: encryptionService,
 		wsHub:             wsHub,
 	}
+}
+
+// groupMentionRegex — mesaj mətnindəki @username uyğunluqları
+// (Flutter MentionTextUtils regex-i ilə eyni format: hərf/rəqəm/_/.).
+var groupMentionRegex = regexp.MustCompile(`@([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)`)
+
+// sendGroupMentionPush — "@username sizdən qrupda bəhs etdi" push-u
+// Laravel `/notification/group-mention` üzərindən. MUTE BYPASS + dərhal.
+func (h *GroupMessageHandler) sendGroupMentionPush(
+	conversationID, senderID uint, groupName string, receiverIDs []uint,
+) {
+	backendURL := os.Getenv("BACKEND_URL")
+	cloudToken := os.Getenv("CLOUD_TOKEN")
+	if backendURL == "" || cloudToken == "" || len(receiverIDs) == 0 {
+		return
+	}
+
+	payload := map[string]interface{}{
+		"receiver_ids":    receiverIDs,
+		"sender_id":       senderID,
+		"conversation_id": conversationID,
+		"group_name":      groupName,
+	}
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	httpReq, err := http.NewRequest("POST",
+		backendURL+"/notification/group-mention", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("x-api-key", cloudToken)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return
+	}
+	resp.Body.Close()
 }
 
 // POST /api/v1/groups/:conversation_id/messages
@@ -270,11 +315,76 @@ func (h *GroupMessageHandler) SendGroupMessage(c *gin.Context) {
 		}
 	}()
 
-	// 📬 GECİKMƏLİ qrup push-u (anti-spam, Telegram yanaşması):
-	// 10 saniyə gözlə → göndərmədən əvvəl hər alıcı üçün yoxla:
-	// mesajı OXUYUB və ya qrup səhifəsi AÇIQDIRSA push GETMİR.
-	// Mute/pending dəvət filtri buradadır; aktiv-chat və read-check
-	// hub.ScheduleGroupPushNotification içində gecikmədən SONRA edilir.
+	// 🏷️ MENTION tespiti: mesajdakı @username-lər (yalnız BU QRUPUN aktiv
+	// üzvləri) + @all (HAMI). Tag olunanlara push MUTE OLSA BELƏ, GECİKMƏSİZ
+	// və xüsusi mətnlə ("qrupda sizdən bəhs etdi") gedir — vacib siqnal,
+	// Telegram/Slack davranışı.
+	mentionedIDs := map[uint]bool{}
+	mentionAll := false
+	if matches := groupMentionRegex.FindAllStringSubmatch(req.Text, -1); len(matches) > 0 {
+		usernames := make([]string, 0, len(matches))
+		for _, m := range matches {
+			uname := strings.ToLower(m[1])
+			if uname == "all" {
+				mentionAll = true
+				continue
+			}
+			usernames = append(usernames, uname)
+		}
+		if len(usernames) > 0 {
+			var rows []struct {
+				UserID uint `gorm:"column:user_id"`
+			}
+			database.DB.Raw(`
+				SELECT cp.user_id FROM conversation_participants cp
+				JOIN users u ON u.id = cp.user_id
+				WHERE cp.conversation_id = ?
+				  AND cp.left_at IS NULL AND cp.deleted_at IS NULL
+				  AND COALESCE(cp.invite_status, 'active') = 'active'
+				  AND LOWER(u.username) IN ?
+			`, conversationID, usernames).Scan(&rows)
+			for _, r := range rows {
+				mentionedIDs[r.UserID] = true
+			}
+		}
+	}
+
+	var groupName string
+	database.DB.Table("conversations").
+		Where("id = ?", conversationID).
+		Select("COALESCE(group_name, '')").
+		Scan(&groupName)
+
+	// AKTİV üzvlər (mute fərq etmir — mention bypass üçün tam siyahı).
+	var allActive []uint
+	database.DB.Model(&models.ConversationParticipant{}).
+		Where("conversation_id = ? AND user_id != ? AND left_at IS NULL AND deleted_at IS NULL", conversationID, senderID).
+		Where("COALESCE(invite_status, 'active') = 'active'").
+		Pluck("user_id", &allActive)
+
+	mentionTargets := make([]uint, 0)
+	for _, uid := range allActive {
+		if mentionAll || mentionedIDs[uid] {
+			mentionTargets = append(mentionTargets, uid)
+		}
+	}
+
+	// 1) MENTION push — dərhal (gecikməsiz), MUTE BYPASS, xüsusi mətn.
+	//    Yalnız hazırda qrup səhifəsində OLMAYANLARA (onsuz da görür).
+	if len(mentionTargets) > 0 {
+		immediate := make([]uint, 0, len(mentionTargets))
+		for _, uid := range mentionTargets {
+			if !h.wsHub.IsUserInGroupChat(uid, conversationID) {
+				immediate = append(immediate, uid)
+			}
+		}
+		if len(immediate) > 0 {
+			go h.sendGroupMentionPush(conversationID, senderID, groupName, immediate)
+		}
+	}
+
+	// 2) NORMAL gecikməli push — mention olunMAyanlara (köhnə axın):
+	//    mute filtri + 10 saniyə + read/aktiv-chat yoxlaması.
 	var pushTargets []uint
 	database.DB.Model(&models.ConversationParticipant{}).
 		Where("conversation_id = ? AND user_id != ? AND left_at IS NULL AND deleted_at IS NULL", conversationID, senderID).
@@ -282,15 +392,19 @@ func (h *GroupMessageHandler) SendGroupMessage(c *gin.Context) {
 		Where("is_muted = false OR (muted_until IS NOT NULL AND muted_until < ?)", now).
 		Pluck("user_id", &pushTargets)
 
-	if len(pushTargets) > 0 {
-		var groupName string
-		database.DB.Table("conversations").
-			Where("id = ?", conversationID).
-			Select("COALESCE(group_name, '')").
-			Scan(&groupName)
+	// Mention alanları normal push-dan çıxar (ikiqat bildiriş olmasın).
+	filtered := make([]uint, 0, len(pushTargets))
+	for _, uid := range pushTargets {
+		if mentionAll || mentionedIDs[uid] {
+			continue
+		}
+		filtered = append(filtered, uid)
+	}
+
+	if len(filtered) > 0 {
 		h.wsHub.ScheduleGroupPushNotification(
 			conversationID, senderID, groupName, req.Text, messageID,
-			pushTargets, 10*time.Second,
+			filtered, 10*time.Second,
 		)
 	}
 
@@ -672,6 +786,23 @@ func (h *GroupMessageHandler) DeleteGroupMessage(c *gin.Context) {
 	}
 
 	conversationID := *msg.ConversationID
+
+	// 📌 Silinən mesaj PIN olunmuşdursa pin-i AVTOMATİK götür + üzvlərə yay.
+	var pinnedID *string
+	database.DB.Table("conversations").
+		Where("id = ?", conversationID).
+		Select("pinned_message_id").Scan(&pinnedID)
+	if pinnedID != nil && *pinnedID == messageID {
+		database.DB.Table("conversations").
+			Where("id = ?", conversationID).
+			Update("pinned_message_id", nil)
+		h.wsHub.SendToMultipleUsers(getGroupParticipantIDs(conversationID),
+			"group_message_pinned", map[string]interface{}{
+				"conversation_id": conversationID,
+				"pinned_message":  nil, // pin götürüldü
+			})
+	}
+
 	memberIDs := getGroupParticipantIDs(conversationID)
 	h.wsHub.SendToMultipleUsers(memberIDs, "group_message_deleted", map[string]interface{}{
 		"conversation_id": conversationID,
@@ -684,6 +815,85 @@ func (h *GroupMessageHandler) DeleteGroupMessage(c *gin.Context) {
 			"conversation_id": conversationID,
 			"message_id":      messageID,
 		},
+	})
+}
+
+// POST /api/v1/groups/messages/:message_id/pin   — mesajı sabitlə
+// POST /api/v1/groups/messages/:message_id/unpin — pin-i götür
+// Yalnız admin/owner. Qrupda TƏK pin var — yenisi köhnəni əvəz edir.
+// Bütün üzvlərə group_message_pinned WS event-i: pinned_message = null
+// (götürüldü) və ya {id, text, sender_id, sender_username}.
+func (h *GroupMessageHandler) PinGroupMessage(c *gin.Context) {
+	h.handlePinUnpin(c, true)
+}
+
+func (h *GroupMessageHandler) UnpinGroupMessage(c *gin.Context) {
+	h.handlePinUnpin(c, false)
+}
+
+func (h *GroupMessageHandler) handlePinUnpin(c *gin.Context, pin bool) {
+	userID := c.MustGet("user_id").(uint)
+	messageID := c.Param("message_id")
+
+	msg, ok := h.findGroupMessage(c, messageID, userID)
+	if !ok {
+		return
+	}
+	conversationID := *msg.ConversationID
+
+	// Yalnız admin/owner pin/unpin edə bilər.
+	var me models.ConversationParticipant
+	err := database.DB.Where(
+		"conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL",
+		conversationID, userID,
+	).First(&me).Error
+	if err != nil || (me.Role != "owner" && me.Role != "admin") {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Yalnızca yöneticiler sabitleyebilir"})
+		return
+	}
+
+	var newPinned interface{} = nil
+	var payload map[string]interface{}
+
+	if pin {
+		if err := database.DB.Table("conversations").
+			Where("id = ?", conversationID).
+			Update("pinned_message_id", messageID).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Sabitlenemedi"})
+			return
+		}
+		// Pinned mesaj məlumatı (banner üçün): text + göndərən username.
+		decrypted, _ := h.encryptionService.DecryptMessage(msg.EncryptedText)
+		var senderUsername string
+		database.DB.Raw(`SELECT username FROM users WHERE id = ?`, msg.SenderID).
+			Scan(&senderUsername)
+		payload = map[string]interface{}{
+			"id":              messageID,
+			"text":            decrypted,
+			"sender_id":       msg.SenderID,
+			"sender_username": senderUsername,
+		}
+		newPinned = payload
+	} else {
+		// Unpin — yalnız hazırda pin olunmuş mesaj üçün.
+		if err := database.DB.Table("conversations").
+			Where("id = ? AND pinned_message_id = ?", conversationID, messageID).
+			Update("pinned_message_id", nil).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Sabitleme kaldırılamadı"})
+			return
+		}
+	}
+
+	memberIDs := getGroupParticipantIDs(conversationID)
+	h.wsHub.SendToMultipleUsers(memberIDs, "group_message_pinned", map[string]interface{}{
+		"conversation_id": conversationID,
+		"pinned_message":  newPinned,
+		"changed_by":      userID,
+	})
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":        "OK",
+		"pinned_message": newPinned,
 	})
 }
 

@@ -288,6 +288,9 @@ func main() {
 		api.PUT("/groups/messages/:message_id", groupMsgHandler.EditGroupMessage)
 		api.POST("/groups/messages/:message_id/star", groupMsgHandler.ToggleGroupStar)
 		api.POST("/groups/messages/:message_id/reaction", groupMsgHandler.SetGroupReaction)
+		// 📌 Mesaj sabitləmə (yalnız admin; qrupda TƏK pin — yenisi əvəz edir)
+		api.POST("/groups/messages/:message_id/pin", groupMsgHandler.PinGroupMessage)
+		api.POST("/groups/messages/:message_id/unpin", groupMsgHandler.UnpinGroupMessage)
 		// ① "Bir dəfə bax" media açıldı (qrup) — hər üzv bir dəfə;
 		// group_message_edited WS event-i ilə bütün üzvlərə yayılır.
 		api.POST("/groups/messages/:message_id/view-once-opened", groupMsgHandler.MarkGroupViewOnceOpened)

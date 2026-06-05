@@ -1188,7 +1188,10 @@ func (h *GroupHandler) GetMyGroups(c *gin.Context) {
 			COALESCE(cp.is_archived, false) as is_archived,
 			(SELECT COUNT(*) FROM conversation_participants cp2
 			 WHERE cp2.conversation_id = c.id AND cp2.left_at IS NULL AND cp2.deleted_at IS NULL) as member_count,
-			c.last_message_at,
+			-- BOŞ QRUP FIX: heç mesaj yoxdursa last_message_at NULL gəlirdi →
+			-- Flutter epoch-0 ilə siyahının ƏN DİBİNƏ atırdı (görünməz kimi).
+			-- Fallback: qoşulma/yaranma vaxtı → yeni qrup yuxarılarda görünür.
+			COALESCE(c.last_message_at, cp.joined_at, c.created_at) as last_message_at,
 			(SELECT COUNT(*) FROM messages m
 			 LEFT JOIN message_reads mr ON mr.message_id = m.id AND mr.user_id = ?
 			 WHERE m.conversation_id = c.id
@@ -1220,7 +1223,7 @@ func (h *GroupHandler) GetMyGroups(c *gin.Context) {
 		ORDER BY
 			COALESCE(cp.is_pinned, false) DESC,
 			cp.pinned_at DESC NULLS LAST,
-			c.last_message_at DESC NULLS LAST
+			COALESCE(c.last_message_at, cp.joined_at, c.created_at) DESC NULLS LAST
 	`, userID, userID, userID, userID, userID).Scan(&groups)
 
 	for i := range groups {
@@ -1326,6 +1329,26 @@ func (h *GroupHandler) GetGroupDetail(c *gin.Context) {
 		inviteToken = conv.InviteToken
 	}
 
+	// 📌 Pinned mesaj (banner üçün): id + decrypt text + göndərən username.
+	// Mesaj silinmişsə (deleted_at) pin sayılmır.
+	var pinnedMessage interface{} = nil
+	if conv.PinnedMessageID != nil {
+		var pinned models.Message
+		if err := database.DB.Where("id = ? AND deleted_at IS NULL",
+			*conv.PinnedMessageID).First(&pinned).Error; err == nil {
+			decrypted, _ := h.encryptionService.DecryptMessage(pinned.EncryptedText)
+			var senderUsername string
+			database.DB.Raw(`SELECT username FROM users WHERE id = ?`, pinned.SenderID).
+				Scan(&senderUsername)
+			pinnedMessage = gin.H{
+				"id":              pinned.ID,
+				"text":            decrypted,
+				"sender_id":       pinned.SenderID,
+				"sender_username": senderUsername,
+			}
+		}
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"id":              conv.ID,
 		"name":            conv.GroupName,
@@ -1339,7 +1362,9 @@ func (h *GroupHandler) GetGroupDetail(c *gin.Context) {
 		"member_previews": previews,
 		// Admin icazələri — Flutter input-u buna görə disable/enable edir.
 		"permissions": parseGroupPermissions(conv.GroupPermissions),
-		"created_at":  conv.CreatedAt,
+		// 📌 Sabitlənmiş mesaj (null = pin yoxdur).
+		"pinned_message": pinnedMessage,
+		"created_at":     conv.CreatedAt,
 	})
 }
 
