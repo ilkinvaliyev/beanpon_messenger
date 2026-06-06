@@ -74,6 +74,7 @@ func defaultGroupPermissions() map[string]bool {
 		"allow_gif":          true,
 		"allow_voice":        true,
 		"allow_circle_video": true,
+		"allow_sound":        true,
 	}
 }
 

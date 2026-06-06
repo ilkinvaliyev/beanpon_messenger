@@ -158,6 +158,8 @@ func (h *GroupMessageHandler) SendGroupMessage(c *gin.Context) {
 					permKey = "allow_gif"
 				case "voice":
 					permKey = "allow_voice"
+				case "sound":
+					permKey = "allow_sound"
 				}
 			}
 		}
