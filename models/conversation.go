@@ -82,7 +82,7 @@ type Conversation struct {
 	CreatedBy            *uint      `json:"created_by"`
 	InviteToken          *string    `json:"invite_token" gorm:"type:varchar(32);uniqueIndex"`
 	InviteTokenExpiresAt *time.Time `json:"invite_token_expires_at"`
-	MaxMembers           int        `json:"max_members" gorm:"default:50"`
+	MaxMembers           int        `json:"max_members" gorm:"default:150"`
 	// Qrup admin icazələri (jsonb): {"allow_text":true,"allow_media":true,
 	// "allow_gif":true,"allow_voice":true,"allow_circle_video":true}.
 	// NULL = hamısı AÇIQ (default). Yalnız admin/owner dəyişə bilər;

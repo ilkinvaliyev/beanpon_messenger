@@ -367,12 +367,13 @@ func (h *GroupHandler) CreateGroup(c *gin.Context) {
 		return
 	}
 
-	// Qrup limiti: maksimum 50 nəfər (yaradan DAXİL). Yaratma zamanı ilkin
-	// üzv siyahısı da yoxlanır (yaradan + member_ids <= 50).
-	const groupMaxMembers = 50
+	// Qrup limiti: maksimum 150 nəfər (yaradan DAXİL). Bu dəyər həm yaratma
+	// yoxlamasında, həm DB-yə (max_members) yazılır → JoinByToken/AddMembers
+	// həmin sütundan oxuyur.
+	const groupMaxMembers = 150
 	if len(req.MemberIDs)+1 > groupMaxMembers {
 		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "Grup en fazla 50 kişi olabilir",
+			"error": "Grup en fazla 150 kişi olabilir",
 		})
 		return
 	}
