@@ -38,11 +38,20 @@ func (h *LiveHub) HandleWebSocket(c *gin.Context) {
 		return
 	}
 
+	// Platforma admin statusunu əvvəlcədən oxu: həm otağa girişdə
+	// (participant olmasa belə admin keçə bilər), həm də client obyektinə
+	// yazılır ki, moderasiya əməliyyatlarında host-VƏYA-admin yoxlaması
+	// işləsin (bax: LiveRoomClient.canModerate).
+	var moderatorUser models.User
+	isAdmin := false
+	if dbErr := database.DB.Select("is_admin").First(&moderatorUser, userID).Error; dbErr == nil {
+		isAdmin = moderatorUser.IsAdmin
+	}
+
 	var participant models.LiveRoomParticipant
 	if err := database.DB.Where("live_room_id = ? AND user_id = ? AND status = 'active'", roomID, userID).First(&participant).Error; err != nil {
 		// Participant yoxdur — admin-dirsə icazə ver
-		var user models.User
-		if dbErr := database.DB.Select("is_admin").First(&user, userID).Error; dbErr != nil || !user.IsAdmin {
+		if !isAdmin {
 			c.JSON(http.StatusForbidden, gin.H{"error": "Odaya erişim izniniz yok"})
 			return
 		}
@@ -104,6 +113,7 @@ func (h *LiveHub) HandleWebSocket(c *gin.Context) {
 		AvatarType: senderInfo.ProfileImageType,
 		IsGhost:    senderInfo.IsGhost,
 		LiveSpam:   senderInfo.LiveSpam,
+		IsAdmin:    isAdmin,
 		Send:       make(chan []byte, 256),
 	}
 

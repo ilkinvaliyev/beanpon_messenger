@@ -32,7 +32,21 @@ type LiveRoomClient struct {
 	// heç bir error / status almır (silent drop) — özünü bloklanmış kimi
 	// hiss etməsin deyə.
 	LiveSpam bool
-	Send     chan []byte
+	// IsAdmin — platforma admini (users.is_admin). Admin otağın host-u
+	// OLMASA belə host-səviyyəli moderasiya səlahiyyətinə malikdir:
+	// chat təmizləmə, speaker/viewer çıxarma, mute, oyun idarəsi.
+	// Bağlantı qurulan an bir dəfə oxunur (HandleWebSocket). Laravel
+	// LiveResource-dakı admin yoxlamasının real-time WS qarşılığıdır.
+	IsAdmin bool
+	Send    chan []byte
+}
+
+// canModerate — bu client otaqda host-səviyyəli moderasiya əməliyyatı
+// (chat_clear, kick, mute, transfer, oyun idarəsi) edə bilərmi?
+// Otağın əsl host-u VƏ YA platforma admini icazəlidir. nil client
+// (məs. obyekt tapılmadı) heç vaxt icazəli deyil.
+func (c *LiveRoomClient) canModerate() bool {
+	return c != nil && (c.Role == "host" || c.IsAdmin)
 }
 
 // visibleCount — otaqdakı ghost və live_spam olmayan istifadəçilərin
@@ -666,6 +680,13 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		}
 
 	case "kick_speaker":
+		h.mu.RLock()
+		ksSender, ksExists := roomClients[event.SenderID]
+		h.mu.RUnlock()
+		if !ksExists || !ksSender.canModerate() {
+			return
+		}
+
 		var dataMap map[string]interface{}
 		if err := json.Unmarshal(event.Data, &dataMap); err != nil {
 			log.Printf("❌ kick_speaker data parse hatası: %v", err)
@@ -694,7 +715,7 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		h.mu.RLock()
 		sender, exists := roomClients[event.SenderID]
 		h.mu.RUnlock()
-		if !exists || sender.Role != "host" {
+		if !exists || !sender.canModerate() {
 			return
 		}
 
@@ -774,7 +795,7 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		h.mu.RLock()
 		sender, exists := roomClients[event.SenderID]
 		h.mu.RUnlock()
-		if !exists || sender.Role != "host" {
+		if !exists || !sender.canModerate() {
 			return
 		}
 
@@ -804,7 +825,7 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		h.mu.RLock()
 		sender, exists := roomClients[event.SenderID]
 		h.mu.RUnlock()
-		if !exists || sender.Role != "host" {
+		if !exists || !sender.canModerate() {
 			return
 		}
 
@@ -905,7 +926,7 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		h.mu.RLock()
 		sender, exists := roomClients[event.SenderID]
 		h.mu.RUnlock()
-		if !exists || sender.Role != "host" {
+		if !exists || !sender.canModerate() {
 			return
 		}
 
@@ -919,10 +940,18 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		}
 		targetUserID := uint(targetUserIDFloat)
 
+		// Köçürməni edən əsl host idisə öz rolunu broadcaster-ə endirir
+		// (otaq tək host-ludur). Admin (host olmayan) başqasını host
+		// təyin edəndə isə öz rolu DƏYİŞMİR — o, host deyildi, sadəcə
+		// moderator idi və moderator qalır.
+		senderWasHost := sender.Role == "host"
+
 		h.mu.Lock()
 		if targetClient, exists := roomClients[targetUserID]; exists {
 			targetClient.Role = "host"
-			sender.Role = "broadcaster" // ← audience deyil
+			if senderWasHost {
+				sender.Role = "broadcaster" // ← audience deyil
+			}
 		}
 		h.mu.Unlock()
 
@@ -934,10 +963,12 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 			"UPDATE live_room_participants SET role = 'host' WHERE live_room_id = ? AND user_id = ?",
 			event.RoomID, targetUserID,
 		)
-		go database.DB.Exec(
-			"UPDATE live_room_participants SET role = 'broadcaster' WHERE live_room_id = ? AND user_id = ?", // ← audience deyil
-			event.RoomID, event.SenderID,
-		)
+		if senderWasHost {
+			go database.DB.Exec(
+				"UPDATE live_room_participants SET role = 'broadcaster' WHERE live_room_id = ? AND user_id = ?", // ← audience deyil
+				event.RoomID, event.SenderID,
+			)
+		}
 
 		hasBlocked := models.IsBlocked(database.DB, targetUserID, event.SenderID)
 		transferPayload, _ := json.Marshal(map[string]interface{}{
@@ -963,7 +994,7 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		h.mu.RLock()
 		sender, ok := roomClients[event.SenderID]
 		h.mu.RUnlock()
-		if !ok || sender.Role != "host" {
+		if !ok || !sender.canModerate() {
 			return
 		}
 
@@ -996,7 +1027,7 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		h.mu.RLock()
 		sender, ok := roomClients[event.SenderID]
 		h.mu.RUnlock()
-		if !ok || sender.Role != "host" {
+		if !ok || !sender.canModerate() {
 			return
 		}
 
@@ -1024,7 +1055,7 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		h.mu.RLock()
 		sender, senderExists := roomClients[event.SenderID]
 		h.mu.RUnlock()
-		if !senderExists || sender.Role != "host" {
+		if !senderExists || !sender.canModerate() {
 			return
 		}
 
