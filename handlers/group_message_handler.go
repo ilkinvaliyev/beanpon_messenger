@@ -445,6 +445,41 @@ func (h *GroupMessageHandler) GetGroupMessages(c *gin.Context) {
 	// İŞARƏLƏNMİR. WhatsApp davranışı — peek görüldü sayılmır.
 	peek := c.DefaultQuery("peek", "false") == "true"
 
+	// 🆕 around=<msgId> — ANLIQ okunmamışa konumlanma (WhatsApp). Verilirsə
+	// həmin mesajdan SONA QƏDƏR bütün mesajlar TƏK sorğuda gəlir (titrəmə yox,
+	// səhifə-səhifə yükləmə yox). Okunmamışlar "yeni" olduğu üçün sayı azdır.
+	// Tavan: 300 (təhlükəsizlik). Yuxarı (köhnə/oxunmuş) mesajlar lazım olsa
+	// adi `page` paginasiyası ilə gəlir.
+	aroundID := c.DefaultQuery("around", "")
+	var aroundCreatedAt *time.Time
+	if aroundID != "" {
+		var ts time.Time
+		if err := database.DB.Raw(
+			`SELECT created_at FROM messages WHERE id = ?`, aroundID,
+		).Scan(&ts).Error; err == nil && !ts.IsZero() {
+			aroundCreatedAt = &ts
+			offset = 0
+			if limit < 300 {
+				limit = 300
+			}
+		}
+	}
+
+	// 🆕 before=<msgId> — KÖHNƏ mesajları çək (cursor paginasiyası).
+	// around rejimindən sonra yuxarı sürüşəndə istifadə olunur (offset/page
+	// qarışmasın). before mesajından DAHA KÖHNƏ olanlar gəlir.
+	beforeID := c.DefaultQuery("before", "")
+	var beforeCreatedAt *time.Time
+	if beforeID != "" {
+		var ts time.Time
+		if err := database.DB.Raw(
+			`SELECT created_at FROM messages WHERE id = ?`, beforeID,
+		).Scan(&ts).Error; err == nil && !ts.IsZero() {
+			beforeCreatedAt = &ts
+			offset = 0
+		}
+	}
+
 	// Yeni qoşulan üzv KÖHNƏ mesajları görmür: yalnız joined_at-dan SONRAKI
 	// mesajlar. JoinedAt null-dursa (köhnə qeydlər) participant created_at
 	// fallback. cleared_at varsa ("söhbəti təmizlə — özüm üçün") ondan sonrakı.
@@ -505,6 +540,10 @@ func (h *GroupMessageHandler) GetGroupMessages(c *gin.Context) {
 		  AND m.deleted_at IS NULL
 		  AND m.created_at >= ?
 		  AND m.created_at > COALESCE(?, '1970-01-01'::timestamptz)
+		  -- around verilibsə: yalnız HƏMİN mesajdan SONRAKILAR (+ özü).
+		  AND (?::timestamptz IS NULL OR m.created_at >= ?::timestamptz)
+		  -- before verilibsə: yalnız HƏMİN mesajdan KÖHNƏLƏR.
+		  AND (?::timestamptz IS NULL OR m.created_at < ?::timestamptz)
 		  AND NOT EXISTS (
 		      SELECT 1 FROM user_blocks ub
 		      WHERE (ub.blocker_id = ? AND ub.blocked_id = m.sender_id)
@@ -512,14 +551,18 @@ func (h *GroupMessageHandler) GetGroupMessages(c *gin.Context) {
 		  )
 		ORDER BY m.created_at DESC
 		LIMIT ? OFFSET ?
-	`, userID, conversationID, joinedAtFilter, me.ClearedAt, userID, userID, limit, offset).Scan(&messages)
+	`, userID, conversationID, joinedAtFilter, me.ClearedAt,
+		aroundCreatedAt, aroundCreatedAt,
+		beforeCreatedAt, beforeCreatedAt,
+		userID, userID, limit, offset).Scan(&messages)
 
 	// 🆕 İLK OXUNMAMIŞ mesaj id-si — MARK-DAN ƏVVƏL hesablanır (mark sonra
 	// hamısını oxundu edəcək). last_read_message_id-dən SONRAKI ilk BAŞQA
 	// göndərənin mesajı. Flutter açılışda buna konumlanıb "Yeni mesajlar"
-	// ayracı qoyur. Yalnız 1-ci səhifədə (page=1) və peek deyil.
+	// ayracı qoyur. Yalnız İLK adi yükləmədə (page=1, around/before YOX) və
+	// peek deyil. (around onsuz da first_unread id-si ilə çağırılır.)
 	var firstUnreadID *string
-	if !peek && page == 1 {
+	if !peek && page == 1 && aroundID == "" && beforeID == "" {
 		var unreadRow struct {
 			ID string `gorm:"column:id"`
 		}
@@ -630,6 +673,20 @@ func (h *GroupMessageHandler) GetGroupMessages(c *gin.Context) {
 		Where("conversation_id = ? AND deleted_at IS NULL", conversationID).
 		Count(&total)
 
+	// 🆕 has_older — yüklənən ƏN KÖHNƏ mesajdan da əvvəl mesaj VARMI?
+	// around/before cursor paginasiyası üçün (page-offset deyil). messages
+	// DESC sıralı → sonuncu element ən köhnə.
+	hasOlder := false
+	if len(messages) > 0 {
+		oldest := messages[len(messages)-1].CreatedAt
+		var cnt int64
+		database.DB.Model(&models.Message{}).
+			Where("conversation_id = ? AND deleted_at IS NULL AND created_at < ? AND created_at >= ? AND created_at > COALESCE(?, '1970-01-01'::timestamptz)",
+				conversationID, oldest, joinedAtFilter, me.ClearedAt).
+			Limit(1).Count(&cnt)
+		hasOlder = cnt > 0
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"data":  result,
 		"page":  page,
@@ -638,6 +695,8 @@ func (h *GroupMessageHandler) GetGroupMessages(c *gin.Context) {
 		// 🆕 İlk oxunmamış mesaj id-si (page=1, mark-dan əvvəl hesablanıb).
 		// null = hamısı oxunub → Flutter ən altda qalır.
 		"first_unread_message_id": firstUnreadID,
+		// 🆕 Cursor paginasiyası: yuxarıda daha köhnə mesaj varmı?
+		"has_older": hasOlder,
 	})
 }
 
