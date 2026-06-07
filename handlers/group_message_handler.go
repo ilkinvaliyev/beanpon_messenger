@@ -514,6 +514,34 @@ func (h *GroupMessageHandler) GetGroupMessages(c *gin.Context) {
 		LIMIT ? OFFSET ?
 	`, userID, conversationID, joinedAtFilter, me.ClearedAt, userID, userID, limit, offset).Scan(&messages)
 
+	// 🆕 İLK OXUNMAMIŞ mesaj id-si — MARK-DAN ƏVVƏL hesablanır (mark sonra
+	// hamısını oxundu edəcək). last_read_message_id-dən SONRAKI ilk BAŞQA
+	// göndərənin mesajı. Flutter açılışda buna konumlanıb "Yeni mesajlar"
+	// ayracı qoyur. Yalnız 1-ci səhifədə (page=1) və peek deyil.
+	var firstUnreadID *string
+	if !peek && page == 1 {
+		var unreadRow struct {
+			ID string `gorm:"column:id"`
+		}
+		// Oxunmamış = message_reads-də cari user qeydi YOX + başqası göndərib.
+		err := database.DB.Raw(`
+			SELECT m.id FROM messages m
+			LEFT JOIN message_reads mr
+			  ON mr.message_id = m.id AND mr.user_id = ?
+			WHERE m.conversation_id = ?
+			  AND m.sender_id != ?
+			  AND m.deleted_at IS NULL
+			  AND m.created_at >= ?
+			  AND m.created_at > COALESCE(?, '1970-01-01'::timestamptz)
+			  AND mr.id IS NULL
+			ORDER BY m.created_at ASC
+			LIMIT 1
+		`, userID, conversationID, userID, joinedAtFilter, me.ClearedAt).Scan(&unreadRow).Error
+		if err == nil && unreadRow.ID != "" {
+			firstUnreadID = &unreadRow.ID
+		}
+	}
+
 	// peek rejimində OXUNDU işarələnmir (önizləmə görüldü sayılmır).
 	if !peek {
 		go h.markGroupMessagesRead(userID, conversationID)
@@ -607,6 +635,9 @@ func (h *GroupMessageHandler) GetGroupMessages(c *gin.Context) {
 		"page":  page,
 		"limit": limit,
 		"total": total,
+		// 🆕 İlk oxunmamış mesaj id-si (page=1, mark-dan əvvəl hesablanıb).
+		// null = hamısı oxunub → Flutter ən altda qalır.
+		"first_unread_message_id": firstUnreadID,
 	})
 }
 

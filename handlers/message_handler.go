@@ -548,6 +548,29 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 		responseMessages = append(responseMessages, responseMessage)
 	}
 
+	// 🆕 İLK OXUNMAMIŞ mesaj id-si — MARK-DAN ƏVVƏL (mark sonra read=true
+	// edəcək). Qarşı tərəfdən gələn, oxunmamış (read=false) ən KÖHNƏ mesaj.
+	// Flutter açılışda buna konumlanıb "Yeni mesajlar" ayracı qoyur.
+	// Yalnız 1-ci səhifədə + peek deyil.
+	var firstUnreadID *string
+	if !peek && page == 1 {
+		var unreadRow struct {
+			ID string `gorm:"column:id"`
+		}
+		e := database.DB.Raw(`
+			SELECT id FROM messages
+			WHERE sender_id = ? AND receiver_id = ?
+			  AND read = false
+			  AND is_deleted_by_receiver = false
+			  AND deleted_at IS NULL
+			ORDER BY created_at ASC
+			LIMIT 1
+		`, otherUserID, userID).Scan(&unreadRow).Error
+		if e == nil && unreadRow.ID != "" {
+			firstUnreadID = &unreadRow.ID
+		}
+	}
+
 	// peek rejimində OXUNDU işarələnmir (önizləmə görüldü sayılmır).
 	if !peek {
 		go h.markReceivedMessagesAsRead(userID.(uint), uint(otherUserID))
@@ -577,11 +600,12 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"data":      responseMessages,
-		"page":      page,
-		"limit":     limit,
-		"total":     int(totalCount),
-		"is_online": h.wsHub.IsUserOnline(uint(otherUserID)),
+		"data":                    responseMessages,
+		"page":                    page,
+		"limit":                   limit,
+		"total":                   int(totalCount),
+		"first_unread_message_id": firstUnreadID,
+		"is_online":               h.wsHub.IsUserOnline(uint(otherUserID)),
 	})
 }
 
