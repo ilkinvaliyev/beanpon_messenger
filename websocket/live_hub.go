@@ -394,8 +394,26 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 
 		gifURL, _ := dataMap["gif_url"].(string)
 		imageURL, _ := dataMap["image_url"].(string)
+		soundURL, _ := dataMap["sound_url"].(string)
 
-		if textData == "" && gifURL == "" && imageURL == "" {
+		// sound_id (float64/string) → *uint
+		var soundID *uint
+		if sv, ok := dataMap["sound_id"]; ok && sv != nil {
+			switch v := sv.(type) {
+			case float64:
+				if v > 0 {
+					id := uint(v)
+					soundID = &id
+				}
+			case string:
+				if parsed, err := strconv.ParseUint(v, 10, 64); err == nil && parsed > 0 {
+					id := uint(parsed)
+					soundID = &id
+				}
+			}
+		}
+
+		if textData == "" && gifURL == "" && imageURL == "" && soundURL == "" {
 			return
 		}
 
@@ -481,6 +499,12 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 				fullGifURL = *w
 			}
 		}
+		var fullSoundURL string
+		if soundURL != "" {
+			if w := utils.PrependS3URL(&soundURL); w != nil {
+				fullSoundURL = *w
+			}
+		}
 
 		// DB kayıt
 		chatMsg := models.LiveRoomMessage{
@@ -495,6 +519,12 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		if fullGifURL != "" {
 			chatMsg.GifURL = &fullGifURL
 		}
+		if fullSoundURL != "" {
+			chatMsg.SoundURL = &fullSoundURL
+		}
+		if soundID != nil {
+			chatMsg.SoundID = soundID
+		}
 
 		if err := database.DB.Create(&chatMsg).Error; err != nil {
 			log.Printf("💥 DB KAYIT HATASI: %v", err)
@@ -508,6 +538,8 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 			"text":        textData,
 			"gif_url":     fullGifURL,
 			"image_url":   fullImageURL,
+			"sound_url":   fullSoundURL,
+			"sound_id":    soundID,
 			"sender_id":   event.SenderID,
 			"sender_name": senderName,
 			"sender_avatar": func() *string {

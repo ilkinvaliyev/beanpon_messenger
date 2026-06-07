@@ -258,6 +258,8 @@ func (h *LiveHub) GetLiveRoomMessages(c *gin.Context) {
 		Text                  string                  `json:"text"`
 		GifURL                *string                 `json:"gif_url"`
 		ImageURL              *string                 `json:"image_url"`
+		SoundURL              *string                 `json:"sound_url"`
+		SoundID               *uint                   `json:"sound_id"`
 		SenderID              uint                    `json:"sender_id"`
 		SenderName            string                  `json:"sender_name"`
 		SenderAvatar          *string                 `json:"sender_avatar"`
@@ -273,7 +275,7 @@ func (h *LiveHub) GetLiveRoomMessages(c *gin.Context) {
 	}
 
 	query := database.DB.Table("live_room_messages lm").
-		Select(`lm.id, lm.text, lm.gif_url, lm.image_url, lm.sender_id, lm.created_at, lm.reply_to_id,
+		Select(`lm.id, lm.text, lm.gif_url, lm.image_url, lm.sound_url, lm.sound_id, lm.sender_id, lm.created_at, lm.reply_to_id,
 		u.name as sender_name,
 		p.profile_image as sender_avatar,
 		p.profile_image_type as sender_avatar_type,
@@ -336,6 +338,9 @@ func (h *LiveHub) GetLiveRoomMessages(c *gin.Context) {
 		}
 		if messages[i].GifURL != nil {
 			messages[i].GifURL = utils.PrependS3URL(messages[i].GifURL)
+		}
+		if messages[i].SoundURL != nil {
+			messages[i].SoundURL = utils.PrependS3URL(messages[i].SoundURL)
 		}
 
 		messages[i].Mentions = utils.ParseMentions(messages[i].Text)

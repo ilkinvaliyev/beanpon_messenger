@@ -55,6 +55,8 @@ type LiveRoomMessage struct {
 	Text       string    `json:"text" gorm:"type:text;not null"`
 	GifURL     *string   `json:"gif_url" gorm:"type:varchar(500)"`   // ← YENİ
 	ImageURL   *string   `json:"image_url" gorm:"type:varchar(500)"` // ← YENİ
+	SoundURL   *string   `json:"sound_url" gorm:"type:varchar(500)"` // ← Piound
+	SoundID    *uint     `json:"sound_id" gorm:"index"`              // ← Piound
 	CreatedAt  time.Time `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt  time.Time `json:"updated_at" gorm:"autoUpdateTime"`
 
