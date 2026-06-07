@@ -98,15 +98,17 @@ func main() {
 		log.Printf("✅ conversations wallpaper sütunları hazırdır")
 	}
 
-	// ✅ Qrup üzv limiti: 50 (yaradan daxil). Köhnə qruplarda 256 qalmışdı —
-	// boot-da endirilir. İdempotent (yalnız 50-dən böyük olanlar dəyişir).
+	// ✅ Qrup üzv limiti: 150 (yaradan daxil). Boot-da KÖHNƏ limitli
+	// (50 və ya 256) qruplar 150-yə qaldırılır. İdempotent (yalnız
+	// 150-dən fərqli olanlar dəyişir). DİQQƏT: bu boot-migration əvvəl
+	// "50-yə ENDİR" idi → admin 150 etsə belə restart-da 50-yə qaytarırdı.
 	if err := database.DB.Exec(`
-		UPDATE conversations SET max_members = 50
-		WHERE chat_type = 'group' AND max_members > 50
+		UPDATE conversations SET max_members = 150
+		WHERE chat_type = 'group' AND max_members <> 150
 	`).Error; err != nil {
-		log.Printf("⚠️ qrup max_members 50-yə endirilə bilmədi: %v", err)
+		log.Printf("⚠️ qrup max_members 150-yə qaldırıla bilmədi: %v", err)
 	} else {
-		log.Printf("✅ qrup max_members limiti 50")
+		log.Printf("✅ qrup max_members limiti 150")
 	}
 
 	// ✅ Messages cədvəlinə ulduzlu mesaj (star) sütunları — per-user.
