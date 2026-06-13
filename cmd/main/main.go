@@ -352,6 +352,9 @@ func main() {
 		// dəyişdikdən sonra bu endpoint-i çağırmalıdır ki, otaqda
 		// olan client-lər dərhal yenilənsin (reconnect gözləmədən).
 		internal.POST("/users/:user_id/live-spam", liveHub.SetLiveSpam)
+
+		// 1:1 sesli arama sinyali (Laravel → online callee/caller WS).
+		internal.POST("/calls/signal", wsHub.HandleCallSignal)
 	}
 
 	// Public routes
