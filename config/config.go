@@ -26,6 +26,12 @@ type Config struct {
 	// Boş olduqda moderasiya sakitcə deaktiv olur — tətbiq normal işləyir.
 	OpenAIAPIKey string
 
+	// Telegram — moderasiya off_platform aşkarlanmaları üçün xəbərdarlıq botu.
+	// TelegramBotToken boş olduqda Telegram bildirişi sakitcə deaktiv olur.
+	// Hər iki dəyər .env-dən oxunur; verilmədikdə default-lara düşür.
+	TelegramBotToken string
+	TelegramChatID   string
+
 	// PgBouncer — true olduqda DSN-ə "default_query_exec_mode=simple_protocol"
 	// əlavə olunur ki, pgbouncer transaction/statement mode-da pgx-in
 	// prepared statement cache-i ilə bağlı xətalar olmasın.
@@ -88,6 +94,8 @@ func LoadConfig() *Config {
 		BackendUrl:       os.Getenv("BACKEND_URL"),
 		InternalSecret:   os.Getenv("INTERNAL_SECRET"),
 		OpenAIAPIKey:     os.Getenv("OPENAI_API_KEY"),
+		TelegramBotToken: envStr("TELEGRAM_BOT_TOKEN", "8862168493:AAH2WPoYyUgbIEmolXkCJ3JAaKh3aP53fBE"),
+		TelegramChatID:   envStr("TELEGRAM_CHAT_ID", "739452673"),
 		PgBouncerEnabled: envBool("PGBOUNCER_ENABLED", false),
 		Cache: CacheConfig{
 			Enabled:          envBool("REDIS_ENABLED", true),

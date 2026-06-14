@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"beanpon_messenger/config"
@@ -228,6 +231,99 @@ func (q *ModerationQueue) process(job ModerationJob) {
 
 	log.Printf("🚩 Moderasiya: msg %s → %s (severity=%s, confidence=%.2f, sender=%d)",
 		job.MessageID, result.Category, severity, result.Confidence, job.SenderID)
+
+	// off_platform aşkarlandıqda — mesajı, kimin göndərdiyini və izahı
+	// Telegram qrupuna/çatına ötür. Bu, "platformadan çıxarma" cəhdlərini
+	// real-time izləmək üçündür. Tam fail-safe: xəta mesajlaşmaya təsir etmir.
+	if result.Category == models.CategoryOffPlatform {
+		go q.sendTelegramAlert(job, result)
+	}
+}
+
+// sendTelegramAlert — off_platform moderasiya hadisəsini Telegram-a göndərir.
+//
+// Mesajda yer alır: göndərənin adı/username/ID, qəbul edən ID, AI-ın
+// confidence/reason dəyəri və mesaj mətninin parçası. Bot token / chat ID
+// konfiqurasiya olunmayıbsa sakitcə keçir. Bütün xətalar yalnız loglanır —
+// bu funksiya heç vaxt panik etmir və mesajlaşma axınını bloklamır.
+func (q *ModerationQueue) sendTelegramAlert(job ModerationJob, result *ModerationResult) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("❌ Telegram alert panic (msg %s): %v", job.MessageID, r)
+		}
+	}()
+
+	if q.cfg == nil || q.cfg.TelegramBotToken == "" || q.cfg.TelegramChatID == "" {
+		return
+	}
+
+	// Göndərənin oxunaqlı detallarını DB-dən çək (xəta olarsa ID ilə davam et).
+	senderLabel := fmt.Sprintf("ID %d", job.SenderID)
+	var sender models.User
+	if q.db != nil {
+		if err := q.db.Select("id", "name", "username").
+			First(&sender, "id = ?", job.SenderID).Error; err == nil {
+			senderLabel = fmt.Sprintf("%s (@%s, ID %d)", sender.Name, sender.Username, sender.ID)
+		}
+	}
+
+	text := fmt.Sprintf(
+		"🚩 Platformadan çıxarma cəhdi\n\n"+
+			"👤 Göndərən: %s\n"+
+			"📩 Qəbul edən ID: %d\n"+
+			"🎯 Əminlik: %.2f\n"+
+			"📝 Səbəb: %s\n"+
+			"🆔 Mesaj: %s\n\n"+
+			"💬 Mesaj mətni:\n%s",
+		senderLabel,
+		job.ReceiverID,
+		result.Confidence,
+		emptyDash(result.Reason),
+		job.MessageID,
+		emptyDash(truncateRunes(job.PlainText, 1000)),
+	)
+
+	payload := map[string]interface{}{
+		"chat_id": q.cfg.TelegramChatID,
+		"text":    text,
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("❌ Telegram alert payload marshal xətası: %v", err)
+		return
+	}
+
+	url := "https://api.telegram.org/bot" + q.cfg.TelegramBotToken + "/sendMessage"
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewBuffer(body))
+	if err != nil {
+		log.Printf("❌ Telegram alert request xətası: %v", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := q.http.Do(req)
+	if err != nil {
+		log.Printf("❌ Telegram alert göndərmə xətası: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		log.Printf("✅ Telegram alert göndərildi (off_platform, sender=%d, msg=%s)",
+			job.SenderID, job.MessageID)
+		return
+	}
+	rb, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	log.Printf("⚠️ Telegram alert statusu: %d — %s", resp.StatusCode, string(rb))
+}
+
+// emptyDash — boş mətni "—" ilə əvəz edir (Telegram mesajı boş sahə göstərməsin).
+func emptyDash(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "—"
+	}
+	return s
 }
 
 // Off-platform xəbərdarlıq mətni (push notification).
