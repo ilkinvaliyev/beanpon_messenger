@@ -1,9 +1,13 @@
 package websocket
 
 import (
+	"encoding/json"
 	"net/http"
+	"time"
 
+	"beanpon_messenger/models"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 // 1:1 sesli arama sinyalleşməsi.
@@ -51,4 +55,78 @@ func (h *Hub) HandleCallSignal(c *gin.Context) {
 		delivered = 1
 	}
 	c.JSON(http.StatusOK, gin.H{"delivered": delivered})
+}
+
+// ── Çağrı conversation mesajı ─────────────────────────────────────────────
+//
+// Çağrı bitdikdə (Laravel `end`) conversation-da KALICI bir "call" mesajı
+// yaranır (WhatsApp/Instagram-vari "Sesli arama / Buraxılmış zəng"). Mesaj
+// mətni JSON-dur: {"type":"call","status":"...","duration":N,"call_id":"..."}
+// Flutter ChatMessage bunu parse edib xüsusi balon göstərir.
+//
+// Route: internal.POST("/calls/message", wsHub.HandleCallMessage)
+type callMessageRequest struct {
+	CallerID uint   `json:"caller_id" binding:"required"`
+	CalleeID uint   `json:"callee_id" binding:"required"`
+	Status   string `json:"status" binding:"required"` // ended | missed | rejected | canceled
+	Duration int    `json:"duration"`
+	CallID   string `json:"call_id"`
+}
+
+func (h *Hub) HandleCallMessage(c *gin.Context) {
+	var req callMessageRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+
+	// Mesaj mətni: JSON (Flutter type=call kimi parse edir).
+	payload := map[string]interface{}{
+		"type":     "call",
+		"status":   req.Status,
+		"duration": req.Duration,
+		"call_id":  req.CallID,
+	}
+	textBytes, _ := json.Marshal(payload)
+	text := string(textBytes)
+
+	encryptedText, err := h.encryptionService.EncryptMessage(text)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "encrypt failed"})
+		return
+	}
+
+	now := time.Now().UTC()
+	receiverID := req.CalleeID
+	message := models.Message{
+		ID:            uuid.New().String(),
+		SenderID:      req.CallerID,
+		ReceiverID:    &receiverID,
+		EncryptedText: encryptedText,
+		Read:          false,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}
+	if err := h.db.Create(&message).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "db failed"})
+		return
+	}
+
+	// Hər iki tərəfə WS ilə çatdır + conversation update.
+	// silent=true → çağrı mesajı üçün ayrıca push GETMƏSİN (çağrı bildirişi
+	// onsuz da getdi). msgType="call".
+	h.HandleNewMessage(
+		req.CallerID,
+		receiverID,
+		message.ID,
+		text,
+		"call",
+		now,
+		nil,
+		nil,
+		"active",
+		true,
+	)
+
+	c.JSON(http.StatusOK, gin.H{"message_id": message.ID})
 }

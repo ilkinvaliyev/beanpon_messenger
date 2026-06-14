@@ -355,6 +355,8 @@ func main() {
 
 		// 1:1 sesli arama sinyali (Laravel → online callee/caller WS).
 		internal.POST("/calls/signal", wsHub.HandleCallSignal)
+		// Çağrı bitdikdə conversation-a kalıcı "call" mesajı.
+		internal.POST("/calls/message", wsHub.HandleCallMessage)
 	}
 
 	// Public routes
