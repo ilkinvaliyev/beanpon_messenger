@@ -98,12 +98,16 @@ func (h *Hub) HandleCallMessage(c *gin.Context) {
 
 	now := time.Now().UTC()
 	receiverID := req.CalleeID
+	// Yalnız BURAXILMIŞ (missed) zəng oxunmamış qalır (unread badge). Bitən
+	// (ended) və rədd edilən (rejected) çağrılar oxunmuş sayılır — istifadəçi
+	// onsuz da çağrı ekranında idi.
+	isRead := req.Status != "missed"
 	message := models.Message{
 		ID:            uuid.New().String(),
 		SenderID:      req.CallerID,
 		ReceiverID:    &receiverID,
 		EncryptedText: encryptedText,
-		Read:          false,
+		Read:          isRead,
 		CreatedAt:     now,
 		UpdatedAt:     now,
 	}
