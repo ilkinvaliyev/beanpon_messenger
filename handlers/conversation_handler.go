@@ -259,6 +259,19 @@ func (h *ConversationHandler) GetOrCreateConversationWithPermission(senderID, re
 		return nil, false, "Verilənlər bazası xətası", err
 	}
 
+	// 🚫 ADMIN BLOK — söhbət admin (Filament) tərəfindən bloklanıbsa, BU
+	// söhbətdə heç kim (nə user1, nə user2) yeni mesaj göndərə bilməz.
+	// Köhnə mesajlar görünür qalır; yalnız yeni göndərmə dayanır.
+	//
+	// reason="" QAYTARILIR — bu, spam shadow-ban ilə eyni davranışı verir:
+	//   • REST: göndərənə saxta 201 "uğurlu" cavabı gedir, amma mesaj DB-yə
+	//     yazılmır və qarşı tərəfə çatmır (admin blokunu bilməsin).
+	//   • WebSocket/broadcast: mesaj sakitcə atlanır (continue).
+	// Beləliklə nə göndərən, nə qəbul edən admin blokunu hiss etmir.
+	if conversation.Blocked {
+		return &conversation, false, "", nil
+	}
+
 	// Conversation var - izin kontrolü yap
 	canSend, errorMsg := h.checkConversationPermission(&conversation, senderID)
 	return &conversation, canSend, errorMsg, nil

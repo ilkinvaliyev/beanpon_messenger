@@ -68,6 +68,13 @@ type Conversation struct {
 	User1ScreenshotDisabledAt *time.Time `json:"user1_screenshot_disabled_at"`
 	User2ScreenshotDisabledAt *time.Time `json:"user2_screenshot_disabled_at"`
 
+	// Blocked — admin (Filament) tərəfindən qoyulan blok. true olduqda BU
+	// söhbətdə HEÇ KİM yeni mesaj göndərə bilməz (nə user1, nə user2). Köhnə
+	// mesajlar görünür qalır. Laravel migration: add_blocked_to_conversations.
+	Blocked   bool       `json:"blocked" gorm:"default:false"`
+	BlockedAt *time.Time `json:"blocked_at"`
+	BlockedBy *uint      `json:"blocked_by"`
+
 	CreatedAt time.Time      `json:"created_at"`
 	UpdatedAt time.Time      `json:"updated_at"`
 	DeletedAt gorm.DeletedAt `json:"deleted_at" gorm:"index"`

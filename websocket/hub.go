@@ -1788,5 +1788,13 @@ func (h *Hub) getOrCreateConversationWithPermission(senderID, receiverID uint) (
 		return nil, false, "Bu kullanıcıya mesaj gönderemezsiniz", nil
 	}
 
+	// 🚫 ADMIN BLOK — söhbət admin (Filament) tərəfindən bloklanıbsa, BU
+	// söhbətdə heç kim yeni mesaj göndərə bilməz (nə user1, nə user2).
+	// spamSilentReason qaytarılır → WS handler mesajı SƏSSİZCƏ udar
+	// (göndərənə xəta getmir, qarşı tərəfə çatmır). Köhnə mesajlar qalır.
+	if conversation.Blocked {
+		return nil, false, spamSilentReason, nil
+	}
+
 	return &conversation, true, "", nil
 }
