@@ -27,6 +27,9 @@ func main() {
 	// GORM ile PostgreSQL'e bağlan
 	database.InitializePostgreSQL(cfg)
 
+	// Bandwidth tracking — async writer (request axınını bloklamır).
+	go middleware.StartBandwidthWriter(database.GetDB())
+
 	// 🚀 Redis cache layer — Laravel ilə paylaşılan spam_ban statusu üçün.
 	// REDIS_ENABLED=false olsa belə tətbiq işləyir (cache çağırışları no-op
 	// olur, DB-yə düşür). Boot dayanmır.
@@ -191,6 +194,10 @@ func main() {
 
 		c.Next()
 	})
+
+	// Bandwidth tracking — WS xaric bütün route-ları ölçür, response-u
+	// gözlətmir (qeydi async kanala atır).
+	router.Use(middleware.BandwidthMiddleware())
 
 	// 🔌 WEBSOCKET ENDPOINT'LERİ
 	router.GET("/ws", middleware.JWTMiddlewareForWebSocket(cfg.JWTSecret), wsHub.HandleWebSocket)
