@@ -173,11 +173,14 @@ func classifyBandwidthPath(path string) (category, norm string) {
 			ext = strings.ToLower(path[i+1:])
 		}
 		switch ext {
-		case "jpg", "jpeg", "png", "webp", "gif":
+		case "jpg", "jpeg", "png", "webp", "gif",
+			"heic", "heif", "jfif", "bmp", "tiff", "tif", "svg", "avif":
 			return "media_image", "/api/s3-storage/*"
-		case "mp4", "webm", "mov":
+		case "mp4", "webm", "mov",
+			"mkv", "avi", "m4v", "3gp", "flv", "ts", "mpeg", "mpg":
 			return "media_video", "/api/s3-storage/*"
-		case "mp3", "m4a", "aac", "wav":
+		case "mp3", "m4a", "aac", "wav",
+			"ogg", "opus", "amr", "flac", "weba", "caf":
 			return "media_audio", "/api/s3-storage/*"
 		default:
 			return "media_other", "/api/s3-storage/*"

@@ -649,6 +649,74 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 			}
 		}
 
+	// Ekran kaydı / screenshot raporu. Otaqdaki HER client öz cihazının
+	// ekran-yakalama durumunu (recording başladı/bitti, screenshot alındı)
+	// buraya gönderir. Server bunu YALNIZ host + admin client-lere iletir;
+	// raporu gönderen kullanıcı (ve diğer izleyiciler) BUNU GÖRMEZ — yani
+	// karşı tarafa rapor gittiğini bilmez (gizli moderasyon sinyali).
+	//
+	// data (client'tan): {"recording": bool, "kind": "recording"|"screenshot"}
+	// Çıkış (host/admin'e): yukarıdakilere ek olarak güvenli alanlar —
+	//   user_id   : raporu gönderenin id'si (event.SenderID)
+	//   user_name : sunucu tarafındaki gerçek username (spoof edilemez)
+	// Böylece admin "hangi kullanıcı kayıt alıyor" bilgisini güvenle görür.
+	case "screen_recording_status":
+		h.mu.RLock()
+		srSender, srExists := roomClients[event.SenderID]
+		h.mu.RUnlock()
+		if !srExists {
+			return
+		}
+
+		// Ghost / shadow-ban kullanıcılar moderasyon sinyali üretmez —
+		// otaqda görünmez olmaları gereken kullanıcıların admin'e sızması
+		// tutarsız olur. Sessizce yok say.
+		if srSender.IsGhost || srSender.LiveSpam {
+			return
+		}
+
+		var srData map[string]interface{}
+		if err := json.Unmarshal(event.Data, &srData); err != nil {
+			log.Printf("❌ screen_recording_status data parse hatası: %v", err)
+			return
+		}
+		recording, _ := srData["recording"].(bool)
+		kind, _ := srData["kind"].(string)
+		if kind != "recording" && kind != "screenshot" {
+			kind = "recording"
+		}
+
+		srPayload, _ := json.Marshal(map[string]interface{}{
+			"type":    "screen_recording_status",
+			"room_id": event.RoomID,
+			"data": map[string]interface{}{
+				"user_id":   event.SenderID,
+				"user_name": srSender.Name,
+				"recording": recording,
+				"kind":      kind,
+			},
+		})
+
+		for _, client := range roomClients {
+			// Sadece host + admin alır. Raporu gönderenin KENDİSİNE
+			// göndermeyiz: admin kendi ekranını kaydederse kendi ekranında
+			// "kendini ihbar" rozeti çıkmasın (client tarafı da ayrıca
+			// kendi user_id'sini filtreler — çift güvence).
+			if client.UserID == event.SenderID {
+				continue
+			}
+			if client.Role == "host" || client.IsAdmin {
+				select {
+				case client.Send <- srPayload:
+				default:
+					close(client.Send)
+					go func(c *LiveRoomClient) {
+						h.Unregister <- c
+					}(client)
+				}
+			}
+		}
+
 	case "ping":
 		h.mu.RLock()
 		client, exists := roomClients[event.SenderID]
