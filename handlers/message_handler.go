@@ -1114,6 +1114,13 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 		return
 	}
 
+	// 🔧 N+1 DÜZƏLİŞİ: əvvəllər döngü içində hər söhbət üçün ayrıca
+	// models.IsBlocked(...) çağırılırdı — 50 söhbət = 50 ayrı DB sorğusu.
+	// DB uzaq host-da olduğu üçün (hər sorğu ~100ms RTT) bu tək başına
+	// saniyələrlə gecikmə yaradırdı. İndi bütün block əlaqələrini BİR sorğuda
+	// çəkib map-ə qoyuruq; döngüdə yoxlama yaddaşda (O(1)) edilir.
+	blockedUserIDs := models.GetBlockedUserIDs(database.DB, userID.(uint))
+
 	var responseConversations []gin.H
 	for _, conv := range conversations {
 		decryptedText, err := h.encryptionService.DecryptMessage(conv.LastMessageText)
@@ -1154,8 +1161,9 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 		isPinnedByMe := conv.PinnedAt != nil
 
 		// Əgər tərəflərdən biri digərini bloklayıbsa, online statusu göstərilməməlidir.
+		// N+1 DÜZƏLİŞİ: DB sorğusu yox — yuxarıda bir dəfə çəkilmiş map-dən yoxlanır.
 		isOnline := false
-		if !models.IsBlocked(database.DB, userID.(uint), conv.OtherUserID) {
+		if !blockedUserIDs[conv.OtherUserID] {
 			isOnline = h.wsHub.IsUserOnline(conv.OtherUserID)
 		}
 

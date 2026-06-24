@@ -4,6 +4,7 @@ import (
 	"beanpon_messenger/config"
 	"fmt"
 	"log"
+	"time"
 
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -36,6 +37,19 @@ func InitializePostgreSQL(cfg *config.Config) {
 	db, err := gorm.Open(postgres.Open(dsn), gormCfg)
 	if err != nil {
 		log.Fatalf("PostgreSQL bağlantı hatası: %v", err)
+	}
+
+	// 🔧 Bağlantı havuzu (connection pool) ayarları.
+	// DB uzaq makinədədir (DB_HOST fərqli host) — hər sorğu üçün yeni TCP
+	// bağlantısı açmaq bahalıdır (~100ms RTT ölçüldü). Pool sayəsində açıq
+	// bağlantılar təkrar istifadə olunur, latency dəfələrlə azalır.
+	if sqlDB, sErr := db.DB(); sErr == nil {
+		sqlDB.SetMaxOpenConns(25)                  // eyni anda maksimum açıq bağlantı
+		sqlDB.SetMaxIdleConns(25)                  // boşda saxlanan bağlantı (yenidən açma yox)
+		sqlDB.SetConnMaxIdleTime(5 * time.Minute)  // boş bağlantı nə qədər yaşasın
+		sqlDB.SetConnMaxLifetime(30 * time.Minute) // bağlantı ömrü (DB tərəf timeout-larından qısa)
+	} else {
+		log.Printf("⚠️ connection pool ayarlanamadı: %v", sErr)
 	}
 
 	DB = db

@@ -29,6 +29,34 @@ func IsBlocked(db *gorm.DB, userID1, userID2 uint) bool {
 	return count > 0
 }
 
+// GetBlockedUserIDs — userID ilə hər hansı istiqamətdə (bloklayan VƏ ya
+// bloklanan) block əlaqəsi olan bütün qarşı tərəf ID-lərini TEK sorğuda qaytarır.
+//
+// Niyə: söhbət siyahısı kimi yerlərdə hər element üçün ayrıca IsBlocked çağırmaq
+// N+1 problemi yaradır (50 söhbət = 50 sorğu). Bunun əvəzinə bu funksiya bir
+// dəfə çağırılır, nəticə map-ə qoyulur və yoxlama yaddaşda (O(1)) edilir.
+//
+// İstifadə:
+//
+//	blocked := models.GetBlockedUserIDs(db, myID)
+//	if blocked[otherUserID] { /* bloklu */ }
+func GetBlockedUserIDs(db *gorm.DB, userID uint) map[uint]bool {
+	var ids []uint
+	// İki istiqaməti UNION ilə birləşdiririk: userID-nin blokladıqları +
+	// userID-ni bloklayanlar. Nəticə: qarşı tərəfin ID-ləri.
+	db.Raw(`
+		SELECT blocked_id AS other_id FROM user_blocks WHERE blocker_id = ?
+		UNION
+		SELECT blocker_id AS other_id FROM user_blocks WHERE blocked_id = ?
+	`, userID, userID).Scan(&ids)
+
+	result := make(map[uint]bool, len(ids))
+	for _, id := range ids {
+		result[id] = true
+	}
+	return result
+}
+
 // BlockUser kullanıcıyı block et
 func BlockUser(db *gorm.DB, blockerID, blockedID uint) error {
 	block := &UserBlock{
