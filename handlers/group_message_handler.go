@@ -357,21 +357,46 @@ func (h *GroupMessageHandler) SendGroupMessage(c *gin.Context) {
 		Select("COALESCE(group_name, '')").
 		Scan(&groupName)
 
-	// AKTİV üzvlər (mute fərq etmir — mention bypass üçün tam siyahı).
+	// AKTİV üzvlər. İki məqsəd üçün:
+	//   - mute SİYAHISI (mute-a hörmət edən axınlar üçün) ayrıca çəkilir;
+	//   - bu siyahı yalnız @all hədəflərini müəyyən etməyə xidmət edir.
 	var allActive []uint
 	database.DB.Model(&models.ConversationParticipant{}).
 		Where("conversation_id = ? AND user_id != ? AND left_at IS NULL AND deleted_at IS NULL", conversationID, senderID).
 		Where("COALESCE(invite_status, 'active') = 'active'").
 		Pluck("user_id", &allActive)
 
+	// 🔇 SESSİZƏ ALANLAR (hazırda aktiv mute). @all bunlara push GÖNDƏRMƏZ —
+	// @all adi mesaj kimi mute-a HÖRMƏT edir. Yalnız BİRBAŞA @username
+	// mention mute-u keçir (Telegram davranışı).
+	mutedSet := map[uint]bool{}
+	{
+		var mutedIDs []uint
+		database.DB.Model(&models.ConversationParticipant{}).
+			Where("conversation_id = ? AND user_id != ? AND left_at IS NULL AND deleted_at IS NULL", conversationID, senderID).
+			Where("COALESCE(invite_status, 'active') = 'active'").
+			Where("is_muted = true AND (muted_until IS NULL OR muted_until > ?)", now).
+			Pluck("user_id", &mutedIDs)
+		for _, uid := range mutedIDs {
+			mutedSet[uid] = true
+		}
+	}
+
+	// MUTE-BYPASS hədəfləri (dərhal, xüsusi "sizdən bəhs etdi" push):
+	//   - birbaşa @username mention → HƏMİŞƏ (mute olsa belə);
+	//   - @all → YALNIZ sessizə almayanlar (mute-a hörmət).
 	mentionTargets := make([]uint, 0)
 	for _, uid := range allActive {
-		if mentionAll || mentionedIDs[uid] {
+		if mentionedIDs[uid] { // birbaşa mention → mute bypass
+			mentionTargets = append(mentionTargets, uid)
+			continue
+		}
+		if mentionAll && !mutedSet[uid] { // @all → mute olmayanlar
 			mentionTargets = append(mentionTargets, uid)
 		}
 	}
 
-	// 1) MENTION push — dərhal (gecikməsiz), MUTE BYPASS, xüsusi mətn.
+	// 1) MENTION push — dərhal (gecikməsiz), xüsusi mətn.
 	//    Yalnız hazırda qrup səhifəsində OLMAYANLARA (onsuz da görür).
 	if len(mentionTargets) > 0 {
 		immediate := make([]uint, 0, len(mentionTargets))
