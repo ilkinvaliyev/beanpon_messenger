@@ -188,13 +188,33 @@ func (h *LiveHub) Run() {
 				})
 			}
 
+			// Host devri olduqda client.Role bayatlaya bilər (köçürmə anında
+			// otaqda olmayan / pointer-i yenilənməyən köhnə host, yaxud yeni
+			// host-un müvəqqəti disconnect-i). Otağı bitirməzdən əvvəl əsl
+			// host-u DB-dəki live_rooms.host_user_id ilə təsdiqləyirik —
+			// transfer_host bu sütunu yeni host-a yazır. Çıxan istifadəçi
+			// artıq host deyilsə, otaq canlı qalır, yalnız o iştirakçı çıxır.
+			isRoomHost := false
+			if client.Role == "host" {
+				var hostUserID uint
+				if err := database.DB.Raw(
+					"SELECT host_user_id FROM live_rooms WHERE id = ?", client.RoomID,
+				).Scan(&hostUserID).Error; err != nil {
+					// DB oxunmadısa, köhnə davranışa düşürük (host saymaq).
+					log.Printf("❌ DB Read Error (host_user_id): %v", err)
+					isRoomHost = true
+				} else {
+					isRoomHost = hostUserID == client.UserID
+				}
+			}
+
 			// MAFIA: oyunçu canlıdan çıxsa/çıxarılsa → oyunda ölü sayılır,
 			// kartı hamıya açılır. (Host çıxanda oyun onsuz da bitir — aşağıda.)
-			if client.Role != "host" {
+			if !isRoomHost {
 				go h.mafiaHandlePlayerLeft(client.RoomID, client.UserID)
 			}
 
-			if client.Role == "host" {
+			if isRoomHost {
 				err := database.DB.Exec("UPDATE live_rooms SET status = 'ended', ended_at = NOW() WHERE id = ?", client.RoomID).Error
 				if err != nil {
 					log.Printf("❌ DB Update Error (Room Ended): %v", err)
