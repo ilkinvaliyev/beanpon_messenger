@@ -25,7 +25,8 @@ import (
 // Client — go-redis wrapper. SharedPrefix (Laravel ilə ortaq) və LocalPrefix
 // (yalnız messenger daxili) iki prefiksi dəstəkləyir.
 type Client struct {
-	rdb     *redis.Client
+	rdb     *redis.Client // master — yazma əməliyyatları
+	readRdb *redis.Client // oxuma — lokal replica (təyin olunmayıbsa rdb-yə bərabər)
 	enabled bool
 
 	sharedPrefix string
@@ -65,8 +66,29 @@ func Initialize(cfg config.CacheConfig) *Client {
 		MaxRetries:   cfg.MaxRetries,
 	})
 
+	// readRdb — oxuma üçün lokal replica. ReadHost boşdursa master-in özünə
+	// düşür (köhnə davranış). Beləcə replica yoxdursa heç nə dəyişmir.
+	readRdb := rdb
+	if cfg.ReadHost != "" {
+		readPort := cfg.ReadPort
+		if readPort == "" {
+			readPort = cfg.Port
+		}
+		readRdb = redis.NewClient(&redis.Options{
+			Addr:         fmt.Sprintf("%s:%s", cfg.ReadHost, readPort),
+			Password:     cfg.Password,
+			DB:           0,
+			PoolSize:     cfg.PoolSize,
+			DialTimeout:  cfg.DialTimeout,
+			ReadTimeout:  cfg.ReadTimeout,
+			WriteTimeout: cfg.WriteTimeout,
+			MaxRetries:   cfg.MaxRetries,
+		})
+	}
+
 	c := &Client{
 		rdb:          rdb,
+		readRdb:      readRdb,
 		enabled:      true,
 		sharedPrefix: cfg.SharedPrefix,
 		localPrefix:  cfg.LocalPrefix,
@@ -82,8 +104,12 @@ func Initialize(cfg config.CacheConfig) *Client {
 	if err := rdb.Ping(pingCtx).Err(); err != nil {
 		log.Printf("cache: boot ping uğursuz: %v — app yenə də ayağa qalxır, DB fallback aktivdir", err)
 	} else {
-		log.Printf("cache: Redis bağlantısı quruldu — %s:%s (shared=%q local=%q)",
-			cfg.Host, cfg.Port, cfg.SharedPrefix, cfg.LocalPrefix)
+		readAddr := fmt.Sprintf("%s:%s", cfg.Host, cfg.Port)
+		if cfg.ReadHost != "" {
+			readAddr = fmt.Sprintf("%s:%s", cfg.ReadHost, cfg.ReadPort)
+		}
+		log.Printf("cache: Redis bağlantısı quruldu — write=%s:%s read=%s (shared=%q local=%q)",
+			cfg.Host, cfg.Port, readAddr, cfg.SharedPrefix, cfg.LocalPrefix)
 	}
 
 	globalClient = c
@@ -108,6 +134,10 @@ func (c *Client) Enabled() bool {
 func (c *Client) Close() error {
 	if c == nil || c.rdb == nil {
 		return nil
+	}
+	// readRdb ayrı bir client-dirsə onu da bağla (rdb-yə bərabər deyilsə).
+	if c.readRdb != nil && c.readRdb != c.rdb {
+		_ = c.readRdb.Close()
 	}
 	return c.rdb.Close()
 }
@@ -172,7 +202,7 @@ func (c *Client) Get(ctx context.Context, fullKey string) (string, bool, error) 
 	if !c.guard() {
 		return "", false, nil
 	}
-	val, err := c.rdb.Get(ctx, fullKey).Result()
+	val, err := c.readRdb.Get(ctx, fullKey).Result()
 	if errors.Is(err, redis.Nil) {
 		c.observe("GET", nil)
 		return "", false, nil

@@ -54,6 +54,12 @@ type CacheConfig struct {
 	Port     string
 	Password string
 
+	// ReadHost/ReadPort — oxuma sorğuları üçün ayrı Redis (lokal replica).
+	// Boş qoyularsa Host/Port-a düşür, yəni köhnə davranış (master-dən oxu).
+	// Yazma həmişə Host/Port (master) üzərindən gedir.
+	ReadHost string
+	ReadPort string
+
 	// SharedPrefix — Laravel ilə paylaşılan key-lər (spam_ban, user və s.).
 	// Default: "bp:shared:".
 	SharedPrefix string
@@ -101,6 +107,8 @@ func LoadConfig() *Config {
 			Enabled:          envBool("REDIS_ENABLED", true),
 			Host:             envStr("REDIS_HOST", "127.0.0.1"),
 			Port:             envStr("REDIS_PORT", "6379"),
+			ReadHost:         envStr("REDIS_READ_HOST", ""),
+			ReadPort:         envStr("REDIS_READ_PORT", ""),
 			Password:         envStr("REDIS_PASSWORD", ""),
 			SharedPrefix:     envStr("REDIS_SHARED_PREFIX", "bp:shared:"),
 			LocalPrefix:      envStr("REDIS_LOCAL_PREFIX", "bp:msg:"),
