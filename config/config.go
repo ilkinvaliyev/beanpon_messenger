@@ -109,7 +109,7 @@ func LoadConfig() *Config {
 			Port:             envStr("REDIS_PORT", "6379"),
 			ReadHost:         envStr("REDIS_READ_HOST", ""),
 			ReadPort:         envStr("REDIS_READ_PORT", ""),
-			Password:         envStr("REDIS_PASSWORD", ""),
+			Password:         envRedisPassword("REDIS_PASSWORD"),
 			SharedPrefix:     envStr("REDIS_SHARED_PREFIX", "bp:shared:"),
 			LocalPrefix:      envStr("REDIS_LOCAL_PREFIX", "bp:msg:"),
 			PoolSize:         envInt("REDIS_POOL_SIZE", 20),
@@ -160,6 +160,17 @@ func envStr(key, defaultVal string) string {
 		return v
 	}
 	return defaultVal
+}
+
+// envRedisPassword — Laravel-style "null" sentinel-ini boş string-ə çevirir.
+// .env-də REDIS_PASSWORD=null olduqda Redis-ə "null" string-i göndərilməsin
+// (piokio_golang_main ilə eyni davranış).
+func envRedisPassword(key string) string {
+	v := os.Getenv(key)
+	if v == "" || v == "null" {
+		return ""
+	}
+	return v
 }
 
 func envInt(key string, defaultVal int) int {
