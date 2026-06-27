@@ -1104,24 +1104,41 @@ func (h *ConversationHandler) GetPendingRequests(c *gin.Context) {
 		return
 	}
 
-	// Son mesajları al
-	for i := range requests {
-		var lastMessage struct {
-			EncryptedText string `json:"encrypted_text"`
+	// Son mesajları al.
+	// N+1 DÜZƏLİŞİ: əvvəllər döngü içində hər requester üçün ayrıca son-mesaj
+	// sorğusu gedirdi (N istək = N sorğu). İndi bütün requester-lərin son
+	// mesajını BİR sorğuda (DISTINCT ON) çəkirik. Davranış birebir eyni:
+	// hər (requester_id -> userID) cütü üçün is_deleted_by_receiver=false olan
+	// ən son mesaj. Response sahələri dəyişmir.
+	if len(requests) > 0 {
+		requesterIDs := make([]uint, len(requests))
+		for i := range requests {
+			requesterIDs[i] = requests[i].RequesterID
 		}
 
+		type lastMsgRow struct {
+			SenderID      uint   `gorm:"column:sender_id"`
+			EncryptedText string `gorm:"column:encrypted_text"`
+		}
+		var lastRows []lastMsgRow
 		database.DB.Raw(`
-            SELECT encrypted_text 
-            FROM messages 
-            WHERE sender_id = ? AND receiver_id = ?
+            SELECT DISTINCT ON (sender_id) sender_id, encrypted_text
+            FROM messages
+            WHERE sender_id IN ? AND receiver_id = ?
             AND is_deleted_by_receiver = false
-            ORDER BY created_at DESC 
-            LIMIT 1
-        `, requests[i].RequesterID, userID).Scan(&lastMessage)
+            ORDER BY sender_id, created_at DESC
+        `, requesterIDs, userID).Scan(&lastRows)
 
-		if lastMessage.EncryptedText != "" {
-			if decrypted, err := h.encryptionService.DecryptMessage(lastMessage.EncryptedText); err == nil {
-				requests[i].LastMessageText = decrypted
+		lastBySender := make(map[uint]string, len(lastRows))
+		for _, r := range lastRows {
+			lastBySender[r.SenderID] = r.EncryptedText
+		}
+
+		for i := range requests {
+			if enc, ok := lastBySender[requests[i].RequesterID]; ok && enc != "" {
+				if decrypted, err := h.encryptionService.DecryptMessage(enc); err == nil {
+					requests[i].LastMessageText = decrypted
+				}
 			}
 		}
 	}

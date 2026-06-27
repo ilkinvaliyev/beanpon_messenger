@@ -691,13 +691,21 @@ func (h *MessageHandler) GetMessagesOld(c *gin.Context) {
 
 // markReceivedMessagesAsRead alınan mesajları okundu olarak işaretle
 func (h *MessageHandler) markReceivedMessagesAsRead(currentUserID, otherUserID uint) {
-	var unreadMessages []models.Message
+	// WebSocket bildirişi üçün yalnız id + sender_id lazımdır — əvvəllər bütün
+	// mesaj sətirləri tam çəkilirdi (encrypted_text daxil, lazımsız böyük).
+	// İndi yalnız iki sütun seçirik. Davranış eyni: oxunmamışlar tapılır,
+	// read=true edilir, hər biri üçün HandleMessageRead çağırılır.
+	type unreadRow struct {
+		ID       string `gorm:"column:id"`
+		SenderID uint   `gorm:"column:sender_id"`
+	}
+	var unreadMessages []unreadRow
 
-	// Karşı taraftan gelen okunmamış mesajları bul
-	err := database.DB.Where(
-		"sender_id = ? AND receiver_id = ? AND read = false",
-		otherUserID, currentUserID,
-	).Find(&unreadMessages).Error
+	// Karşı taraftan gelen okunmamış mesajları bul (yalnız lazımi sütunlar)
+	err := database.DB.Model(&models.Message{}).
+		Select("id, sender_id").
+		Where("sender_id = ? AND receiver_id = ? AND read = false", otherUserID, currentUserID).
+		Scan(&unreadMessages).Error
 
 	if err != nil {
 		return
