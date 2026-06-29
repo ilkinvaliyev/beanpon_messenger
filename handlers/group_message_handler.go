@@ -375,7 +375,7 @@ func (h *GroupMessageHandler) SendGroupMessage(c *gin.Context) {
 		database.DB.Model(&models.ConversationParticipant{}).
 			Where("conversation_id = ? AND user_id != ? AND left_at IS NULL AND deleted_at IS NULL", conversationID, senderID).
 			Where("COALESCE(invite_status, 'active') = 'active'").
-			Where("is_muted = true AND (muted_until IS NULL OR muted_until > ?)", now).
+			Where("is_muted = true").
 			Pluck("user_id", &mutedIDs)
 		for _, uid := range mutedIDs {
 			mutedSet[uid] = true
@@ -416,7 +416,7 @@ func (h *GroupMessageHandler) SendGroupMessage(c *gin.Context) {
 	database.DB.Model(&models.ConversationParticipant{}).
 		Where("conversation_id = ? AND user_id != ? AND left_at IS NULL AND deleted_at IS NULL", conversationID, senderID).
 		Where("COALESCE(invite_status, 'active') = 'active'").
-		Where("is_muted = false OR (muted_until IS NOT NULL AND muted_until < ?)", now).
+		Where("is_muted = false").
 		Pluck("user_id", &pushTargets)
 
 	// Mention alanları normal push-dan çıxar (ikiqat bildiriş olmasın).
