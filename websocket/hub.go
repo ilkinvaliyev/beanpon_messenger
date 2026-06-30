@@ -349,16 +349,33 @@ func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, ms
 
 	// Hem gönderen hem de alıcıya gönder.
 	//
-	// EGRESS SEAM (XMPP): the sender always gets the legacy echo on their own
-	// WS session. The receiver is routed by capability: if they are on a NEW
-	// (XMPP) client the message goes out as an XMPP stanza; otherwise it falls
-	// back to the legacy WS path. When the XMPP subsystem is disabled this is
-	// byte-for-byte the old behaviour. See xmpp/WIRING.md.
-	h.SendToUser(senderID, "new_message", messageData) // sender echo (always legacy)
+	// EGRESS SEAM (XMPP) — DUAL DELIVERY for zero message loss.
+	//
+	// The message is ALWAYS delivered over the legacy WS channel (to both the
+	// sender's echo and the receiver). ADDITIONALLY, if the receiver is on a
+	// NEW (XMPP) client, the same message is published as an XMPP stanza.
+	//
+	// Why dual-deliver instead of "XMPP OR WS"? A NEW client connects to BOTH
+	// transports (the iOS facade keeps the legacy WS open while adding XMPP),
+	// and it DEDUPLICATES inbound messages by id. So:
+	//   - receiver on legacy WS only  → gets it via WS.
+	//   - receiver on XMPP + WS        → gets both, dedup shows one.
+	//   - receiver transiently offline on XMPP (presence TTL) → still gets it
+	//     via WS; nothing is lost. (With auth_method: jwt, ejabberd has no
+	//     mod_offline, so an XMPP-only delivery to an offline JID would be
+	//     dropped — dual delivery removes that risk.)
+	// The message is persisted in the DB regardless, so history/push cover the
+	// fully-offline case exactly as today.
+	//
+	// When the XMPP subsystem is disabled this is byte-for-byte the old
+	// behaviour (the XMPP block is skipped). See xmpp/WIRING.md.
+	userIDs := []uint{senderID, receiverID}
+	h.SendToMultipleUsers(userIDs, "new_message", messageData) // legacy WS (always)
 
-	deliveredViaXMPP := false
-	if h.xmpp != nil && h.xmpp.Enabled() {
-		deliveredViaXMPP = h.xmpp.RouteDM(xmpp.DM1to1{
+	if h.xmpp != nil && h.xmpp.Enabled() && h.xmpp.Registry().IsXMPP(receiverID) {
+		// Best-effort XMPP copy for the NEW client. iOS dedups by id, so this
+		// never double-shows alongside the WS copy.
+		h.xmpp.RouteDM(xmpp.DM1to1{
 			MessageID:        messageID,
 			SenderID:         senderID,
 			ReceiverID:       receiverID,
@@ -366,9 +383,6 @@ func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, ms
 			Kind:             msgType,
 			ReplyToMessageID: derefStr(replyToMessageID),
 		})
-	}
-	if !deliveredViaXMPP {
-		h.SendToUser(receiverID, "new_message", messageData) // OLD client → legacy
 	}
 
 	h.sendConversationUpdate(senderID, receiverID, messageData)
