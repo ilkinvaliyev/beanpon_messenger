@@ -57,14 +57,21 @@ listen:
         password: "f69c6581787ed9577e0e572aadda4a605853f66ad75f944737a7c6bb875cf818"
 
 # --- Authentication ---------------------------------------------------------
-# Delegate auth to the Go service so the JWT remains the single source of
-# truth. ejabberd POSTs {user, server, password=JWT} and Go answers isuser /
-# check_password by verifying the JWT and that user_id == user.
-auth_method: [http]
-auth_opts:
-  host: "http://127.0.0.1:5082"      # Go messenger service (internal)
-  path: "/internal/xmpp/auth"
-  connection_pool_size: 10
+# PHASE 1: use ejabberd's built-in SQL auth so the server can boot and we can
+# verify DB connectivity + the component bridge. Client JWT auth is NOT needed
+# yet — the Go bridge connects as a trusted COMPONENT (shared secret on port
+# 5347), not as a JWT-authenticated client.
+#
+# PHASE 2 (later): delegate auth to the Go service so the JWT stays the single
+# source of truth. The stock ejabberd image does NOT ship the HTTP auth backend
+# as `auth_method: http`; it requires the external `ejabberd_auth_http` module
+# (or a small custom module). Wire that in when enabling native XMPP clients.
+auth_method: [sql]
+# auth_method: [http]
+# auth_opts:
+#   host: "http://127.0.0.1:5082"
+#   path: "/internal/xmpp/auth"
+#   connection_pool_size: 10
 
 # --- Access rules / shapers (minimal) --------------------------------------
 acl:
