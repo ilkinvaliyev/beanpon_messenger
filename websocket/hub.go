@@ -4,6 +4,7 @@ import (
 	"beanpon_messenger/config"
 	"beanpon_messenger/models"
 	"beanpon_messenger/utils"
+	"beanpon_messenger/xmpp"
 	"bytes"
 	"encoding/json"
 	"github.com/google/uuid"
@@ -74,6 +75,13 @@ type Hub struct {
 	// Lokal funksiya tipi kimi saxlanır ki, services paketinə birbaşa
 	// asılılıq (və potensial import cycle) olmasın.
 	moderationEnqueue func(messageID string, senderID, receiverID uint, plainText string, createdAt time.Time)
+
+	// xmpp — XMPP bridge (counterpart: none; server-only transport migration).
+	// nil when the XMPP subsystem is disabled (XMPP_ENABLED=false). When set,
+	// the Hub consults it on the egress path to route 1:1 / group messages to
+	// NEW (XMPP) recipients while OLD recipients keep the legacy WS path. See
+	// xmpp/WIRING.md.
+	xmpp *xmpp.Bridge
 }
 
 // SetModerationEnqueue — WS axını üçün moderasiya enqueue callback-ini bağlayır.
@@ -167,6 +175,11 @@ func (h *Hub) registerClient(client *Client) {
 
 	//online oldugunu yazir
 	h.setUserOnline(client.UserID)
+
+	// XMPP: this user is on a legacy WS client → mark them OLD in the registry
+	// so the egress seam routes their incoming messages over legacy WS. No-op
+	// when XMPP is disabled.
+	h.markLegacyPresence(client.UserID)
 
 	// Kullanıcı online durumunu diğer kullanıcılara bildir
 	h.broadcastUserStatus(client.UserID, "online")
@@ -334,9 +347,29 @@ func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, ms
 		}
 	}
 
-	// Hem gönderen hem de alıcıya gönder
-	userIDs := []uint{senderID, receiverID}
-	h.SendToMultipleUsers(userIDs, "new_message", messageData)
+	// Hem gönderen hem de alıcıya gönder.
+	//
+	// EGRESS SEAM (XMPP): the sender always gets the legacy echo on their own
+	// WS session. The receiver is routed by capability: if they are on a NEW
+	// (XMPP) client the message goes out as an XMPP stanza; otherwise it falls
+	// back to the legacy WS path. When the XMPP subsystem is disabled this is
+	// byte-for-byte the old behaviour. See xmpp/WIRING.md.
+	h.SendToUser(senderID, "new_message", messageData) // sender echo (always legacy)
+
+	deliveredViaXMPP := false
+	if h.xmpp != nil && h.xmpp.Enabled() {
+		deliveredViaXMPP = h.xmpp.RouteDM(xmpp.DM1to1{
+			MessageID:        messageID,
+			SenderID:         senderID,
+			ReceiverID:       receiverID,
+			Text:             content,
+			Kind:             msgType,
+			ReplyToMessageID: derefStr(replyToMessageID),
+		})
+	}
+	if !deliveredViaXMPP {
+		h.SendToUser(receiverID, "new_message", messageData) // OLD client → legacy
+	}
 
 	h.sendConversationUpdate(senderID, receiverID, messageData)
 

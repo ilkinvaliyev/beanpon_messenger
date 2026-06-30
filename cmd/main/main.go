@@ -8,6 +8,7 @@ import (
 	"beanpon_messenger/middleware"
 	"beanpon_messenger/services"
 	"beanpon_messenger/websocket"
+	"beanpon_messenger/xmpp"
 	"github.com/Depado/ginprom"
 	"github.com/gin-gonic/gin"
 	"log"
@@ -132,6 +133,22 @@ func main() {
 	wsHub := websocket.NewHub(database.DB, encryptionService, cfg)
 	database.DB.Exec("UPDATE user_presences SET is_online = false, last_seen_at = NOW() WHERE is_online = true")
 	go wsHub.Run()
+
+	// 1b. XMPP BRIDGE (transport migration for chat_page / group_chat_page).
+	// No-op unless XMPP_ENABLED=true. The Hub implements both xmpp.LegacyDelivery
+	// and xmpp.IngressSink (see websocket/hub_xmpp.go). When enabled, the Hub's
+	// egress seam routes messages to NEW (XMPP) recipients while OLD recipients
+	// keep the legacy WS path. See xmpp/WIRING.md and xmpp/CLAUDE.md.
+	xmppCfg := xmpp.LoadConfig()
+	xmppReg := xmpp.NewRegistry(2 * time.Minute)
+	xmppBridge := xmpp.NewBridge(xmppCfg, xmppReg, wsHub, wsHub)
+	wsHub.AttachXMPP(xmppBridge)
+	xmppBridge.Start() // no-op when disabled
+	if xmppCfg.Enabled {
+		log.Printf("✅ XMPP bridge enabled (component=%s domain=%s)", xmppCfg.ComponentName, xmppCfg.Domain)
+	} else {
+		log.Printf("ℹ️  XMPP bridge disabled (XMPP_ENABLED=false) — legacy WebSocket only")
+	}
 
 	// 🔍 MODERASIYA SİSTEMİ
 	// Mesajlar şifrələnmədən əvvəl arxa planda AI (OpenAI gpt-4o-mini) ilə
@@ -363,6 +380,10 @@ func main() {
 		internal.POST("/calls/signal", wsHub.HandleCallSignal)
 		// Çağrı bitdikdə conversation-a kalıcı "call" mesajı.
 		internal.POST("/calls/message", wsHub.HandleCallMessage)
+
+		// XMPP client auth callback (ejabberd → Go, validates the JWT). Used in
+		// PHASE 2 when native XMPP clients connect; harmless when XMPP disabled.
+		internal.POST("/xmpp/auth", xmppBridge.AuthHandler(cfg.JWTSecret))
 	}
 
 	// Public routes
