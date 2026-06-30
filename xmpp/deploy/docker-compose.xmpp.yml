@@ -1,0 +1,59 @@
+# ============================================================================
+# docker-compose.xmpp.yml — adds the ejabberd XMPP backbone next to the
+# existing beanpon_messenger Go service.
+#
+# Usage (alongside the existing root docker-compose.yml):
+#   docker compose -f docker-compose.yml -f xmpp/deploy/docker-compose.xmpp.yml up -d
+#
+# The Go service stays exactly as it is; it simply gains a few env vars
+# (see xmpp/deploy/.env.xmpp.example) and dials the component port 5347.
+# ============================================================================
+
+services:
+  ejabberd:
+    image: ejabberd/ecs:24.12
+    container_name: beanpon_ejabberd
+    restart: always
+    # Resource ceilings — ejabberd is light. Tune as connection count grows.
+    # Typical idle footprint: ~300-700 MB RAM. Tens of thousands of
+    # connections fit on a single node before horizontal scaling is needed.
+    deploy:
+      resources:
+        limits:
+          memory: 1500M
+        reservations:
+          memory: 512M
+    ports:
+      - "5222:5222"   # native XMPP client (TLS)
+      - "5443:5443"   # XMPP-over-WebSocket / BOSH (wss)
+      # 5347 (component) is bound to 127.0.0.1 only — NOT published publicly.
+      - "127.0.0.1:5347:5347"
+    volumes:
+      - ./ejabberd.yml:/home/ejabberd/conf/ejabberd.yml:ro
+      - ejabberd_data:/home/ejabberd/database
+    networks:
+      - beanpon_local-network
+    depends_on:
+      - ejabberd_db_wait
+
+  # Optional one-shot helper to ensure the ejabberd DB/schema exists.
+  # Replace with your real migration step in production.
+  ejabberd_db_wait:
+    image: postgres:16-alpine
+    container_name: beanpon_ejabberd_db_wait
+    entrypoint:
+      - sh
+      - -c
+      - |
+        echo "Ensure a 'ejabberd' database + user exist in your Postgres,
+        then load ejabberd's pg.sql schema once. This stub just exits 0."
+        exit 0
+    networks:
+      - beanpon_local-network
+
+volumes:
+  ejabberd_data:
+
+networks:
+  beanpon_local-network:
+    external: true

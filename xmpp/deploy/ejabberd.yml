@@ -1,0 +1,151 @@
+# ============================================================================
+# ejabberd.yml — Beanpon Messenger XMPP server configuration
+#
+# Scope: ONLY chat_page (1:1 DM) and group_chat_page (groups) messaging.
+# Live / Rave / Mafia hubs are NOT touched by XMPP — they keep their own
+# WebSocket hubs (/ws/live, /ws/rave).
+#
+# Role of this server: pure transport backbone.
+#   - It moves <message> stanzas between online users (1:1) and MUC rooms
+#     (groups), keeps presence, and archives messages (MAM).
+#   - It runs NO business logic. All permission / spam / moderation / per-user
+#     settings stay in the Go service. The Go service joins this server as an
+#     EXTERNAL COMPONENT (XEP-0114) named bridge.beanpon.com and is the single
+#     authority for whether a message may be delivered.
+#
+# Identity: JID == "<user_id>@beanpon.com". There is NO separate XMPP password;
+# clients authenticate with the SAME JWT they already use for /ws. ejabberd
+# validates the JWT by calling back into the Go service over HTTP
+# (ejabberd_auth http backend -> POST /internal/xmpp/auth).
+# ============================================================================
+
+hosts:
+  - "beanpon.com"
+
+loglevel: info
+
+# --- Listeners --------------------------------------------------------------
+listen:
+  # Native XMPP client connection (TLS). New app versions connect here.
+  - port: 5222
+    ip: "::"
+    module: ejabberd_c2s
+    max_stanza_size: 262144
+    shaper: c2s_shaper
+    access: c2s
+    starttls: true
+
+  # WebSocket + BOSH for mobile/web XMPP clients (XEP-0206 / RFC 7395).
+  # New app versions may use wss://xmpp.beanpon.com/ws instead of raw 5222.
+  - port: 5443
+    ip: "::"
+    module: ejabberd_http
+    tls: true
+    request_handlers:
+      /ws: ejabberd_http_ws
+      /bosh: mod_bosh
+
+  # EXTERNAL COMPONENT port (XEP-0114). The Go bridge connects here.
+  # secret must match XMPP_COMPONENT_SECRET in the Go service .env.
+  - port: 5347
+    ip: "127.0.0.1"
+    module: ejabberd_service
+    access: all
+    shaper: fast
+    hosts:
+      "bridge.beanpon.com":
+        password: "CHANGE_ME_COMPONENT_SECRET"
+
+# --- Authentication ---------------------------------------------------------
+# Delegate auth to the Go service so the JWT remains the single source of
+# truth. ejabberd POSTs {user, server, password=JWT} and Go answers isuser /
+# check_password by verifying the JWT and that user_id == user.
+auth_method: [http]
+auth_opts:
+  host: "http://127.0.0.1:5082"      # Go messenger service (internal)
+  path: "/internal/xmpp/auth"
+  connection_pool_size: 10
+
+# --- Access rules / shapers (minimal) --------------------------------------
+acl:
+  local:
+    user_regexp: ""
+access_rules:
+  c2s:
+    allow: all
+  local:
+    allow: local
+shaper:
+  normal: 1000
+  fast: 50000
+shaper_rules:
+  c2s_shaper: normal
+
+# --- Modules ----------------------------------------------------------------
+modules:
+  # Message Archive Management (XEP-0313) — chat history + multi-device sync.
+  # Backed by the same PostgreSQL instance the Go service uses (separate
+  # tables, ejabberd-owned; Go's messages table is untouched).
+  mod_mam:
+    db_type: sql
+    default: always
+    user_mucsub_from_muc_archive: true
+
+  # Multi-User Chat (XEP-0045) — backs group_chat_page. Group membership /
+  # permissions remain authoritative in Go; rooms here are transport only.
+  mod_muc:
+    host: "groups.beanpon.com"
+    access: all
+    access_create: all
+    access_persistent: all
+    access_admin: all
+    db_type: sql
+    default_room_options:
+      persistent: true
+      mam: true
+      members_only: true
+      public: false
+      public_list: false
+
+  mod_muc_admin: {}
+
+  # Presence / roster — kept minimal; roster authority is Go (follow graph),
+  # but ejabberd presence is used for online/last-seen transport.
+  mod_roster:
+    versioning: true
+  mod_last: {}
+
+  # Message Carbons (XEP-0280) — deliver a copy to all of a user's devices.
+  mod_carboncopy: {}
+
+  # Stream Management (XEP-0198) — survive flaky mobile networks (resume).
+  mod_stream_mgmt:
+    resume_timeout: 300
+    max_resume_timeout: 600
+
+  # Push (XEP-0357) — used to wake the Go service so it can fire FCM/APNs
+  # exactly like today. ejabberd does not talk to FCM directly; it pushes to
+  # the Go app-server endpoint which reuses the existing push pipeline.
+  mod_push:
+    db_type: sql
+  mod_push_keepalive: {}
+
+  # Offline storage — queue stanzas for users who are not connected.
+  mod_offline:
+    db_type: sql
+    access_max_user_messages: 5000
+
+  mod_ping:
+    send_pings: true
+    ping_interval: 60
+
+# --- SQL (shared PostgreSQL) -----------------------------------------------
+# Uses the same Postgres server; ejabberd creates its own tables. The Go
+# service's existing schema (messages, conversations, ...) is NOT modified.
+sql_type: pgsql
+sql_server: "postgres"
+sql_port: 5432
+sql_database: "ejabberd"
+sql_username: "ejabberd"
+sql_password: "CHANGE_ME_EJABBERD_DB_PASSWORD"
+sql_pool_size: 10
