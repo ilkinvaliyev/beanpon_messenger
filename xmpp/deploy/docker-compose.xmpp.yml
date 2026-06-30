@@ -2,11 +2,18 @@
 # docker-compose.xmpp.yml — adds the ejabberd XMPP backbone next to the
 # existing beanpon_messenger Go service.
 #
-# Usage (alongside the existing root docker-compose.yml):
-#   docker compose -f docker-compose.yml -f xmpp/deploy/docker-compose.xmpp.yml up -d
+# Usage — run from THIS directory (xmpp/deploy) so the relative ./ paths to
+# ejabberd.yml and beanpon.pem resolve correctly:
+#
+#   cd xmpp/deploy
+#   docker compose -f docker-compose.xmpp.yml up -d
+#
+# Do NOT merge it with the root docker-compose.yml via -f; merging makes the
+# relative volume paths resolve against the repo root and breaks the mount.
+# ejabberd is a standalone backbone — it does not need the app compose file.
 #
 # The Go service stays exactly as it is; it simply gains a few env vars
-# (see xmpp/deploy/.env.xmpp.example) and dials the component port 5347.
+# (see .env.xmpp.example) and dials the component port 5347.
 # ============================================================================
 
 services:
@@ -35,23 +42,6 @@ services:
       # your existing Let's Encrypt fullchain+key.
       - ./beanpon.pem:/home/ejabberd/conf/beanpon.pem:ro
       - ejabberd_data:/home/ejabberd/database
-    networks:
-      - beanpon_local-network
-    depends_on:
-      - ejabberd_db_wait
-
-  # Optional one-shot helper to ensure the ejabberd DB/schema exists.
-  # Replace with your real migration step in production.
-  ejabberd_db_wait:
-    image: postgres:16-alpine
-    container_name: beanpon_ejabberd_db_wait
-    entrypoint:
-      - sh
-      - -c
-      - |
-        echo "Ensure a 'ejabberd' database + user exist in your Postgres,
-        then load ejabberd's pg.sql schema once. This stub just exits 0."
-        exit 0
     networks:
       - beanpon_local-network
 
