@@ -54,7 +54,7 @@ listen:
     shaper: fast
     hosts:
       "bridge.beanpon.com":
-        password: "CHANGE_ME_COMPONENT_SECRET"
+        password: "f69c6581787ed9577e0e572aadda4a605853f66ad75f944737a7c6bb875cf818"
 
 # --- Authentication ---------------------------------------------------------
 # Delegate auth to the Go service so the JWT remains the single source of
@@ -143,9 +143,26 @@ modules:
 # Uses the same Postgres server; ejabberd creates its own tables. The Go
 # service's existing schema (messages, conversations, ...) is NOT modified.
 sql_type: pgsql
-sql_server: "postgres"
-sql_port: 5432
+# Real PostgreSQL (NOT pgbouncer). pgbouncer is on 5432; the actual server is
+# on 10.10.0.5:5433. ejabberd does its own connection management, so it talks
+# to Postgres directly (bypassing pgbouncer).
+sql_server: "10.10.0.5"
+sql_port: 5433
 sql_database: "ejabberd"
 sql_username: "ejabberd"
-sql_password: "CHANGE_ME_EJABBERD_DB_PASSWORD"
+sql_password: "3ec5cd9bd65733967151f8424351c6921ead43aa6a824efab11e739e8d84322e"
 sql_pool_size: 10
+
+# --- TLS certificates -------------------------------------------------------
+# XMPP clients connect over TLS (ports 5222 / 5443). Point these at your
+# existing beanpon.com certificate (e.g. the same Let's Encrypt fullchain you
+# use for the web/API). The component port (5347) is localhost-only and needs
+# no TLS.
+#
+# For STAGING you may generate a self-signed cert:
+#   openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+#     -keyout beanpon.key -out beanpon.crt -subj "/CN=beanpon.com"
+#   cat beanpon.crt beanpon.key > beanpon.pem
+# then mount it and set certfiles below.
+certfiles:
+  - "/home/ejabberd/conf/beanpon.pem"

@@ -1,0 +1,28 @@
+-- -- ============================================================================
+-- -- setup_postgres.sql — one-time ejabberd database setup.
+-- --
+-- -- SAFETY: this creates a SEPARATE database ("ejabberd") and a SEPARATE user.
+-- -- It does NOT touch your existing messenger database (messages, conversations,
+-- -- users, ...). ejabberd only ever reads/writes its own database.
+-- --
+-- -- Run it ONCE against your Postgres server as a superuser, e.g.:
+-- --   psql "postgresql://postgres:PASS@DBHOST:5432/postgres" -f setup_postgres.sql
+-- -- ============================================================================
+--
+-- -- 1) Dedicated role + database for ejabberd.
+-- CREATE ROLE ejabberd WITH LOGIN PASSWORD '3ec5cd9bd65733967151f8424351c6921ead43aa6a824efab11e739e8d84322e';
+--
+-- CREATE DATABASE ejabberd OWNER ejabberd;
+--
+-- GRANT ALL PRIVILEGES ON DATABASE ejabberd TO ejabberd;
+--
+-- -- 2) After this, load ejabberd's own schema (tables) INTO the ejabberd db.
+-- --    The official schema file ships with ejabberd as "pg.sql". Easiest path:
+-- --    the ejabberd/ecs container auto-creates its schema on first boot when the
+-- --    db is empty. If you prefer to do it manually:
+-- --
+-- --      docker exec -i beanpon_ejabberd \
+-- --        psql "postgresql://ejabberd:PASS@postgres:5432/ejabberd" \
+-- --        < /opt/ejabberd/lib/ejabberd-*/priv/sql/pg.sql
+-- --
+-- --    (path may vary by image version). Nothing here touches your app schema.
