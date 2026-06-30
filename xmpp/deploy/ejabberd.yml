@@ -35,12 +35,25 @@ listen:
     access: c2s
     starttls: true
 
-  # WebSocket + BOSH for mobile/web XMPP clients (XEP-0206 / RFC 7395).
-  # New app versions may use wss://xmpp.beanpon.com/ws instead of raw 5222.
+  # WebSocket + BOSH over TLS (direct, port 5443). Kept for clients that
+  # connect straight to ejabberd without the nginx front (e.g. raw testing).
   - port: 5443
     ip: "::"
     module: ejabberd_http
     tls: true
+    request_handlers:
+      /ws: ejabberd_http_ws
+      /bosh: mod_bosh
+
+  # PLAIN WebSocket + BOSH (NO TLS) on 5280, behind the host nginx.
+  # Flow: client → Cloudflare (TLS) → host nginx :80 → ejabberd :5280.
+  # TLS is terminated by Cloudflare/nginx, so this port must NOT do TLS again
+  # (avoids double-TLS). Bound to all interfaces so the docker port mapping
+  # (5280) reaches it; the host nginx proxies wss://xmpp.beanpon.com/ws here.
+  - port: 5280
+    ip: "::"
+    module: ejabberd_http
+    tls: false
     request_handlers:
       /ws: ejabberd_http_ws
       /bosh: mod_bosh
@@ -57,21 +70,20 @@ listen:
         password: "f69c6581787ed9577e0e572aadda4a605853f66ad75f944737a7c6bb875cf818"
 
 # --- Authentication ---------------------------------------------------------
-# PHASE 1: use ejabberd's built-in SQL auth so the server can boot and we can
-# verify DB connectivity + the component bridge. Client JWT auth is NOT needed
-# yet — the Go bridge connects as a trusted COMPONENT (shared secret on port
-# 5347), not as a JWT-authenticated client.
+# JWT auth (ejabberd built-in). Clients log in with a short-lived token that
+# carries their `jid` claim, signed with the SAME secret as Beanpon's JWTs.
+# The Go service mints that token at POST /api/v1/xmpp/token (token_handler.go)
+# from the user's existing JWT, so the JWT stays the single source of truth and
+# no separate XMPP password exists.
 #
-# PHASE 2 (later): delegate auth to the Go service so the JWT stays the single
-# source of truth. The stock ejabberd image does NOT ship the HTTP auth backend
-# as `auth_method: http`; it requires the external `ejabberd_auth_http` module
-# (or a small custom module). Wire that in when enabling native XMPP clients.
-auth_method: [sql]
-# auth_method: [http]
-# auth_opts:
-#   host: "http://127.0.0.1:5082"
-#   path: "/internal/xmpp/auth"
-#   connection_pool_size: 10
+# jwt_key points at a file containing the raw HMAC secret (= JWT_SECRET). The
+# docker compose mounts it; create it once from your server .env (see
+# xmpp/deploy/README_AUTH.md).
+#
+# Note: with JWT auth, mod_offline does not apply (accounts aren't stored). The
+# Go service already owns offline delivery + push, so this is fine.
+auth_method: [jwt]
+jwt_key: "/home/ejabberd/conf/jwt.key"
 
 # --- Access rules / shapers (minimal) --------------------------------------
 acl:

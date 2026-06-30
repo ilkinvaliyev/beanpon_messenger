@@ -32,7 +32,10 @@ services:
           memory: 512M
     ports:
       - "5222:5222"   # native XMPP client (TLS)
-      - "5443:5443"   # XMPP-over-WebSocket / BOSH (wss)
+      - "5443:5443"   # XMPP-over-WebSocket / BOSH (wss, direct)
+      # 5280 = plain WS/BOSH behind the host nginx (Cloudflare terminates TLS).
+      # Bound to 10.10.0.5 so the host nginx can proxy to it.
+      - "10.10.0.5:5280:5280"
       # 5347 (component) is bound to 127.0.0.1 only — NOT published publicly.
       - "127.0.0.1:5347:5347"
     volumes:
@@ -41,6 +44,9 @@ services:
       # cert+key PEM next to this compose file as beanpon.pem, or point this at
       # your existing Let's Encrypt fullchain+key.
       - ./beanpon.pem:/home/ejabberd/conf/beanpon.pem:ro
+      # JWT signing secret (= JWT_SECRET). Used by auth_method: jwt to verify
+      # client login tokens. Create it once: see README_AUTH.md.
+      - ./jwt.key:/home/ejabberd/conf/jwt.key:ro
       - ejabberd_data:/home/ejabberd/database
     networks:
       - beanpon_local-network

@@ -245,6 +245,11 @@ func main() {
 		api.DELETE("/conversations/:other_user_id/clear", messageHandler.ClearConversation)
 		api.DELETE("/conversations/clear-all", messageHandler.ClearAllMyMessages)
 
+		// ── XMPP: istemci giriş token'ı ──────────────────────────────────
+		// İstemci (yeni sürüm) XMPP'ye bağlanmadan önce buradan jid'li
+		// kısa-ömürlü token alır. ejabberd yerleşik JWT auth'u doğrular.
+		api.POST("/xmpp/token", xmppBridge.TokenHandler(cfg.JWTSecret))
+
 		// ── DM: Sohbet operasyonları ─────────────────────────────────────
 		api.GET("/conversations", messageHandler.GetConversations)
 		api.GET("/unread-count", messageHandler.GetUnreadCount)
