@@ -915,6 +915,13 @@ func (h *ConversationHandler) GetConversationDetails(c *gin.Context) {
 		canSendMessage = false
 	}
 
+	// Admin (Filament) blok — BU söhbətdə heç kim mesaj göndərə bilməz.
+	// stop_message_reason burada dəyişdirilmir; client `blocked` sahəsinə görə
+	// ayrıca "söhbət bağlandı" banner-i göstərir (restriction banner deyil).
+	if conversation.Blocked {
+		canSendMessage = false
+	}
+
 	// Other user settings — scope'u buraya çek ki aşağıda da erişebilelim
 	allowVoiceMessages := true
 	showReadReceipts := true
@@ -988,6 +995,7 @@ func (h *ConversationHandler) GetConversationDetails(c *gin.Context) {
 			"max_pending_messages": conversation.MaxPendingMessages,
 			"allow_voice_messages": allowVoiceMessages,
 			"show_read_receipts":   showReadReceipts,
+			"blocked":              conversation.Blocked,
 		},
 	}
 

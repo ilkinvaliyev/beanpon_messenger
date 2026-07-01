@@ -879,6 +879,7 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 		IsOtherMuted       *bool      `json:"is_other_muted"`
 		IsOtherRestricted  *bool      `json:"is_other_restricted"`
 		MaxPendingMessages *int       `json:"max_pending_messages"`
+		Blocked            *bool      `json:"blocked"`
 
 		OtherUserName       string  `json:"other_user_name"`
 		OtherUserUsername   string  `json:"other_user_username"`
@@ -1058,6 +1059,7 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
             ELSE NULL
         END as is_other_restricted,
         conv.max_pending_messages,
+        conv.blocked,
         u.name as other_user_name,
         u.username as other_user_username,
         u.account_type_id,
@@ -1161,6 +1163,12 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 			canSendMessage = false
 		}
 
+		// Admin (Filament) blok — söhbət bağlıdırsa heç kim göndərə bilməz.
+		isBlocked := conv.Blocked != nil && *conv.Blocked
+		if isBlocked {
+			canSendMessage = false
+		}
+
 		isMutedByMe := conv.AmIMuted != nil && *conv.AmIMuted
 		isArchivedByMe := conv.AmIArchived != nil && *conv.AmIArchived
 		// Pin = pinned_at dolu (NULL deyil). AmIPinned (*bool) bəzi hallarda
@@ -1216,6 +1224,7 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 				"max_pending_messages": conv.MaxPendingMessages,
 				"allow_voice_messages": conv.AllowVoiceMessages,
 				"show_read_receipts":   conv.ShowReadReceipts,
+				"blocked":              isBlocked,
 			},
 		}
 
