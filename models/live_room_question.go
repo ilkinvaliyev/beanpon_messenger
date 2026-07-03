@@ -7,6 +7,7 @@ type LiveRoomQuestion struct {
 	ID         uint      `json:"id" gorm:"primaryKey;autoIncrement"`
 	Text       string    `json:"text" gorm:"type:text;not null"`
 	Lang       string    `json:"lang" gorm:"type:varchar(8);default:'az'"`
+	Type       string    `json:"type" gorm:"type:varchar(32);default:'normal'"`
 	ShownCount uint64    `json:"shown_count" gorm:"default:0"`
 	CreatedAt  time.Time `json:"created_at"`
 	UpdatedAt  time.Time `json:"updated_at"`

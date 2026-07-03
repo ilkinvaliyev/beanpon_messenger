@@ -37,13 +37,18 @@ func (h *LiveHub) AskQuestion(c *gin.Context) {
 	}
 	roomID := uint(roomID64)
 
-	// Body — optional lang
+	// Body — optional lang + type
 	var body struct {
 		Lang string `json:"lang"`
+		Type string `json:"type"`
 	}
 	_ = c.ShouldBindJSON(&body)
 	if body.Lang == "" {
 		body.Lang = "az"
+	}
+	// type göndərilməyibsə həmişə "normal" suallar seçilir
+	if body.Type == "" {
+		body.Type = "normal"
 	}
 
 	// 1) Otağı yoxla — yalnız host sual verə bilər
@@ -61,11 +66,12 @@ func (h *LiveHub) AskQuestion(c *gin.Context) {
 		return
 	}
 
-	// 2) Bu otaqda hələ göstərilməmiş random sual seç
+	// 2) Bu otaqda hələ göstərilməmiş random sual seç (lang + type filter ilə)
 	var question models.LiveRoomQuestion
 	err = database.DB.
 		Table("live_room_questions q").
 		Where("q.lang = ?", body.Lang).
+		Where("q.type = ?", body.Type).
 		Where("NOT EXISTS (SELECT 1 FROM live_room_question_usages u WHERE u.question_id = q.id AND u.live_room_id = ?)", roomID).
 		Order("RANDOM()").
 		Limit(1).
@@ -110,6 +116,7 @@ func (h *LiveHub) AskQuestion(c *gin.Context) {
 		"question_id": question.ID,
 		"text":        question.Text,
 		"lang":        question.Lang,
+		"type":        question.Type,
 		"asked_by":    userID,
 		"shown_at":    now,
 	})
@@ -127,6 +134,7 @@ func (h *LiveHub) AskQuestion(c *gin.Context) {
 		"question_id": question.ID,
 		"text":        question.Text,
 		"lang":        question.Lang,
+		"type":        question.Type,
 		"shown_at":    now,
 	})
 }
