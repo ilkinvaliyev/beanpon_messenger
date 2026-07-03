@@ -50,13 +50,14 @@ type Config struct {
 	S3 S3Config
 }
 
-// S3Config — səs/media faylları üçün S3/MinIO. Laravel s3 disk ilə eyni bucket.
+// S3Config — səs/media faylları üçün S3/MinIO/Hetzner. Laravel s3 disk ilə eyni.
 type S3Config struct {
-	Bucket   string
-	Region   string
-	Endpoint string // MinIO / custom endpoint (boşdursa AWS default)
-	Key      string
-	Secret   string
+	Bucket    string
+	Region    string
+	Endpoint  string // MinIO / Hetzner endpoint (boşdursa AWS default)
+	Key       string
+	Secret    string
+	PathStyle bool // Laravel AWS_USE_PATH_STYLE_ENDPOINT (Hetzner=false, MinIO=true)
 }
 
 // CacheConfig — Redis cache layeri üçün konfiqurasiya. piokio_golang_main
@@ -121,11 +122,12 @@ func LoadConfig() *Config {
 		PgBouncerEnabled: envBool("PGBOUNCER_ENABLED", false),
 		AppURL:           envStr("APP_URL", "https://api.beanpon.com"),
 		S3: S3Config{
-			Bucket:   envStr("AWS_BUCKET", ""),
-			Region:   envStr("AWS_DEFAULT_REGION", "us-east-1"),
-			Endpoint: envStr("AWS_ENDPOINT", ""),
-			Key:      envStr("AWS_ACCESS_KEY_ID", ""),
-			Secret:   envStr("AWS_SECRET_ACCESS_KEY", ""),
+			Bucket:    envStr("AWS_BUCKET", ""),
+			Region:    envStr("AWS_DEFAULT_REGION", "us-east-1"),
+			Endpoint:  envStr("AWS_ENDPOINT", ""),
+			Key:       envStr("AWS_ACCESS_KEY_ID", ""),
+			Secret:    envStr("AWS_SECRET_ACCESS_KEY", ""),
+			PathStyle: envBool("AWS_USE_PATH_STYLE_ENDPOINT", false),
 		},
 		Cache: CacheConfig{
 			Enabled:          envBool("REDIS_ENABLED", true),

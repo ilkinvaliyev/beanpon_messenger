@@ -18,9 +18,10 @@ type S3Uploader struct {
 	bucket string
 }
 
-// NewS3Uploader — S3/MinIO client (custom endpoint + path-style, digər
-// servislərlə eyni). bucket boş olduqda no-op uploader qaytarır.
-func NewS3Uploader(bucket, region, endpoint, accessKey, secretKey string) *S3Uploader {
+// NewS3Uploader — S3/MinIO/Hetzner client. bucket boş olduqda no-op uploader.
+// pathStyle Laravel `AWS_USE_PATH_STYLE_ENDPOINT` ilə eynidir: Hetzner Object
+// Storage virtual-hosted işlədir (false) → bucket.endpoint; MinIO isə true.
+func NewS3Uploader(bucket, region, endpoint, accessKey, secretKey string, pathStyle bool) *S3Uploader {
 	if bucket == "" {
 		return &S3Uploader{}
 	}
@@ -34,7 +35,7 @@ func NewS3Uploader(bucket, region, endpoint, accessKey, secretKey string) *S3Upl
 	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
 		if endpoint != "" {
 			o.BaseEndpoint = aws.String(endpoint)
-			o.UsePathStyle = true
+			o.UsePathStyle = pathStyle
 		}
 	})
 	return &S3Uploader{client: client, bucket: bucket}

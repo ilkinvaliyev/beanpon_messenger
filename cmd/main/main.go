@@ -193,7 +193,7 @@ func main() {
 	raveHandler := handlers.NewRaveHandler(raveHub) // ← YENİ
 
 	// Voice/media upload — Laravel MessageController::uploadVoice/uploadMedia portu.
-	s3Uploader := services.NewS3Uploader(cfg.S3.Bucket, cfg.S3.Region, cfg.S3.Endpoint, cfg.S3.Key, cfg.S3.Secret)
+	s3Uploader := services.NewS3Uploader(cfg.S3.Bucket, cfg.S3.Region, cfg.S3.Endpoint, cfg.S3.Key, cfg.S3.Secret, cfg.S3.PathStyle)
 	uploadHandler := handlers.NewUploadHandler(s3Uploader)
 
 	// Gin router'ını oluştur
