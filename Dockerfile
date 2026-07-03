@@ -19,15 +19,25 @@ WORKDIR /app/cmd/main
 RUN go build -o /app/main .
 
 # ── RUNTIME STAGE ───────────────────────────────────────────────────────────
-# Runtime-da ffmpeg + audiowaveform lazımdır (voice waveform üçün). Bunlar
-# Debian-based image-də rahat qurulur; audiowaveform bookworm apt repo-sunda var.
+# Runtime-da ffmpeg + audiowaveform lazımdır (voice waveform üçün).
+# ffmpeg bookworm apt repo-sundadır. audiowaveform Debian rəsmi repo-da YOXDUR
+# → BBC-nin rəsmi bookworm .deb release-indən qurulur (asılılıqları `apt-get
+# install ./file.deb` avtomatik həll edir).
 FROM debian:bookworm-slim
+
+ARG AUDIOWAVEFORM_VERSION=1.10.1
+ARG AUDIOWAVEFORM_DEB=audiowaveform_${AUDIOWAVEFORM_VERSION}-1-12_amd64.deb
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ffmpeg \
-        audiowaveform \
         ca-certificates \
+        wget \
+    && wget -q "https://github.com/bbc/audiowaveform/releases/download/${AUDIOWAVEFORM_VERSION}/${AUDIOWAVEFORM_DEB}" -O /tmp/audiowaveform.deb \
+    && apt-get install -y --no-install-recommends /tmp/audiowaveform.deb \
+    && rm -f /tmp/audiowaveform.deb \
+    && apt-get purge -y wget \
+    && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
