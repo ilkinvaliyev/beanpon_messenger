@@ -28,13 +28,17 @@ FROM debian:bookworm-slim
 ARG AUDIOWAVEFORM_VERSION=1.10.1
 ARG AUDIOWAVEFORM_DEB=audiowaveform_${AUDIOWAVEFORM_VERSION}-1-12_amd64.deb
 
+# ffmpeg MƏCBURİDİR (build fail etməlidir onsuz). audiowaveform BEST-EFFORT:
+# .deb yüklənməsə/qurulmasa belə build DAYANMIR (`|| true`) — servis mütləq
+# qalxsın deyə. audiowaveform yoxdursa waveform fallback-a düşür (mesaj yenə gedir).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ffmpeg \
         ca-certificates \
         wget \
-    && wget -q "https://github.com/bbc/audiowaveform/releases/download/${AUDIOWAVEFORM_VERSION}/${AUDIOWAVEFORM_DEB}" -O /tmp/audiowaveform.deb \
-    && apt-get install -y --no-install-recommends /tmp/audiowaveform.deb \
+    && ( wget -q "https://github.com/bbc/audiowaveform/releases/download/${AUDIOWAVEFORM_VERSION}/${AUDIOWAVEFORM_DEB}" -O /tmp/audiowaveform.deb \
+         && apt-get install -y --no-install-recommends /tmp/audiowaveform.deb \
+         || echo "WARN: audiowaveform quraşdırılmadı — waveform fallback işlədiləcək" ) \
     && rm -f /tmp/audiowaveform.deb \
     && apt-get purge -y wget \
     && apt-get autoremove -y \
