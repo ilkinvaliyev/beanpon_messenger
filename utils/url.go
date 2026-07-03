@@ -2,7 +2,25 @@ package utils
 
 import "strings"
 
-const BaseURL = "https://api.beanpon.com"
+// BaseURL — media full URL prefiksi. Default api.beanpon.com; main.go
+// SetBaseURL(cfg.AppURL) ilə override edir (Laravel APP_URL ilə byte-uyğunluq).
+var BaseURL = "https://api.beanpon.com"
+
+// SetBaseURL — APP_URL-i tətbiq başlanğıcında təyin edir.
+func SetBaseURL(u string) {
+	if u != "" {
+		BaseURL = strings.TrimRight(u, "/")
+	}
+}
+
+// FilePathS3 — Laravel filePathS3($key): BaseURL/api/s3-storage/key.
+// Səs/media upload cavabında tam URL qaytarmaq üçün (nil-safe).
+func FilePathS3(key string) string {
+	if key == "" {
+		return ""
+	}
+	return BaseURL + "/api/s3-storage/" + strings.TrimPrefix(key, "/")
+}
 
 type StorageType string
 

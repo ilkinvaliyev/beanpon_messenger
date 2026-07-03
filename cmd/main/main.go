@@ -7,6 +7,7 @@ import (
 	"beanpon_messenger/handlers"
 	"beanpon_messenger/middleware"
 	"beanpon_messenger/services"
+	"beanpon_messenger/utils"
 	"beanpon_messenger/websocket"
 	"beanpon_messenger/xmpp"
 	"github.com/Depado/ginprom"
@@ -24,6 +25,9 @@ func main() {
 
 	// Konfigürasyonu yükle
 	cfg := config.LoadConfig()
+
+	// Media full URL prefiksi (Laravel APP_URL) — filePathS3 üçün.
+	utils.SetBaseURL(cfg.AppURL)
 
 	// GORM ile PostgreSQL'e bağlan
 	database.InitializePostgreSQL(cfg)
@@ -188,6 +192,10 @@ func main() {
 	groupMsgHandler := handlers.NewGroupMessageHandler(encryptionService, wsHub)
 	raveHandler := handlers.NewRaveHandler(raveHub) // ← YENİ
 
+	// Voice/media upload — Laravel MessageController::uploadVoice/uploadMedia portu.
+	s3Uploader := services.NewS3Uploader(cfg.S3.Bucket, cfg.S3.Region, cfg.S3.Endpoint, cfg.S3.Key, cfg.S3.Secret)
+	uploadHandler := handlers.NewUploadHandler(s3Uploader)
+
 	// Gin router'ını oluştur
 	router := gin.Default()
 
@@ -225,6 +233,10 @@ func main() {
 	api := router.Group("/api/v1")
 	api.Use(middleware.JWTMiddleware(cfg.JWTSecret))
 	{
+		// ── Voice/media upload (Laravel messenger/upload-*) ──────────────
+		api.POST("/messenger/upload-voice", uploadHandler.UploadVoice)
+		api.POST("/messenger/upload-media", uploadHandler.UploadMedia)
+
 		// ── DM: Mesaj operasyonları ──────────────────────────────────────
 		api.POST("/messages", messageHandler.SendMessage)
 		api.POST("/messages/broadcast", messageHandler.BroadcastMessage)

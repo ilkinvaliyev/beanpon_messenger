@@ -41,6 +41,22 @@ type Config struct {
 	// Disable olunsa belə tətbiq işləyir — bütün cache çağırışları no-op olur,
 	// DB-yə düşür.
 	Cache CacheConfig
+
+	// AppURL — media full URL qurmaq üçün (Laravel filePathS3 = APP_URL/api/s3-storage/key).
+	// utils.BaseURL hardcoded idi; artıq buradan konfiqurasiya olunur.
+	AppURL string
+
+	// S3 — səs/media yükləmə (voice + upload-media). Laravel Storage::disk('s3').
+	S3 S3Config
+}
+
+// S3Config — səs/media faylları üçün S3/MinIO. Laravel s3 disk ilə eyni bucket.
+type S3Config struct {
+	Bucket   string
+	Region   string
+	Endpoint string // MinIO / custom endpoint (boşdursa AWS default)
+	Key      string
+	Secret   string
 }
 
 // CacheConfig — Redis cache layeri üçün konfiqurasiya. piokio_golang_main
@@ -103,6 +119,14 @@ func LoadConfig() *Config {
 		TelegramBotToken: envStr("TELEGRAM_BOT_TOKEN", "8862168493:AAH2WPoYyUgbIEmolXkCJ3JAaKh3aP53fBE"),
 		TelegramChatID:   envStr("TELEGRAM_CHAT_ID", "739452673"),
 		PgBouncerEnabled: envBool("PGBOUNCER_ENABLED", false),
+		AppURL:           envStr("APP_URL", "https://api.beanpon.com"),
+		S3: S3Config{
+			Bucket:   envStr("AWS_BUCKET", ""),
+			Region:   envStr("AWS_DEFAULT_REGION", "us-east-1"),
+			Endpoint: envStr("AWS_ENDPOINT", ""),
+			Key:      envStr("AWS_ACCESS_KEY_ID", ""),
+			Secret:   envStr("AWS_SECRET_ACCESS_KEY", ""),
+		},
 		Cache: CacheConfig{
 			Enabled:          envBool("REDIS_ENABLED", true),
 			Host:             envStr("REDIS_HOST", "127.0.0.1"),
