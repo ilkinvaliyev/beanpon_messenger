@@ -341,6 +341,7 @@ func main() {
 		api.GET("/live-rooms/:room_id/messages", liveHub.GetLiveRoomMessages)
 		api.GET("/live-rooms/:room_id/reactions", liveHub.GetLiveRoomReactions)
 		api.POST("/live-rooms/:room_id/ask-question", liveHub.AskQuestion)
+		api.POST("/live-rooms/:room_id/question-vote", liveHub.CastQuestionVote)
 		api.POST("/live-rooms/:room_id/mafia/start", liveHub.StartMafia)
 
 		// ── WebSocket bilgi endpoint'leri ────────────────────────────────

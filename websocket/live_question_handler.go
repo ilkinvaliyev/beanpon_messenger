@@ -111,6 +111,9 @@ func (h *LiveHub) AskQuestion(c *gin.Context) {
 		return
 	}
 
+	// Yeni sual → əvvəlki sualın Ok-Nok səsləri sıfırlanır (WS-only, keçici).
+	h.resetQuestionVotes(roomID)
+
 	// 4) WebSocket vasitəsilə yay
 	eventData, _ := json.Marshal(map[string]interface{}{
 		"question_id": question.ID,

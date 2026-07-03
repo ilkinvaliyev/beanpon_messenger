@@ -66,10 +66,14 @@ func (h *LiveHub) visibleCount(roomID uint) int {
 type LiveHub struct {
 	rooms          map[uint]map[uint]*LiveRoomClient
 	reactionBuffer map[uint]map[uint]map[string]uint64
-	Register       chan *LiveRoomClient
-	Unregister     chan *LiveRoomClient
-	Broadcast      chan *LiveMessageEvent
-	mu             sync.RWMutex
+	// questionVotes — Ok-Nok sualları üçün WS-only (yaddaşda) səsvermə.
+	// roomID → questionID → userID → "ok"|"nok". Yeni sual gələndə və ya
+	// otaq boşalanda sıfırlanır. DB-yə yazılmır (keçici).
+	questionVotes map[uint]map[uint]map[uint]string
+	Register      chan *LiveRoomClient
+	Unregister    chan *LiveRoomClient
+	Broadcast     chan *LiveMessageEvent
+	mu            sync.RWMutex
 }
 
 type LiveMessageEvent struct {
@@ -83,6 +87,7 @@ func NewLiveHub() *LiveHub {
 	return &LiveHub{
 		rooms:          make(map[uint]map[uint]*LiveRoomClient),
 		reactionBuffer: make(map[uint]map[uint]map[string]uint64),
+		questionVotes:  make(map[uint]map[uint]map[uint]string),
 		Register:       make(chan *LiveRoomClient),
 		Unregister:     make(chan *LiveRoomClient),
 		Broadcast:      make(chan *LiveMessageEvent),
@@ -172,6 +177,7 @@ func (h *LiveHub) Run() {
 				if len(room) == 0 {
 					delete(h.rooms, client.RoomID)
 					delete(h.reactionBuffer, client.RoomID)
+					delete(h.questionVotes, client.RoomID)
 					roomExists = false
 				}
 			}
@@ -763,6 +769,19 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 
 	case "question":
 		// Host tarafindan tetiklenen icebreaker sorusu — otaqdaki hər kəsə eyni anda göstərilir
+		for _, client := range roomClients {
+			select {
+			case client.Send <- payload:
+			default:
+				close(client.Send)
+				go func(c *LiveRoomClient) {
+					h.Unregister <- c
+				}(client)
+			}
+		}
+
+	case "question_vote_update":
+		// Ok-Nok səs sayğacı — otaqdakı hər kəsə canlı yayılır
 		for _, client := range roomClients {
 			select {
 			case client.Send <- payload:
