@@ -47,4 +47,10 @@ RUN apt-get update \
 WORKDIR /app
 COPY --from=build /app/main /app/main
 
+# .env — köhnə tək-stage Dockerfile `COPY . .` ilə .env-i də image-ə salırdı,
+# tətbiq isə godotenv.Load() ilə onu oxuyur (docker-compose env_file işlətmir).
+# Multi-stage-də bunu açıq şəkildə kopyalamalıyıq, yoxsa DB dəyişənləri boş
+# qalır və tətbiq "PostgreSQL environment variables are missing" ilə çökür.
+COPY .env /app/.env
+
 CMD ["./main"]
