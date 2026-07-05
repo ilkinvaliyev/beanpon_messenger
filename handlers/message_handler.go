@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -608,6 +609,270 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 		"total":                   int(totalCount),
 		"first_unread_message_id": firstUnreadID,
 		"is_online":               h.wsHub.IsUserOnline(uint(otherUserID)),
+	})
+}
+
+// SearchMessages — in-chat DM text search (WhatsApp-style).
+// GET /api/v1/messages/:user_id/search?q=<text>&limit=<1..50, default 25>&before_ms=<int64, optional>
+//
+// Messages are stored AES-encrypted (encrypted_text) with a random IV, so a
+// SQL ILIKE on the text is impossible. Instead the server scans rows in
+// batches with EXACTLY the same visibility conditions as GetMessages
+// (pair match + is_deleted_by_sender/receiver CASE), plus the DM marker
+// used by SyncMessages (conversation_id IS NULL) and the defensive
+// deleted_at IS NULL guard, decrypts each row and filters with a
+// case-insensitive contains. A single request scans at most
+// searchScanCap rows; the client continues with next_before_ms
+// (keyset paging on created_at DESC). Media/voice/call JSON payloads
+// carry no user text and are skipped; view-once payloads are always
+// excluded. Fully additive — old clients never call this endpoint.
+func (h *MessageHandler) SearchMessages(c *gin.Context) {
+	userIDVal, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+	userID := userIDVal.(uint)
+
+	otherUserID, err := strconv.ParseUint(c.Param("user_id"), 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz kullanıcı ID"})
+		return
+	}
+
+	q := strings.TrimSpace(c.Query("q"))
+	if q == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "Geçersiz q"})
+		return
+	}
+	qLower := strings.ToLower(q)
+
+	limit, err := strconv.Atoi(c.DefaultQuery("limit", "25"))
+	if err != nil || limit <= 0 {
+		limit = 25
+	}
+	if limit > 50 {
+		limit = 50
+	}
+
+	beforeMs, err := strconv.ParseInt(c.DefaultQuery("before_ms", "0"), 10, 64)
+	if err != nil || beforeMs < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "Geçersiz before_ms"})
+		return
+	}
+
+	// Scan guards: batch page size and a per-request total-rows cap so one
+	// request can never walk an entire huge history in a single call.
+	const searchBatchSize = 200
+	const searchScanCap = 2000
+
+	// Same row shape as GetMessages (reply + story enrichment via joins).
+	type searchRow struct {
+		ID                   string     `gorm:"column:id"`
+		SenderID             uint       `gorm:"column:sender_id"`
+		ReceiverID           uint       `gorm:"column:receiver_id"`
+		StoryID              *uint      `gorm:"column:story_id"`
+		StoryMetadata        *string    `gorm:"column:story_metadata"`
+		ReplyToMessageID     *string    `gorm:"column:reply_to_message_id"`
+		EncryptedText        string     `gorm:"column:encrypted_text"`
+		Read                 bool       `gorm:"column:read"`
+		Delivered            bool       `gorm:"column:delivered"`
+		IsEdited             bool       `gorm:"column:is_edited"`
+		SenderReaction       *string    `gorm:"column:sender_reaction"`
+		ReceiverReaction     *string    `gorm:"column:receiver_reaction"`
+		StarredBySender      bool       `gorm:"column:starred_by_sender"`
+		StarredByReceiver    bool       `gorm:"column:starred_by_receiver"`
+		CreatedAt            time.Time  `gorm:"column:created_at"`
+		UpdatedAt            time.Time  `gorm:"column:updated_at"`
+		ReplyToMessageText   *string    `gorm:"column:reply_to_message_text"`
+		ReplyToMessageSender *uint      `gorm:"column:reply_to_message_sender"`
+		ReplyToCreatedAt     *time.Time `gorm:"column:reply_to_created_at"`
+		StoryType            *string    `gorm:"column:story_type"`
+		StoryMediaURL        *string    `gorm:"column:story_media_url"`
+		StoryContent         *string    `gorm:"column:story_content"`
+		StoryUserID          *uint      `gorm:"column:story_user_id"`
+		StoryCreatedAt       *time.Time `gorm:"column:story_created_at"`
+	}
+
+	// VISIBILITY: pair + is_deleted_by_* CASE copied verbatim from GetMessages,
+	// so search can never return a message the user would not see in the chat.
+	// conversation_id IS NULL = DM marker (mirrors SyncMessages); deleted_at
+	// guard mirrors SyncMessages/first-unread classification (group-only flow,
+	// defensive here).
+	baseQuery := `
+        SELECT
+            m.*,
+            reply.encrypted_text as reply_to_message_text,
+            reply.sender_id as reply_to_message_sender,
+            reply.created_at as reply_to_created_at,
+            s.type as story_type,
+            s.media_url as story_media_url,
+            s.content as story_content,
+            s.media_metadata as story_metadata,
+            s.user_id as story_user_id,
+            s.created_at as story_created_at
+        FROM messages m
+        LEFT JOIN messages reply ON m.reply_to_message_id = reply.id
+        LEFT JOIN stories s ON m.story_id = s.id
+        WHERE ((m.sender_id = ? AND m.receiver_id = ?) OR (m.sender_id = ? AND m.receiver_id = ?))
+        AND (
+            CASE
+                WHEN m.sender_id = ? THEN m.is_deleted_by_sender = false
+                ELSE m.is_deleted_by_receiver = false
+            END
+        )
+        AND m.conversation_id IS NULL
+        AND m.deleted_at IS NULL
+        AND m.created_at < ?
+        ORDER BY m.created_at DESC
+        LIMIT ?
+    `
+
+	cursor := time.Now().UTC().Add(time.Hour) // "no cursor" → include everything
+	if beforeMs > 0 {
+		cursor = time.UnixMilli(beforeMs).UTC()
+	}
+
+	matches := make([]gin.H, 0, limit)
+	scanned := 0
+	exhausted := false
+
+	for scanned < searchScanCap && len(matches) < limit {
+		var rows []searchRow
+		if err := database.DB.Raw(baseQuery,
+			userID, otherUserID, otherUserID, userID,
+			userID,
+			cursor, searchBatchSize,
+		).Scan(&rows).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "Mesajlar alınamadı"})
+			return
+		}
+
+		if len(rows) == 0 {
+			exhausted = true
+			break
+		}
+
+		for _, msg := range rows {
+			cursor = msg.CreatedAt
+			scanned++
+
+			decryptedText, decErr := h.encryptionService.DecryptMessage(msg.EncryptedText)
+			if decErr != nil {
+				continue // undecryptable rows are unsearchable
+			}
+
+			// Structured payloads (voice/image/video/gif/sound/call/view-once)
+			// carry no free text → not searchable; view_once always excluded.
+			searchable := decryptedText
+			trimmed := strings.TrimSpace(decryptedText)
+			if strings.HasPrefix(trimmed, "{") {
+				var payload map[string]interface{}
+				if json.Unmarshal([]byte(trimmed), &payload) == nil {
+					if payload["view_once"] == true {
+						continue
+					}
+					if _, isTyped := payload["type"]; isTyped {
+						continue
+					}
+				}
+			}
+			if !strings.Contains(strings.ToLower(searchable), qLower) {
+				continue
+			}
+
+			// Row JSON — same shape as GetMessages.
+			responseMessage := gin.H{
+				"id":                  msg.ID,
+				"sender_id":           msg.SenderID,
+				"receiver_id":         msg.ReceiverID,
+				"story_id":            msg.StoryID,
+				"reply_to_message_id": msg.ReplyToMessageID,
+				"text":                decryptedText,
+				"read":                msg.Read,
+				"delivered":           msg.Delivered,
+				"is_edited":           msg.IsEdited,
+				"sender_reaction":     msg.SenderReaction,
+				"receiver_reaction":   msg.ReceiverReaction,
+				"is_starred_by_me":    starredByUser(userID, msg.SenderID, msg.StarredBySender, msg.StarredByReceiver),
+				"created_at":          msg.CreatedAt,
+				"updated_at":          msg.UpdatedAt,
+			}
+
+			if msg.StoryID != nil {
+				if msg.StoryType != nil {
+					storyResponse := gin.H{
+						"id":         *msg.StoryID,
+						"type":       *msg.StoryType,
+						"media_url":  utils.PrependS3URL(msg.StoryMediaURL),
+						"content":    msg.StoryContent,
+						"user_id":    *msg.StoryUserID,
+						"created_at": msg.StoryCreatedAt,
+						"available":  true,
+					}
+					if *msg.StoryType == "video" && msg.StoryMetadata != nil {
+						var metadata map[string]interface{}
+						if err := json.Unmarshal([]byte(*msg.StoryMetadata), &metadata); err == nil {
+							if thumbnailURL, exists := metadata["thumbnail_url"].(string); exists && thumbnailURL != "" {
+								storyResponse["thumbnail_url"] = utils.PrependS3URL(&thumbnailURL)
+							}
+						}
+					}
+					responseMessage["story"] = storyResponse
+				} else {
+					responseMessage["story"] = gin.H{
+						"id":        *msg.StoryID,
+						"available": false,
+						"message":   "Bu story artık mevcut değil",
+					}
+				}
+			}
+
+			if msg.ReplyToMessageID != nil && msg.ReplyToMessageText != nil {
+				replyDecryptedText, replyErr := h.encryptionService.DecryptMessage(*msg.ReplyToMessageText)
+				if replyErr != nil {
+					replyDecryptedText = "Mesaj çözülemedi"
+				}
+				responseMessage["reply_to_message"] = gin.H{
+					"id":         *msg.ReplyToMessageID,
+					"sender_id":  msg.ReplyToMessageSender,
+					"text":       replyDecryptedText,
+					"created_at": msg.ReplyToCreatedAt,
+				}
+			}
+
+			matches = append(matches, responseMessage)
+			if len(matches) >= limit {
+				break
+			}
+		}
+
+		// Stop on a full page of matches FIRST — if the limit filled midway
+		// through this batch, the remaining rows were not evaluated yet, so
+		// the history must NOT be marked exhausted (has_more stays true).
+		if len(matches) >= limit {
+			break
+		}
+		if len(rows) < searchBatchSize {
+			exhausted = true
+			break
+		}
+	}
+
+	// next_before_ms — created_at of the LAST SCANNED row (ms). The client
+	// resumes scanning from there whether or not this page found matches.
+	nextBeforeMs := beforeMs
+	if scanned > 0 {
+		nextBeforeMs = cursor.UnixMilli()
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data": gin.H{
+			"messages":       matches,
+			"has_more":       !exhausted,
+			"next_before_ms": nextBeforeMs,
+		},
 	})
 }
 

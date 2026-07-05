@@ -922,6 +922,28 @@ func (h *ConversationHandler) GetConversationDetails(c *gin.Context) {
 		canSendMessage = false
 	}
 
+	// User-blok (`user_blocks`) — indiyədək detala DÜŞMÜRDÜ (yalnız send
+	// yollarında models.IsBlocked ilə yoxlanırdı). Client-ə əlavə olaraq ötürülür:
+	//   blocked        → admin bloku VƏ YA istənilən istiqamətdə user bloku
+	//   blocked_by_me  → bloklayan MƏNƏM (client "engeli kaldır" göstərə bilsin).
+	// Qarşı tərəf məni bloklayıbsa yalnız generik "bağlandı" vəziyyəti görünür —
+	// səbəb açıqlanmır (WhatsApp davranışı). blocked_by_me YENİ sahədir; köhnə
+	// clientlər onu tanımır və davranışları dəyişmir.
+	var userBlocks []models.UserBlock
+	database.DB.Where(
+		"(blocker_id = ? AND blocked_id = ?) OR (blocker_id = ? AND blocked_id = ?)",
+		userID, otherUserID, otherUserID, userID,
+	).Find(&userBlocks)
+	blockedByMe := false
+	for _, b := range userBlocks {
+		if b.BlockerID == userID.(uint) {
+			blockedByMe = true
+		}
+	}
+	if len(userBlocks) > 0 {
+		canSendMessage = false
+	}
+
 	// Other user settings — scope'u buraya çek ki aşağıda da erişebilelim
 	allowVoiceMessages := true
 	showReadReceipts := true
@@ -995,7 +1017,8 @@ func (h *ConversationHandler) GetConversationDetails(c *gin.Context) {
 			"max_pending_messages": conversation.MaxPendingMessages,
 			"allow_voice_messages": allowVoiceMessages,
 			"show_read_receipts":   showReadReceipts,
-			"blocked":              conversation.Blocked,
+			"blocked":              conversation.Blocked || len(userBlocks) > 0,
+			"blocked_by_me":        blockedByMe,
 		},
 	}
 

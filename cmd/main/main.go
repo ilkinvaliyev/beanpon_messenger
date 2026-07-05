@@ -241,6 +241,8 @@ func main() {
 		api.POST("/messages", messageHandler.SendMessage)
 		api.POST("/messages/broadcast", messageHandler.BroadcastMessage)
 		api.GET("/messages/:user_id", messageHandler.GetMessages)
+		// In-chat DM search (WhatsApp-style) — additive, only new clients call it.
+		api.GET("/messages/:user_id/search", messageHandler.SearchMessages)
 		api.PUT("/messages/:message_id/read", messageHandler.MarkAsRead)
 		api.PUT("/messages/:message_id", messageHandler.EditMessage)
 		api.DELETE("/messages/:message_id", messageHandler.DeleteMessage)
