@@ -256,12 +256,86 @@ func (h *Hub) broadcastMessage(message *Message) {
 	if client, exists := h.clients[message.ReceiverID]; exists {
 		select {
 		case client.Send <- h.messageToBytes(message):
+			// Canlı new_message push-u BAĞLI alıcıya çatdısa (kanala yazıla
+			// bildi) → server tərəfdə dərhal delivered=true (WhatsApp davranışı,
+			// ani iki tick). Uğursuz göndərmə (default branch) bura düşmür.
+			h.maybeMarkLivePushDelivered(message)
 		default:
 			go func() {
 				h.unregister <- client
 			}()
 		}
 	}
+}
+
+// maybeMarkLivePushDelivered — canlı `new_message` push-u bağlı alıcının Send
+// kanalına uğurla yazıldıqda mesajı delivered=true işarələyir və göndərənə
+// `message_delivered` event-i göndərir. Client ack-i (`mark_delivered` frame-i,
+// bax handleMarkDelivered) push/offline gəlişlərini örtür; bu yol yalnız ani
+// iki tick üçündür. delivered=false şərti ikiqat emit-in qarşısını alır.
+func (h *Hub) maybeMarkLivePushDelivered(message *Message) {
+	if message.Type != "new_message" {
+		return
+	}
+
+	dataMap, ok := message.Data.(map[string]interface{})
+	if !ok {
+		return
+	}
+
+	// Tarixi mesajlar ayrı tiplə (history_message) gedir — yenə də qoruyucu.
+	if isHistory, _ := dataMap["is_history"].(bool); isHistory {
+		return
+	}
+
+	msgID, ok := dataMap["id"].(string)
+	if !ok || msgID == "" {
+		return
+	}
+	senderID, ok := dataMap["sender_id"].(uint)
+	if !ok {
+		return
+	}
+	receiverID, ok := dataMap["receiver_id"].(uint)
+	if !ok {
+		return
+	}
+
+	// new_message həm göndərənin echo-suna, həm alıcıya gedir — yalnız
+	// ALICININ nüsxəsində işarələ (göndərən echo-su delivered demək deyil).
+	if message.ReceiverID != receiverID {
+		return
+	}
+
+	// DB işi hub Run döngüsünü bloklamasın deyə goroutine-də. h app-ömürlü
+	// singleton-dur — retain/leak problemi yoxdur.
+	go func() {
+		res := h.db.Model(&models.Message{}).
+			Where("id = ? AND delivered = false", msgID).
+			Update("delivered", true)
+		if res.Error != nil {
+			log.Printf("live-push delivered işarələmə xətası: %v", res.Error)
+			return
+		}
+		if res.RowsAffected == 0 {
+			// WS göndərmə yolu mesajı DB-yə ASYNC yazır (readPump-dakı
+			// goroutine) — sətir hələ mövcud olmaya bilər. Bir dəfə qısa
+			// gözləyib təkrar yoxla; yenə 0 olsa (artıq delivered/read və ya
+			// sətir yoxdur) event getmir — client ack-i onsuz da örtəcək.
+			time.Sleep(1 * time.Second)
+			res = h.db.Model(&models.Message{}).
+				Where("id = ? AND delivered = false", msgID).
+				Update("delivered", true)
+			if res.Error != nil || res.RowsAffected == 0 {
+				return
+			}
+		}
+
+		h.SendToUser(senderID, "message_delivered", map[string]interface{}{
+			"other_user_id": receiverID,
+			"message_ids":   []string{msgID},
+		})
+	}()
 }
 
 // SendToUser belirli kullanıcıya mesaj gönder
@@ -953,6 +1027,24 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 
 		otherUserID := uint(otherUserIDFloat)
 		c.Hub.handleMarkRead(c.UserID, otherUserID)
+
+	case "mark_delivered":
+		// Mesajları ÇATDIRILDI (delivered) olaraq işaretle — iki tick.
+		// data.sender_id = mesajları GÖNDƏRƏN qarşı tərəf. Köhnə client-lər
+		// bu frame-i göndərmir (tam additiv).
+		dataMap, ok := msg.Data.(map[string]interface{})
+		if !ok {
+			log.Printf("mark_delivered data parse edilemedi")
+			return
+		}
+
+		senderIDFloat, ok := dataMap["sender_id"].(float64)
+		if !ok {
+			log.Printf("sender_id eksik veya geçersiz")
+			return
+		}
+
+		c.Hub.handleMarkDelivered(c.UserID, uint(senderIDFloat))
 
 	case "get_unread_count":
 		// ✅ YENİ: Client'ın talep ettiği durumda okunmamış sayıyı gönder
@@ -1745,10 +1837,12 @@ func (h *Hub) sendReactionPushNotification(reactorID, receiverID uint, emoji str
 
 // handleMarkRead kullanıcının mesajlarını okundu olarak işaretle
 func (h *Hub) handleMarkRead(readerID, otherUserID uint) {
-	// Bu conversation'daki okunmamış mesajları okundu olarak işaretle
+	// Bu conversation'daki okunmamış mesajları okundu olarak işaretle.
+	// Oxundu = çatdırıldı da (read implies delivered) — ayrıca message_delivered
+	// event-i lazım deyil, mövcud message_read göndərəni onsuz da xəbərdar edir.
 	result := h.db.Model(&models.Message{}).
 		Where("sender_id = ? AND receiver_id = ? AND read = false", otherUserID, readerID).
-		Update("read", true)
+		Updates(map[string]interface{}{"read": true, "delivered": true})
 
 	if result.Error != nil {
 		log.Printf("Mesajları okundu olarak işaretleme hatası: %v", result.Error)
@@ -1774,6 +1868,67 @@ func (h *Hub) handleMarkRead(readerID, otherUserID uint) {
 		log.Printf("Mesajlar okundu olarak işaretlendi: %d mesaj, reader: %d, sender: %d",
 			updatedCount, readerID, otherUserID)
 	}
+}
+
+// handleMarkDelivered — qarşı tərəfin (senderID) recipientID-yə göndərdiyi, hələ
+// çatdırılmamış mesajları delivered=true işarələyir və göndərənə
+// `message_delivered` event-i ilə bildirir (iki tick). Oxundu (read) ayrıca
+// axındır — bax handleMarkRead. Client `mark_delivered` frame-ini push/offline
+// gəlişlərində göndərir; canlı WS çatdırılması üçün bax maybeMarkLivePushDelivered.
+func (h *Hub) handleMarkDelivered(recipientID, senderID uint) {
+	// Əvvəlcə təsirlənəcək mesaj id-ləri (ən yenidən köhnəyə, maks 500) —
+	// event-də göndərmək üçün. 500-dən çox varsa HAMISI update olunur, amma
+	// event yalnız son 500 id + "all_before" daşıyır (client bulk tətbiq edir).
+	type deliveredRow struct {
+		ID        string    `gorm:"column:id"`
+		CreatedAt time.Time `gorm:"column:created_at"`
+	}
+	var rows []deliveredRow
+	if err := h.db.Model(&models.Message{}).
+		Select("id, created_at").
+		Where("sender_id = ? AND receiver_id = ? AND delivered = false", senderID, recipientID).
+		Order("created_at DESC").
+		Limit(500).
+		Scan(&rows).Error; err != nil {
+		log.Printf("mark_delivered id seçimi xətası: %v", err)
+		return
+	}
+
+	if len(rows) == 0 {
+		return
+	}
+
+	result := h.db.Model(&models.Message{}).
+		Where("sender_id = ? AND receiver_id = ? AND delivered = false", senderID, recipientID).
+		Update("delivered", true)
+
+	if result.Error != nil {
+		log.Printf("Mesajları delivered olarak işaretleme hatası: %v", result.Error)
+		return
+	}
+
+	if result.RowsAffected == 0 {
+		return
+	}
+
+	messageIDs := make([]string, 0, len(rows))
+	for _, r := range rows {
+		messageIDs = append(messageIDs, r.ID)
+	}
+
+	deliveredData := map[string]interface{}{
+		"other_user_id": recipientID,
+		"message_ids":   messageIDs,
+	}
+
+	// 500-dən çox təsirləndi → id siyahısı kəsilib. Ən yeni təsirlənən mesajın
+	// vaxtı verilir ki, client ondan ƏVVƏLKİ bütün mesajları delivered saysın.
+	if result.RowsAffected > int64(len(rows)) {
+		deliveredData["all_before"] = rows[0].CreatedAt.UTC().Format(time.RFC3339)
+	}
+
+	// Göndərən onlayn deyilsə SendToUser sadəcə heç nə etmir (clients map-də yoxdur).
+	h.SendToUser(senderID, "message_delivered", deliveredData)
 }
 
 // BroadcastScreenshotProtectionChange screenshot koruma değişikliğini her iki kullanıcıya bildir

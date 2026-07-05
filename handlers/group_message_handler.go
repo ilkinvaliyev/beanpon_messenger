@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"regexp"
@@ -129,6 +130,39 @@ func (h *GroupMessageHandler) SendGroupMessage(c *gin.Context) {
 	}
 	if participant.IsRestricted {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Mesaj gönderme yetkiniz kısıtlandı"})
+		return
+	}
+
+	// 🚫 SPAM SHADOW-BAN — 1:1 mesajlaşma ilə eyni məntiq.
+	//
+	// Yalnız spam_bans.actions sütununa baxılır (IsMessagingBannedByActions):
+	//   • actions = NULL                    → mesaj BLOKLANIR (bütün əməliyyatlar)
+	//   • actions massivində "message" var  → mesaj BLOKLANIR
+	//   • actions = ["post"], ["story"] və s. (message yox) → mesaj GEDƏ BİLƏR
+	//   • aktiv spam_ban qeydi yoxdur        → mesaj GEDƏ BİLƏR
+	//
+	// Davranış: shadow-ban — göndərənə uğurlu (201) sahte cavab qaytarılır,
+	// amma mesaj DB-yə YAZILMIR, WS ilə üzvlərə YAYILMIR, push GETMİR.
+	// Göndərən heç nə hiss etmir; digər üzvlər mesajı görmür.
+	if models.IsMessagingBannedByActions(database.DB, senderID) {
+		log.Printf("🚫 SPAM SHADOW-BAN (group): sender_id=%d → conversation_id=%d mesajı bloklandı (DB yazılmadı, WS yayılmadı, push yox)",
+			senderID, conversationID)
+		c.JSON(http.StatusCreated, gin.H{
+			"message": "Mesaj gönderildi",
+			"data": gin.H{
+				"id":                  uuid.New().String(),
+				"conversation_id":     conversationID,
+				"chat_type":           "group",
+				"sender_id":           senderID,
+				"text":                req.Text,
+				"reply_to_message_id": req.ReplyToMessageID,
+				"reply_to_message":    nil,
+				"is_edited":           false,
+				"is_starred_by_me":    false,
+				"reactions":           []gin.H{},
+				"created_at":          time.Now().UTC().Format(time.RFC3339),
+			},
+		})
 		return
 	}
 
@@ -836,6 +870,41 @@ func (h *GroupMessageHandler) markGroupMessagesRead(userID, conversationID uint)
 		"message_ids":     unreadIDs,
 		"read_at":         now,
 	})
+}
+
+// POST /api/v1/groups/:conversation_id/mark-read
+// MarkGroupConversationRead — qrupdakı bütün oxunmamış mesajları REST ilə
+// oxundu işarələ. GetGroupMessages-in oxundu yolu ilə EYNİ işi görür
+// (markGroupMessagesRead): message_reads insert + participant last_read
+// yeniləməsi + üzvlərə MÖVCUD `group_message_read` event-i + dismiss push.
+// İdempotentdir — oxunmamış yoxdursa heç nə etmir. Köhnə client-lər bu
+// endpoint-i çağırmır (tam additiv).
+func (h *GroupMessageHandler) MarkGroupConversationRead(c *gin.Context) {
+	userID := c.MustGet("user_id").(uint)
+
+	convID, err := strconv.ParseUint(c.Param("conversation_id"), 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz conversation_id"})
+		return
+	}
+	conversationID := uint(convID)
+
+	// Üzvlük yoxlaması — GetGroupMessages ilə eyni guard (PENDING dəvət
+	// mesajları oxuya bilməz → oxundu da işarələyə bilməz).
+	var me models.ConversationParticipant
+	err = database.DB.Where(
+		"conversation_id = ? AND user_id = ? AND deleted_at IS NULL AND COALESCE(invite_status, 'active') = 'active'",
+		conversationID, userID,
+	).First(&me).Error
+	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Bu grubun üyesi değilsiniz"})
+		return
+	}
+
+	// Sinxron çağırılır ki, client cavab alanda oxundu artıq qeydə alınsın.
+	h.markGroupMessagesRead(userID, conversationID)
+
+	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
 // findGroupMessage — qrup mesajını tap + üzvlüyü yoxla. Hər message-id əsaslı

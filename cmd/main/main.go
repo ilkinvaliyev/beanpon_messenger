@@ -254,6 +254,11 @@ func main() {
 		// inline reply (Quick Reply) bunu chağırır.
 		api.POST("/conversations/:other_user_id/mark-read", messageHandler.MarkConversationAsRead)
 
+		// Delta sync — reconnect zamanı buraxılmış DM dəyişikliklərini doldur
+		// (yeni mesaj / edit / read-delivered / silinmə). Yalnız yeni client-lər
+		// çağırır; köhnə client-lərə təsiri yoxdur (tam additiv).
+		api.GET("/messages/sync", messageHandler.SyncMessages)
+
 		api.DELETE("/conversations/:other_user_id/clear", messageHandler.ClearConversation)
 		api.DELETE("/conversations/clear-all", messageHandler.ClearAllMyMessages)
 
@@ -324,6 +329,9 @@ func main() {
 		// ── GROUP: Mesajlar ──────────────────────────────────────────────
 		api.POST("/groups/:conversation_id/messages", groupMsgHandler.SendGroupMessage)
 		api.GET("/groups/:conversation_id/messages", groupMsgHandler.GetGroupMessages)
+		// Qrupu REST ilə oxundu işarələ — WS/GetGroupMessages oxundu yolu ilə
+		// eyni iş (message_reads + last_read + group_message_read event-i).
+		api.POST("/groups/:conversation_id/mark-read", groupMsgHandler.MarkGroupConversationRead)
 		api.GET("/groups/:conversation_id/starred", groupMsgHandler.GetGroupStarred)
 		api.GET("/groups/messages/:message_id/reads", groupMsgHandler.GetMessageReads)
 		api.DELETE("/groups/messages/:message_id", groupMsgHandler.DeleteGroupMessage)

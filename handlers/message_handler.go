@@ -423,6 +423,7 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 		ReplyToMessageID     *string    `gorm:"column:reply_to_message_id"`
 		EncryptedText        string     `gorm:"column:encrypted_text"`
 		Read                 bool       `gorm:"column:read"`
+		Delivered            bool       `gorm:"column:delivered"` // ← YENİ (iki tick)
 		IsEdited             bool       `gorm:"column:is_edited"` // ← YENİ
 		SenderReaction       *string    `gorm:"column:sender_reaction"`
 		ReceiverReaction     *string    `gorm:"column:receiver_reaction"`
@@ -492,7 +493,8 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 			"reply_to_message_id": msg.ReplyToMessageID,
 			"text":                decryptedText,
 			"read":                msg.Read,
-			"is_edited":           msg.IsEdited, // ← YENİ
+			"delivered":           msg.Delivered, // ← YENİ (iki tick)
+			"is_edited":           msg.IsEdited,  // ← YENİ
 			"sender_reaction":     msg.SenderReaction,
 			"receiver_reaction":   msg.ReceiverReaction,
 			"is_starred_by_me":    starredByUser(userID.(uint), msg.SenderID, msg.StarredBySender, msg.StarredByReceiver),
@@ -609,6 +611,211 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 	})
 }
 
+// SyncMessages — delta sinxronizasiya (reconnect gap-fill).
+// GET /api/v1/messages/sync?since_ms=<int64>&limit=<int, default 200, max 500>
+//
+// Client (yeni iOS) reconnect-də son bildiyi server_time_ms ilə çağırır və
+// qayıdan mesajları id-yə görə upsert edir. Köhnə client-lər bu endpoint-i
+// heç vaxt çağırmır (tam additiv).
+//
+// Mexanizm — niyə `updated_at > since` hər dəyişikliyi tutur:
+//   - yeni mesaj: INSERT-də updated_at = created_at yazılır;
+//   - edit: EditMessage updated_at-ı açıq yeniləyir;
+//   - read/delivered: GORM Model().Update updated_at-ı avtomatik yeniləyir;
+//   - silinmə: DM-də HARD DELETE YOXDUR — DeleteMessage/ClearConversation
+//     is_deleted_by_sender/receiver flag-larını qoyub updated_at-ı yeniləyir.
+//     Ona görə mənim üçün silinmiş mesajlar da bu pəncərəyə düşür və
+//     `deleted_message_ids` siyahısında qaytarılır. (messages.deleted_at DM
+//     axınında heç vaxt yazılmır — yalnız qrup mesajı silinməsi istifadə edir;
+//     yenə də qoruyucu olaraq deleted_at dolu sətir silinmiş sayılır.)
+func (h *MessageHandler) SyncMessages(c *gin.Context) {
+	userIDVal, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+	userID := userIDVal.(uint)
+
+	sinceMs, err := strconv.ParseInt(c.DefaultQuery("since_ms", "0"), 10, 64)
+	if err != nil || sinceMs < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz since_ms"})
+		return
+	}
+
+	limit, err := strconv.Atoi(c.DefaultQuery("limit", "200"))
+	if err != nil || limit <= 0 {
+		limit = 200
+	}
+	if limit > 500 {
+		limit = 500
+	}
+
+	since := time.UnixMilli(sinceMs).UTC()
+
+	// GetMessages ilə eyni sütun dəsti + delete flag-ları (təsnifat üçün).
+	var rows []struct {
+		ID                   string     `gorm:"column:id"`
+		SenderID             uint       `gorm:"column:sender_id"`
+		ReceiverID           uint       `gorm:"column:receiver_id"`
+		StoryID              *uint      `gorm:"column:story_id"`
+		StoryMetadata        *string    `gorm:"column:story_metadata"`
+		ReplyToMessageID     *string    `gorm:"column:reply_to_message_id"`
+		EncryptedText        string     `gorm:"column:encrypted_text"`
+		Read                 bool       `gorm:"column:read"`
+		Delivered            bool       `gorm:"column:delivered"`
+		IsEdited             bool       `gorm:"column:is_edited"`
+		IsDeletedBySender    bool       `gorm:"column:is_deleted_by_sender"`
+		IsDeletedByReceiver  bool       `gorm:"column:is_deleted_by_receiver"`
+		DeletedAt            *time.Time `gorm:"column:deleted_at"`
+		SenderReaction       *string    `gorm:"column:sender_reaction"`
+		ReceiverReaction     *string    `gorm:"column:receiver_reaction"`
+		StarredBySender      bool       `gorm:"column:starred_by_sender"`
+		StarredByReceiver    bool       `gorm:"column:starred_by_receiver"`
+		CreatedAt            time.Time  `gorm:"column:created_at"`
+		UpdatedAt            time.Time  `gorm:"column:updated_at"`
+		ReplyToMessageText   *string    `gorm:"column:reply_to_message_text"`
+		ReplyToMessageSender *uint      `gorm:"column:reply_to_message_sender"`
+		ReplyToCreatedAt     *time.Time `gorm:"column:reply_to_created_at"`
+		StoryType            *string    `gorm:"column:story_type"`
+		StoryMediaURL        *string    `gorm:"column:story_media_url"`
+		StoryContent         *string    `gorm:"column:story_content"`
+		StoryUserID          *uint      `gorm:"column:story_user_id"`
+		StoryCreatedAt       *time.Time `gorm:"column:story_created_at"`
+	}
+
+	// conversation_id IS NULL → yalnız DM (qrup mesajları ayrı axındır).
+	// LIMIT limit+1 → has_more hesablamaq üçün.
+	query := `
+        SELECT
+            m.*,
+            reply.encrypted_text as reply_to_message_text,
+            reply.sender_id as reply_to_message_sender,
+            reply.created_at as reply_to_created_at,
+            s.type as story_type,
+            s.media_url as story_media_url,
+            s.content as story_content,
+            s.media_metadata as story_metadata,
+            s.user_id as story_user_id,
+            s.created_at as story_created_at
+        FROM messages m
+        LEFT JOIN messages reply ON m.reply_to_message_id = reply.id
+        LEFT JOIN stories s ON m.story_id = s.id
+        WHERE (m.sender_id = ? OR m.receiver_id = ?)
+        AND m.conversation_id IS NULL
+        AND m.updated_at > ?
+        ORDER BY m.updated_at ASC
+        LIMIT ?
+    `
+
+	if err := database.DB.Raw(query, userID, userID, since, limit+1).Scan(&rows).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Mesajlar alınamadı"})
+		return
+	}
+
+	hasMore := false
+	if len(rows) > limit {
+		hasMore = true
+		rows = rows[:limit]
+	}
+
+	nextSinceMs := sinceMs
+	responseMessages := make([]gin.H, 0, len(rows))
+	deletedMessageIDs := make([]string, 0)
+
+	for _, msg := range rows {
+		nextSinceMs = msg.UpdatedAt.UnixMilli()
+
+		// Mənim üçün silinmiş → mətn qaytarılmır, yalnız id (client silsin).
+		deletedForMe := msg.DeletedAt != nil ||
+			(msg.SenderID == userID && msg.IsDeletedBySender) ||
+			(msg.SenderID != userID && msg.IsDeletedByReceiver)
+		if deletedForMe {
+			deletedMessageIDs = append(deletedMessageIDs, msg.ID)
+			continue
+		}
+
+		decryptedText, err := h.encryptionService.DecryptMessage(msg.EncryptedText)
+		if err != nil {
+			decryptedText = "Mesaj çözülemedi"
+		}
+
+		responseMessage := gin.H{
+			"id":                  msg.ID,
+			"sender_id":           msg.SenderID,
+			"receiver_id":         msg.ReceiverID,
+			"story_id":            msg.StoryID,
+			"reply_to_message_id": msg.ReplyToMessageID,
+			"text":                decryptedText,
+			"read":                msg.Read,
+			"delivered":           msg.Delivered,
+			"is_edited":           msg.IsEdited,
+			"sender_reaction":     msg.SenderReaction,
+			"receiver_reaction":   msg.ReceiverReaction,
+			"is_starred_by_me":    starredByUser(userID, msg.SenderID, msg.StarredBySender, msg.StarredByReceiver),
+			"created_at":          msg.CreatedAt,
+			"updated_at":          msg.UpdatedAt,
+		}
+
+		if msg.StoryID != nil {
+			if msg.StoryType != nil {
+				storyResponse := gin.H{
+					"id":         *msg.StoryID,
+					"type":       *msg.StoryType,
+					"media_url":  utils.PrependS3URL(msg.StoryMediaURL),
+					"content":    msg.StoryContent,
+					"user_id":    *msg.StoryUserID,
+					"created_at": msg.StoryCreatedAt,
+					"available":  true,
+				}
+
+				if *msg.StoryType == "video" && msg.StoryMetadata != nil {
+					var metadata map[string]interface{}
+					if err := json.Unmarshal([]byte(*msg.StoryMetadata), &metadata); err == nil {
+						if thumbnailURL, exists := metadata["thumbnail_url"].(string); exists && thumbnailURL != "" {
+							storyResponse["thumbnail_url"] = utils.PrependS3URL(&thumbnailURL)
+						}
+					}
+				}
+
+				responseMessage["story"] = storyResponse
+			} else {
+				responseMessage["story"] = gin.H{
+					"id":        *msg.StoryID,
+					"available": false,
+					"message":   "Bu story artık mevcut değil",
+				}
+			}
+		}
+
+		if msg.ReplyToMessageID != nil && msg.ReplyToMessageText != nil {
+			replyDecryptedText, err := h.encryptionService.DecryptMessage(*msg.ReplyToMessageText)
+			if err != nil {
+				replyDecryptedText = "Mesaj çözülemedi"
+			}
+
+			responseMessage["reply_to_message"] = gin.H{
+				"id":         *msg.ReplyToMessageID,
+				"sender_id":  msg.ReplyToMessageSender,
+				"text":       replyDecryptedText,
+				"created_at": msg.ReplyToCreatedAt,
+			}
+		}
+
+		responseMessages = append(responseMessages, responseMessage)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data": gin.H{
+			"messages":            responseMessages,
+			"deleted_message_ids": deletedMessageIDs,
+			"server_time_ms":      time.Now().UTC().UnixMilli(),
+			"has_more":            hasMore,
+			"next_since_ms":       nextSinceMs,
+		},
+	})
+}
+
 // GetMessages belirli kullanıcı ile mesajları getir
 func (h *MessageHandler) GetMessagesOld(c *gin.Context) {
 	userID, exists := c.Get("user_id")
@@ -711,11 +918,11 @@ func (h *MessageHandler) markReceivedMessagesAsRead(currentUserID, otherUserID u
 		return
 	}
 
-	// Okundu olarak işaretle
+	// Okundu olarak işaretle. Oxundu = çatdırıldı da (read implies delivered).
 	database.DB.Model(&models.Message{}).Where(
 		"sender_id = ? AND receiver_id = ? AND read = false",
 		otherUserID, currentUserID,
-	).Update("read", true)
+	).Updates(map[string]interface{}{"read": true, "delivered": true})
 
 	// Her mesaj için WebSocket bildirimi gönder
 	for _, msg := range unreadMessages {
@@ -756,8 +963,9 @@ func (h *MessageHandler) MarkAsRead(c *gin.Context) {
 		return
 	}
 
-	// Okundu olarak işaretle
+	// Okundu olarak işaretle. Oxundu = çatdırıldı da (read implies delivered).
 	message.Read = true
+	message.Delivered = true
 	message.UpdatedAt = time.Now().UTC()
 
 	if err := database.DB.Save(&message).Error; err != nil {
@@ -809,10 +1017,12 @@ func (h *MessageHandler) MarkConversationAsRead(c *gin.Context) {
 	}
 
 	now := time.Now().UTC()
+	// Oxundu = çatdırıldı da (read implies delivered) — ayrıca event lazım deyil.
 	result := database.DB.Model(&models.Message{}).
 		Where("sender_id = ? AND receiver_id = ? AND read = false", otherID, readerID).
 		Updates(map[string]interface{}{
 			"read":       true,
+			"delivered":  true,
 			"updated_at": now,
 		})
 
@@ -857,14 +1067,17 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 	archivedFilter := c.DefaultQuery("archived", "false")
 
 	var conversations []struct {
-		OtherUserID        uint      `json:"other_user_id"`
-		LastMessageID      string    `json:"last_message_id"`
-		LastMessageText    string    `json:"last_message_text"`
-		LastMessageTime    time.Time `json:"last_message_time"`
-		IsLastFromMe       bool      `json:"is_last_from_me"`
-		LastMessageRead    *bool     `json:"last_message_read"`
-		UnreadCount        int       `json:"unread_count"`
-		ConversationStatus string    `json:"conversation_status"`
+		OtherUserID     uint      `json:"other_user_id"`
+		LastMessageID   string    `json:"last_message_id"`
+		LastMessageText string    `json:"last_message_text"`
+		LastMessageTime time.Time `json:"last_message_time"`
+		IsLastFromMe    bool      `json:"is_last_from_me"`
+		LastMessageRead *bool     `json:"last_message_read"`
+		// ← YENİ (additiv): son mesaj məndəndirsə, çatdırılıb-çatdırılmadığı
+		// (iki tick). Köhnə client-lər bu sahəni sadəcə görmür.
+		LastMessageDelivered *bool  `json:"last_message_delivered"`
+		UnreadCount          int    `json:"unread_count"`
+		ConversationStatus   string `json:"conversation_status"`
 
 		ConversationID     *uint      `json:"conversation_id"`
 		MyMessageCount     *int       `json:"my_message_count"`
@@ -966,6 +1179,7 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
             created_at,
             sender_id = ? as is_from_me,
             read,
+            delivered,
             ROW_NUMBER() OVER (
                 PARTITION BY CASE WHEN sender_id = ? THEN receiver_id ELSE sender_id END 
                 ORDER BY created_at DESC
@@ -996,10 +1210,14 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
         lm.encrypted_text as last_message_text,
         lm.created_at as last_message_time,
         lm.is_from_me,
-        CASE 
+        CASE
             WHEN lm.is_from_me = true THEN lm.read
             ELSE NULL
         END as last_message_read,
+        CASE
+            WHEN lm.is_from_me = true THEN lm.delivered
+            ELSE NULL
+        END as last_message_delivered,
         COALESCE(uc.unread_count, 0) as unread_count,
         COALESCE(conv.status, 'active') as conversation_status,
         conv.id as conversation_id,
@@ -1198,6 +1416,7 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 			"last_message_time":        conv.LastMessageTime,
 			"is_last_from_me":          conv.IsLastFromMe,
 			"last_message_read":        conv.LastMessageRead,
+			"last_message_delivered":   conv.LastMessageDelivered,
 			"unread_count":             conv.UnreadCount,
 			"is_online":                isOnline,
 			"conversation_active":      conversationActive,
