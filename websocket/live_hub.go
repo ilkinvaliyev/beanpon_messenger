@@ -23,6 +23,7 @@ type LiveRoomClient struct {
 	RoomID     uint
 	Role       string
 	Name       string
+	Username   string
 	Avatar     *string
 	AvatarType *string
 	IsGhost    bool
@@ -467,7 +468,12 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		senderName := "User"
 		var senderAvatar *string
 		if senderExists {
-			senderName = senderClient.Name
+			// Chat-də ad yerine username göstərilir (boşdursa ada fallback).
+			if senderClient.Username != "" {
+				senderName = senderClient.Username
+			} else {
+				senderName = senderClient.Name
+			}
 			if senderClient.Avatar != nil {
 				avatar := *senderClient.Avatar
 				senderAvatar = &avatar
@@ -485,7 +491,7 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 			}
 			var rr replyRow
 			err := database.DB.Table("live_room_messages lm").
-				Select("lm.id, lm.text, lm.sender_id, u.name as sender_name, p.profile_image as sender_avatar").
+				Select("lm.id, lm.text, lm.sender_id, u.username as sender_name, p.profile_image as sender_avatar").
 				Joins("LEFT JOIN users u ON u.id = lm.sender_id").
 				Joins("LEFT JOIN profiles p ON p.user_id = lm.sender_id").
 				Where("lm.id = ?", *replyToID).
@@ -646,7 +652,12 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		var senderAvatar *string = nil
 
 		if senderExists {
-			senderName = senderClient.Name
+			// Chat-də ad yerine username göstərilir (boşdursa ada fallback).
+			if senderClient.Username != "" {
+				senderName = senderClient.Username
+			} else {
+				senderName = senderClient.Name
+			}
 			if senderClient.Avatar != nil {
 				avatar := *senderClient.Avatar
 				senderAvatar = &avatar

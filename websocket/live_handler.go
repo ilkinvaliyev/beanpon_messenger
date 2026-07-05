@@ -90,6 +90,7 @@ func (h *LiveHub) HandleWebSocket(c *gin.Context) {
 
 	type SenderInfo struct {
 		Name             string
+		Username         string
 		ProfileImage     *string
 		ProfileImageType *string
 		IsGhost          bool
@@ -97,7 +98,7 @@ func (h *LiveHub) HandleWebSocket(c *gin.Context) {
 	}
 	var senderInfo SenderInfo
 	database.DB.Table("users").
-		Select("users.name, users.is_ghost, users.live_spam, profiles.profile_image, profiles.profile_image_type").
+		Select("users.name, users.username, users.is_ghost, users.live_spam, profiles.profile_image, profiles.profile_image_type").
 		Joins("left join profiles on profiles.user_id = users.id").
 		Where("users.id = ?", userID).
 		Scan(&senderInfo)
@@ -109,6 +110,7 @@ func (h *LiveHub) HandleWebSocket(c *gin.Context) {
 		RoomID:     uint(roomID),
 		Role:       participant.Role,
 		Name:       senderInfo.Name,
+		Username:   senderInfo.Username,
 		Avatar:     senderInfo.ProfileImage,
 		AvatarType: senderInfo.ProfileImageType,
 		IsGhost:    senderInfo.IsGhost,
@@ -276,12 +278,12 @@ func (h *LiveHub) GetLiveRoomMessages(c *gin.Context) {
 
 	query := database.DB.Table("live_room_messages lm").
 		Select(`lm.id, lm.text, lm.gif_url, lm.image_url, lm.sound_url, lm.sound_id, lm.sender_id, lm.created_at, lm.reply_to_id,
-		u.name as sender_name,
+		u.username as sender_name,
 		p.profile_image as sender_avatar,
 		p.profile_image_type as sender_avatar_type,
 		rm.text as reply_text,
 		rm.sender_id as reply_sender_id,
-		ru.name as reply_sender_name,
+		ru.username as reply_sender_name,
 		rp.profile_image as reply_sender_avatar,
 		rp.profile_image_type as reply_sender_avatar_type`).
 		Joins("LEFT JOIN users u ON u.id = lm.sender_id").
