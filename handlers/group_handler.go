@@ -528,13 +528,8 @@ func (h *GroupHandler) PreviewByToken(c *gin.Context) {
 			SELECT b.icon_url
 			FROM badges b
 			WHERE b.is_active AND b.is_special
-			  AND (
-				b.id = u.selected_badge_id
-				OR (u.selected_badge_id IS NULL AND EXISTS (
-					SELECT 1 FROM user_badges ub WHERE ub.user_id = u.id AND ub.badge_id = b.id
-				))
-			  )
-			ORDER BY (b.id = u.selected_badge_id) DESC NULLS LAST, b.priority DESC
+			  AND b.id = u.selected_badge_id
+			ORDER BY b.priority DESC
 			LIMIT 1
 		) member_badge ON u.is_verified = true
 		LEFT JOIN profiles p ON p.user_id = cp.user_id
@@ -1140,13 +1135,8 @@ func (h *GroupHandler) GetMembers(c *gin.Context) {
 			SELECT b.icon_url
 			FROM badges b
 			WHERE b.is_active AND b.is_special
-			  AND (
-				b.id = u.selected_badge_id
-				OR (u.selected_badge_id IS NULL AND EXISTS (
-					SELECT 1 FROM user_badges ub WHERE ub.user_id = u.id AND ub.badge_id = b.id
-				))
-			  )
-			ORDER BY (b.id = u.selected_badge_id) DESC NULLS LAST, b.priority DESC
+			  AND b.id = u.selected_badge_id
+			ORDER BY b.priority DESC
 			LIMIT 1
 		) member_badge ON u.is_verified = true
 		LEFT JOIN profiles p ON p.user_id = cp.user_id
