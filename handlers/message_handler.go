@@ -1359,11 +1359,14 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 		MaxPendingMessages *int       `json:"max_pending_messages"`
 		Blocked            *bool      `json:"blocked"`
 
-		OtherUserName       string  `json:"other_user_name"`
-		OtherUserUsername   string  `json:"other_user_username"`
-		OtherUserIsVerified bool    `json:"other_user_is_verified"`
-		AccountTypeID       int     `json:"account_type_id"`
-		ProfileImage        *string `json:"profile_image"`
+		OtherUserName       string `json:"other_user_name"`
+		OtherUserUsername   string `json:"other_user_username"`
+		OtherUserIsVerified bool   `json:"other_user_is_verified"`
+		// YENİ (additiv): verified user-in seçilmiş/sahib olduğu special badge icon URL-i.
+		// is_verified=false olduqda LATERAL boş qalır → null.
+		OtherUserSpecialBadgeIconURL *string `json:"other_user_special_badge_icon_url" gorm:"column:other_user_special_badge_icon_url"`
+		AccountTypeID                int     `json:"account_type_id"`
+		ProfileImage                 *string `json:"profile_image"`
 
 		AllowVoiceMessages bool `json:"allow_voice_messages"`
 		ShowReadReceipts   bool `json:"show_read_receipts"`
@@ -1547,6 +1550,7 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
         u.username as other_user_username,
         u.account_type_id,
         u.is_verified as other_user_is_verified,
+        other_badge.icon_url as other_user_special_badge_icon_url,
         p.profile_image,
         COALESCE(us.allow_voice_messages, true) as allow_voice_messages,
         COALESCE(us.show_read_receipts, true) as show_read_receipts,
@@ -1556,6 +1560,19 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
     FROM latest_messages lm
     LEFT JOIN unread_counts uc ON lm.other_user_id = uc.other_user_id
     LEFT JOIN users u ON u.id = lm.other_user_id
+    LEFT JOIN LATERAL (
+        SELECT b.icon_url
+        FROM badges b
+        WHERE b.is_active AND b.is_special
+          AND (
+            b.id = u.selected_badge_id
+            OR (u.selected_badge_id IS NULL AND EXISTS (
+                SELECT 1 FROM user_badges ub WHERE ub.user_id = u.id AND ub.badge_id = b.id
+            ))
+          )
+        ORDER BY (b.id = u.selected_badge_id) DESC NULLS LAST, b.priority DESC
+        LIMIT 1
+    ) other_badge ON u.is_verified = true
     LEFT JOIN profiles p ON p.user_id = lm.other_user_id
     LEFT JOIN user_settings us ON us.user_id = lm.other_user_id
     LEFT JOIN conversations conv ON (
@@ -1667,29 +1684,30 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 		}
 
 		responseData := gin.H{
-			"other_user_id":            conv.OtherUserID,
-			"other_user_name":          conv.OtherUserName,
-			"other_user_username":      conv.OtherUserUsername,
-			"other_user_is_verified":   conv.OtherUserIsVerified,
-			"account_type_id":          conv.AccountTypeID,
-			"last_reaction_emoji":      conv.LastReactionEmoji,
-			"last_reaction_at":         conv.LastReactionAt,
-			"last_reaction_by_user_id": conv.LastReactionByUserID,
-			"profile_image":            utils.PrependBaseURL(conv.ProfileImage),
-			"last_message_id":          conv.LastMessageID,
-			"last_message_text":        decryptedText,
-			"last_message_time":        conv.LastMessageTime,
-			"is_last_from_me":          conv.IsLastFromMe,
-			"last_message_read":        conv.LastMessageRead,
-			"last_message_delivered":   conv.LastMessageDelivered,
-			"unread_count":             conv.UnreadCount,
-			"is_online":                isOnline,
-			"conversation_active":      conversationActive,
-			"is_archived_by_me":        isArchivedByMe,
-			"is_pinned_by_me":          isPinnedByMe,
-			"pinned_at":                conv.PinnedAt,
-			"my_nickname":              conv.MyNickname,
-			"my_wallpaper_id":          conv.MyWallpaperID,
+			"other_user_id":                     conv.OtherUserID,
+			"other_user_name":                   conv.OtherUserName,
+			"other_user_username":               conv.OtherUserUsername,
+			"other_user_is_verified":            conv.OtherUserIsVerified,
+			"other_user_special_badge_icon_url": conv.OtherUserSpecialBadgeIconURL,
+			"account_type_id":                   conv.AccountTypeID,
+			"last_reaction_emoji":               conv.LastReactionEmoji,
+			"last_reaction_at":                  conv.LastReactionAt,
+			"last_reaction_by_user_id":          conv.LastReactionByUserID,
+			"profile_image":                     utils.PrependBaseURL(conv.ProfileImage),
+			"last_message_id":                   conv.LastMessageID,
+			"last_message_text":                 decryptedText,
+			"last_message_time":                 conv.LastMessageTime,
+			"is_last_from_me":                   conv.IsLastFromMe,
+			"last_message_read":                 conv.LastMessageRead,
+			"last_message_delivered":            conv.LastMessageDelivered,
+			"unread_count":                      conv.UnreadCount,
+			"is_online":                         isOnline,
+			"conversation_active":               conversationActive,
+			"is_archived_by_me":                 isArchivedByMe,
+			"is_pinned_by_me":                   isPinnedByMe,
+			"pinned_at":                         conv.PinnedAt,
+			"my_nickname":                       conv.MyNickname,
+			"my_wallpaper_id":                   conv.MyWallpaperID,
 			"conversation": gin.H{
 				"id":                   conv.ConversationID,
 				"status":               conv.ConversationStatus,
@@ -2429,7 +2447,9 @@ func (h *MessageHandler) GetShareRecipients(c *gin.Context) {
 		Username     string  `json:"username"`
 		ProfileImage *string `json:"profile_image"`
 		IsVerified   bool    `json:"is_verified"`
-		Score        float64 `json:"score"`
+		// YENİ (additiv): verified user-in special badge icon URL-i (null ola bilər).
+		SpecialBadgeIconURL *string `json:"special_badge_icon_url" gorm:"column:special_badge_icon_url"`
+		Score               float64 `json:"score"`
 	}
 
 	// Birbaşa messages cədvəlindən: current user-in göndərdiyi mesajlar
@@ -2448,15 +2468,29 @@ SELECT
     u.username,
     p.profile_image,
     u.is_verified,
+    sender_badge.icon_url AS special_badge_icon_url,
     EXTRACT(EPOCH FROM MAX(m.created_at)) AS score
 FROM messages m
 INNER JOIN users u ON u.id = m.receiver_id
+LEFT JOIN LATERAL (
+    SELECT b.icon_url
+    FROM badges b
+    WHERE b.is_active AND b.is_special
+      AND (
+        b.id = u.selected_badge_id
+        OR (u.selected_badge_id IS NULL AND EXISTS (
+            SELECT 1 FROM user_badges ub WHERE ub.user_id = u.id AND ub.badge_id = b.id
+        ))
+      )
+    ORDER BY (b.id = u.selected_badge_id) DESC NULLS LAST, b.priority DESC
+    LIMIT 1
+) sender_badge ON u.is_verified = true
 LEFT JOIN profiles p ON p.user_id = m.receiver_id
 WHERE m.sender_id = ?
   AND m.receiver_id IS NOT NULL
   AND m.deleted_at IS NULL
   AND COALESCE(m.is_deleted_by_sender, false) = false
-GROUP BY m.receiver_id, u.name, u.username, p.profile_image, u.is_verified
+GROUP BY m.receiver_id, u.name, u.username, p.profile_image, u.is_verified, sender_badge.icon_url
 ORDER BY MAX(m.created_at) DESC, COUNT(*) DESC
 LIMIT ? OFFSET ?`
 

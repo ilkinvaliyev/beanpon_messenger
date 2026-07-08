@@ -257,10 +257,26 @@ func (h *GroupMessageHandler) SendGroupMessage(c *gin.Context) {
 		Username     string  `json:"username"`
 		IsVerified   bool    `json:"is_verified"`
 		ProfileImage *string `json:"profile_image"`
+		// YENİ (additiv): verified sender-in special badge icon URL-i (null ola bilər).
+		SpecialBadgeIconURL *string `gorm:"column:special_badge_icon_url"`
 	}
 	database.DB.Raw(`
-		SELECT u.name, u.username, u.is_verified, p.profile_image
+		SELECT u.name, u.username, u.is_verified, p.profile_image,
+			sender_badge.icon_url AS special_badge_icon_url
 		FROM users u
+		LEFT JOIN LATERAL (
+			SELECT b.icon_url
+			FROM badges b
+			WHERE b.is_active AND b.is_special
+			  AND (
+				b.id = u.selected_badge_id
+				OR (u.selected_badge_id IS NULL AND EXISTS (
+					SELECT 1 FROM user_badges ub WHERE ub.user_id = u.id AND ub.badge_id = b.id
+				))
+			  )
+			ORDER BY (b.id = u.selected_badge_id) DESC NULLS LAST, b.priority DESC
+			LIMIT 1
+		) sender_badge ON u.is_verified = true
 		LEFT JOIN profiles p ON p.user_id = u.id
 		WHERE u.id = ?
 	`, senderID).Scan(&senderInfo)
@@ -277,22 +293,39 @@ func (h *GroupMessageHandler) SendGroupMessage(c *gin.Context) {
 				Username     string  `gorm:"column:username"`
 				IsVerified   bool    `gorm:"column:is_verified"`
 				ProfileImage *string `gorm:"column:profile_image"`
+				// YENİ (additiv): verified reply sender-in special badge icon URL-i.
+				SpecialBadgeIconURL *string `gorm:"column:special_badge_icon_url"`
 			}
 			database.DB.Raw(`
-				SELECT u.username, u.is_verified, p.profile_image
+				SELECT u.username, u.is_verified, p.profile_image,
+					reply_badge.icon_url AS special_badge_icon_url
 				FROM users u
+				LEFT JOIN LATERAL (
+					SELECT b.icon_url
+					FROM badges b
+					WHERE b.is_active AND b.is_special
+					  AND (
+						b.id = u.selected_badge_id
+						OR (u.selected_badge_id IS NULL AND EXISTS (
+							SELECT 1 FROM user_badges ub WHERE ub.user_id = u.id AND ub.badge_id = b.id
+						))
+					  )
+					ORDER BY (b.id = u.selected_badge_id) DESC NULLS LAST, b.priority DESC
+					LIMIT 1
+				) reply_badge ON u.is_verified = true
 				LEFT JOIN profiles p ON p.user_id = u.id
 				WHERE u.id = ?
 			`, replyMsg.SenderID).Scan(&replySender)
 
 			replyData = map[string]interface{}{
-				"id":                 replyMsg.ID,
-				"sender_id":          replyMsg.SenderID,
-				"sender_username":    replySender.Username,
-				"sender_is_verified": replySender.IsVerified,
-				"sender_avatar":      utils.PrependBaseURL(replySender.ProfileImage),
-				"text":               replyDecrypted,
-				"created_at":         replyMsg.CreatedAt,
+				"id":                            replyMsg.ID,
+				"sender_id":                     replyMsg.SenderID,
+				"sender_username":               replySender.Username,
+				"sender_is_verified":            replySender.IsVerified,
+				"sender_special_badge_icon_url": replySender.SpecialBadgeIconURL,
+				"sender_avatar":                 utils.PrependBaseURL(replySender.ProfileImage),
+				"text":                          replyDecrypted,
+				"created_at":                    replyMsg.CreatedAt,
 			}
 		}
 	}
@@ -300,17 +333,18 @@ func (h *GroupMessageHandler) SendGroupMessage(c *gin.Context) {
 	// Tüm üyelere WebSocket ile gönder
 	memberIDs := getGroupParticipantIDs(conversationID)
 	wsPayload := map[string]interface{}{
-		"id":                  messageID,
-		"conversation_id":     conversationID,
-		"chat_type":           "group",
-		"sender_id":           senderID,
-		"sender_name":         senderInfo.Name,
-		"sender_username":     senderInfo.Username,
-		"sender_is_verified":  senderInfo.IsVerified,
-		"sender_avatar":       utils.PrependBaseURL(senderInfo.ProfileImage),
-		"text":                req.Text,
-		"reply_to_message_id": req.ReplyToMessageID,
-		"reply_to_message":    replyData,
+		"id":                            messageID,
+		"conversation_id":               conversationID,
+		"chat_type":                     "group",
+		"sender_id":                     senderID,
+		"sender_name":                   senderInfo.Name,
+		"sender_username":               senderInfo.Username,
+		"sender_is_verified":            senderInfo.IsVerified,
+		"sender_special_badge_icon_url": senderInfo.SpecialBadgeIconURL,
+		"sender_avatar":                 utils.PrependBaseURL(senderInfo.ProfileImage),
+		"text":                          req.Text,
+		"reply_to_message_id":           req.ReplyToMessageID,
+		"reply_to_message":              replyData,
 		// Flutter parse tutarlılığı — GetGroupMessages item formatı ilə eyni.
 		"is_edited":        false,
 		"is_starred_by_me": false,
@@ -548,23 +582,27 @@ func (h *GroupMessageHandler) GetGroupMessages(c *gin.Context) {
 	}
 
 	var messages []struct {
-		ID               string    `gorm:"column:id"`
-		SenderID         uint      `gorm:"column:sender_id"`
-		SenderName       string    `gorm:"column:sender_name"`
-		SenderUsername   string    `gorm:"column:sender_username"`
-		SenderIsVerified bool      `gorm:"column:sender_is_verified"`
-		SenderAvatar     *string   `gorm:"column:sender_avatar"`
-		EncryptedText    string    `gorm:"column:encrypted_text"`
-		ReplyToMessageID *string   `gorm:"column:reply_to_message_id"`
-		ReplyText        *string   `gorm:"column:reply_text"`
-		ReplyToSenderID  *uint     `gorm:"column:reply_to_sender_id"`
-		ReplyUsername    *string   `gorm:"column:reply_username"`
-		ReplyIsVerified  *bool     `gorm:"column:reply_is_verified"`
-		ReplyAvatar      *string   `gorm:"column:reply_avatar"`
-		ReadCount        int       `gorm:"column:read_count"`
-		IsEdited         bool      `gorm:"column:is_edited"`
-		IsStarredByMe    bool      `gorm:"column:is_starred_by_me"`
-		CreatedAt        time.Time `gorm:"column:created_at"`
+		ID               string `gorm:"column:id"`
+		SenderID         uint   `gorm:"column:sender_id"`
+		SenderName       string `gorm:"column:sender_name"`
+		SenderUsername   string `gorm:"column:sender_username"`
+		SenderIsVerified bool   `gorm:"column:sender_is_verified"`
+		// YENİ (additiv): verified sender-in special badge icon URL-i (null ola bilər).
+		SenderSpecialBadgeIconURL *string `gorm:"column:sender_special_badge_icon_url"`
+		SenderAvatar              *string `gorm:"column:sender_avatar"`
+		EncryptedText             string  `gorm:"column:encrypted_text"`
+		ReplyToMessageID          *string `gorm:"column:reply_to_message_id"`
+		ReplyText                 *string `gorm:"column:reply_text"`
+		ReplyToSenderID           *uint   `gorm:"column:reply_to_sender_id"`
+		ReplyUsername             *string `gorm:"column:reply_username"`
+		ReplyIsVerified           *bool   `gorm:"column:reply_is_verified"`
+		// YENİ (additiv): verified reply sender-in special badge icon URL-i.
+		ReplySpecialBadgeIconURL *string   `gorm:"column:reply_special_badge_icon_url"`
+		ReplyAvatar              *string   `gorm:"column:reply_avatar"`
+		ReadCount                int       `gorm:"column:read_count"`
+		IsEdited                 bool      `gorm:"column:is_edited"`
+		IsStarredByMe            bool      `gorm:"column:is_starred_by_me"`
+		CreatedAt                time.Time `gorm:"column:created_at"`
 	}
 
 	database.DB.Raw(`
@@ -574,6 +612,7 @@ func (h *GroupMessageHandler) GetGroupMessages(c *gin.Context) {
 			u.name as sender_name,
 			u.username as sender_username,
 			u.is_verified as sender_is_verified,
+			sender_badge.icon_url as sender_special_badge_icon_url,
 			p.profile_image as sender_avatar,
 			m.encrypted_text,
 			m.reply_to_message_id,
@@ -581,6 +620,7 @@ func (h *GroupMessageHandler) GetGroupMessages(c *gin.Context) {
 			reply.sender_id as reply_to_sender_id,
 			reply_u.username as reply_username,
 			reply_u.is_verified as reply_is_verified,
+			reply_badge.icon_url as reply_special_badge_icon_url,
 			reply_p.profile_image as reply_avatar,
 			(SELECT COUNT(*) FROM message_reads mr WHERE mr.message_id = m.id AND mr.user_id != m.sender_id) as read_count,
 			m.is_edited,
@@ -591,9 +631,35 @@ func (h *GroupMessageHandler) GetGroupMessages(c *gin.Context) {
 			m.created_at
 		FROM messages m
 		JOIN users u ON u.id = m.sender_id
+		LEFT JOIN LATERAL (
+			SELECT b.icon_url
+			FROM badges b
+			WHERE b.is_active AND b.is_special
+			  AND (
+				b.id = u.selected_badge_id
+				OR (u.selected_badge_id IS NULL AND EXISTS (
+					SELECT 1 FROM user_badges ub WHERE ub.user_id = u.id AND ub.badge_id = b.id
+				))
+			  )
+			ORDER BY (b.id = u.selected_badge_id) DESC NULLS LAST, b.priority DESC
+			LIMIT 1
+		) sender_badge ON u.is_verified = true
 		LEFT JOIN profiles p ON p.user_id = m.sender_id
 		LEFT JOIN messages reply ON reply.id = m.reply_to_message_id
 		LEFT JOIN users reply_u ON reply_u.id = reply.sender_id
+		LEFT JOIN LATERAL (
+			SELECT b.icon_url
+			FROM badges b
+			WHERE b.is_active AND b.is_special
+			  AND (
+				b.id = reply_u.selected_badge_id
+				OR (reply_u.selected_badge_id IS NULL AND EXISTS (
+					SELECT 1 FROM user_badges ub WHERE ub.user_id = reply_u.id AND ub.badge_id = b.id
+				))
+			  )
+			ORDER BY (b.id = reply_u.selected_badge_id) DESC NULLS LAST, b.priority DESC
+			LIMIT 1
+		) reply_badge ON reply_u.is_verified = true
 		LEFT JOIN profiles reply_p ON reply_p.user_id = reply.sender_id
 		WHERE m.conversation_id = ?
 		  AND m.deleted_at IS NULL
@@ -687,20 +753,21 @@ func (h *GroupMessageHandler) GetGroupMessages(c *gin.Context) {
 		}
 
 		item := gin.H{
-			"id":                  msg.ID,
-			"conversation_id":     conversationID,
-			"sender_id":           msg.SenderID,
-			"sender_name":         msg.SenderName,
-			"sender_username":     msg.SenderUsername,
-			"sender_is_verified":  msg.SenderIsVerified,
-			"sender_avatar":       utils.PrependBaseURL(msg.SenderAvatar),
-			"text":                text,
-			"reply_to_message_id": msg.ReplyToMessageID,
-			"read_count":          msg.ReadCount,
-			"is_edited":           msg.IsEdited,
-			"is_starred_by_me":    msg.IsStarredByMe,
-			"reactions":           reactions,
-			"created_at":          msg.CreatedAt,
+			"id":                            msg.ID,
+			"conversation_id":               conversationID,
+			"sender_id":                     msg.SenderID,
+			"sender_name":                   msg.SenderName,
+			"sender_username":               msg.SenderUsername,
+			"sender_is_verified":            msg.SenderIsVerified,
+			"sender_special_badge_icon_url": msg.SenderSpecialBadgeIconURL,
+			"sender_avatar":                 utils.PrependBaseURL(msg.SenderAvatar),
+			"text":                          text,
+			"reply_to_message_id":           msg.ReplyToMessageID,
+			"read_count":                    msg.ReadCount,
+			"is_edited":                     msg.IsEdited,
+			"is_starred_by_me":              msg.IsStarredByMe,
+			"reactions":                     reactions,
+			"created_at":                    msg.CreatedAt,
 		}
 
 		if msg.ReplyToMessageID != nil && msg.ReplyText != nil {
@@ -714,13 +781,14 @@ func (h *GroupMessageHandler) GetGroupMessages(c *gin.Context) {
 				replyUsername = *msg.ReplyUsername
 			}
 			item["reply_to_message"] = gin.H{
-				"id":                 *msg.ReplyToMessageID,
-				"sender_id":          msg.ReplyToSenderID,
-				"sender_username":    replyUsername,
-				"sender_is_verified": replyVerified,
-				"sender_avatar":      utils.PrependBaseURL(msg.ReplyAvatar),
-				"text":               replyText,
-				"created_at":         msg.CreatedAt, // reply-də də tarix (Flutter parse crash olmasın)
+				"id":                            *msg.ReplyToMessageID,
+				"sender_id":                     msg.ReplyToSenderID,
+				"sender_username":               replyUsername,
+				"sender_is_verified":            replyVerified,
+				"sender_special_badge_icon_url": msg.ReplySpecialBadgeIconURL,
+				"sender_avatar":                 utils.PrependBaseURL(msg.ReplyAvatar),
+				"text":                          replyText,
+				"created_at":                    msg.CreatedAt, // reply-də də tarix (Flutter parse crash olmasın)
 			}
 		}
 
@@ -1306,15 +1374,17 @@ func (h *GroupMessageHandler) GetGroupStarred(c *gin.Context) {
 	}
 
 	var rows []struct {
-		ID               string    `gorm:"column:id"`
-		SenderID         uint      `gorm:"column:sender_id"`
-		SenderName       string    `gorm:"column:sender_name"`
-		SenderUsername   string    `gorm:"column:sender_username"`
-		SenderIsVerified bool      `gorm:"column:sender_is_verified"`
-		SenderAvatar     *string   `gorm:"column:sender_avatar"`
-		EncryptedText    string    `gorm:"column:encrypted_text"`
-		IsEdited         bool      `gorm:"column:is_edited"`
-		CreatedAt        time.Time `gorm:"column:created_at"`
+		ID               string `gorm:"column:id"`
+		SenderID         uint   `gorm:"column:sender_id"`
+		SenderName       string `gorm:"column:sender_name"`
+		SenderUsername   string `gorm:"column:sender_username"`
+		SenderIsVerified bool   `gorm:"column:sender_is_verified"`
+		// YENİ (additiv): verified sender-in special badge icon URL-i (null ola bilər).
+		SenderSpecialBadgeIconURL *string   `gorm:"column:sender_special_badge_icon_url"`
+		SenderAvatar              *string   `gorm:"column:sender_avatar"`
+		EncryptedText             string    `gorm:"column:encrypted_text"`
+		IsEdited                  bool      `gorm:"column:is_edited"`
+		CreatedAt                 time.Time `gorm:"column:created_at"`
 	}
 
 	database.DB.Raw(`
@@ -1324,6 +1394,7 @@ func (h *GroupMessageHandler) GetGroupStarred(c *gin.Context) {
 			u.name as sender_name,
 			u.username as sender_username,
 			u.is_verified as sender_is_verified,
+			sender_badge.icon_url as sender_special_badge_icon_url,
 			p.profile_image as sender_avatar,
 			m.encrypted_text,
 			m.is_edited,
@@ -1331,6 +1402,19 @@ func (h *GroupMessageHandler) GetGroupStarred(c *gin.Context) {
 		FROM group_message_stars gms
 		JOIN messages m ON m.id = gms.message_id
 		JOIN users u ON u.id = m.sender_id
+		LEFT JOIN LATERAL (
+			SELECT b.icon_url
+			FROM badges b
+			WHERE b.is_active AND b.is_special
+			  AND (
+				b.id = u.selected_badge_id
+				OR (u.selected_badge_id IS NULL AND EXISTS (
+					SELECT 1 FROM user_badges ub WHERE ub.user_id = u.id AND ub.badge_id = b.id
+				))
+			  )
+			ORDER BY (b.id = u.selected_badge_id) DESC NULLS LAST, b.priority DESC
+			LIMIT 1
+		) sender_badge ON u.is_verified = true
 		LEFT JOIN profiles p ON p.user_id = m.sender_id
 		WHERE gms.conversation_id = ?
 		  AND gms.user_id = ?
@@ -1342,17 +1426,18 @@ func (h *GroupMessageHandler) GetGroupStarred(c *gin.Context) {
 	for _, r := range rows {
 		text, _ := h.encryptionService.DecryptMessage(r.EncryptedText)
 		result = append(result, gin.H{
-			"id":                 r.ID,
-			"conversation_id":    conversationID,
-			"sender_id":          r.SenderID,
-			"sender_name":        r.SenderName,
-			"sender_username":    r.SenderUsername,
-			"sender_is_verified": r.SenderIsVerified,
-			"sender_avatar":      utils.PrependBaseURL(r.SenderAvatar),
-			"text":               text,
-			"is_edited":          r.IsEdited,
-			"is_starred_by_me":   true,
-			"created_at":         r.CreatedAt,
+			"id":                            r.ID,
+			"conversation_id":               conversationID,
+			"sender_id":                     r.SenderID,
+			"sender_name":                   r.SenderName,
+			"sender_username":               r.SenderUsername,
+			"sender_is_verified":            r.SenderIsVerified,
+			"sender_special_badge_icon_url": r.SenderSpecialBadgeIconURL,
+			"sender_avatar":                 utils.PrependBaseURL(r.SenderAvatar),
+			"text":                          text,
+			"is_edited":                     r.IsEdited,
+			"is_starred_by_me":              true,
+			"created_at":                    r.CreatedAt,
 		})
 	}
 

@@ -511,16 +511,32 @@ func (h *GroupHandler) PreviewByToken(c *gin.Context) {
 
 	// Üzv siyahısı — ad/username/avatar (preview-da göstərmək üçün).
 	var members []struct {
-		UserID       uint    `json:"user_id" gorm:"column:user_id"`
-		Name         string  `json:"name" gorm:"column:name"`
-		Username     string  `json:"username" gorm:"column:username"`
-		IsVerified   bool    `json:"is_verified" gorm:"column:is_verified"`
-		ProfileImage *string `json:"profile_image" gorm:"column:profile_image"`
+		UserID     uint   `json:"user_id" gorm:"column:user_id"`
+		Name       string `json:"name" gorm:"column:name"`
+		Username   string `json:"username" gorm:"column:username"`
+		IsVerified bool   `json:"is_verified" gorm:"column:is_verified"`
+		// YENİ (additiv): verified üzvün special badge icon URL-i (null ola bilər).
+		SpecialBadgeIconURL *string `json:"special_badge_icon_url" gorm:"column:special_badge_icon_url"`
+		ProfileImage        *string `json:"profile_image" gorm:"column:profile_image"`
 	}
 	database.DB.Raw(`
-		SELECT cp.user_id, u.name, u.username, u.is_verified, p.profile_image
+		SELECT cp.user_id, u.name, u.username, u.is_verified,
+			member_badge.icon_url AS special_badge_icon_url, p.profile_image
 		FROM conversation_participants cp
 		JOIN users u ON u.id = cp.user_id
+		LEFT JOIN LATERAL (
+			SELECT b.icon_url
+			FROM badges b
+			WHERE b.is_active AND b.is_special
+			  AND (
+				b.id = u.selected_badge_id
+				OR (u.selected_badge_id IS NULL AND EXISTS (
+					SELECT 1 FROM user_badges ub WHERE ub.user_id = u.id AND ub.badge_id = b.id
+				))
+			  )
+			ORDER BY (b.id = u.selected_badge_id) DESC NULLS LAST, b.priority DESC
+			LIMIT 1
+		) member_badge ON u.is_verified = true
 		LEFT JOIN profiles p ON p.user_id = cp.user_id
 		WHERE cp.conversation_id = ? AND cp.left_at IS NULL AND cp.deleted_at IS NULL
 		  AND u.deactivated_at IS NULL
@@ -530,11 +546,12 @@ func (h *GroupHandler) PreviewByToken(c *gin.Context) {
 	memberList := make([]gin.H, 0, len(members))
 	for _, m := range members {
 		memberList = append(memberList, gin.H{
-			"user_id":       m.UserID,
-			"name":          m.Name,
-			"username":      m.Username,
-			"is_verified":   m.IsVerified,
-			"profile_image": utils.PrependBaseURL(m.ProfileImage),
+			"user_id":                m.UserID,
+			"name":                   m.Name,
+			"username":               m.Username,
+			"is_verified":            m.IsVerified,
+			"special_badge_icon_url": m.SpecialBadgeIconURL,
+			"profile_image":          utils.PrependBaseURL(m.ProfileImage),
 		})
 	}
 
@@ -1095,14 +1112,16 @@ func (h *GroupHandler) GetMembers(c *gin.Context) {
 	}
 
 	var members []struct {
-		UserID       uint       `json:"user_id"`
-		Name         string     `json:"name"`
-		Username     string     `json:"username"`
-		IsVerified   bool       `json:"is_verified"`
-		ProfileImage *string    `json:"profile_image"`
-		Role         string     `json:"role"`
-		JoinedAt     *time.Time `json:"joined_at"`
-		IsOnline     bool       `json:"is_online"`
+		UserID     uint   `json:"user_id"`
+		Name       string `json:"name"`
+		Username   string `json:"username"`
+		IsVerified bool   `json:"is_verified"`
+		// YENİ (additiv): verified üzvün special badge icon URL-i (null ola bilər).
+		SpecialBadgeIconURL *string    `json:"special_badge_icon_url" gorm:"column:special_badge_icon_url"`
+		ProfileImage        *string    `json:"profile_image"`
+		Role                string     `json:"role"`
+		JoinedAt            *time.Time `json:"joined_at"`
+		IsOnline            bool       `json:"is_online"`
 	}
 
 	database.DB.Raw(`
@@ -1111,11 +1130,25 @@ func (h *GroupHandler) GetMembers(c *gin.Context) {
 			u.name,
 			u.username,
 			u.is_verified,
+			member_badge.icon_url AS special_badge_icon_url,
 			p.profile_image,
 			cp.role,
 			cp.joined_at
 		FROM conversation_participants cp
 		JOIN users u ON u.id = cp.user_id
+		LEFT JOIN LATERAL (
+			SELECT b.icon_url
+			FROM badges b
+			WHERE b.is_active AND b.is_special
+			  AND (
+				b.id = u.selected_badge_id
+				OR (u.selected_badge_id IS NULL AND EXISTS (
+					SELECT 1 FROM user_badges ub WHERE ub.user_id = u.id AND ub.badge_id = b.id
+				))
+			  )
+			ORDER BY (b.id = u.selected_badge_id) DESC NULLS LAST, b.priority DESC
+			LIMIT 1
+		) member_badge ON u.is_verified = true
 		LEFT JOIN profiles p ON p.user_id = cp.user_id
 		WHERE cp.conversation_id = ?
 		  AND cp.left_at IS NULL

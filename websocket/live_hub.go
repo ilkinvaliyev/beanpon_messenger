@@ -392,6 +392,101 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		h.reactionBuffer[event.RoomID][event.SenderID][reactionName]++
 		h.mu.Unlock()
 
+	case "live_gift":
+		// Canlıda hediyyə göndərmə. Gift göndərmə/coin əməliyyatı client
+		// tərəfdən piokio_commerce /gifts/send ilə edilir; bu event YALNIZ
+		// real-time yayım üçündür: otaqdakı hər kəs uçan gift animasiyası +
+		// chat mesajını görsün. Client göndərir: {receiver_id, gift_id,
+		// gift_name, gift_icon_url, quantity, is_anonymous}. Hub sender/receiver
+		// adlarını doldurub otağa yayır. Anonim halda sender adı gizlədilir.
+		var g struct {
+			ReceiverID  uint   `json:"receiver_id"`
+			GiftID      uint   `json:"gift_id"`
+			GiftName    string `json:"gift_name"`
+			GiftIconURL string `json:"gift_icon_url"`
+			Quantity    int    `json:"quantity"`
+			IsAnonymous bool   `json:"is_anonymous"`
+		}
+		if err := json.Unmarshal(event.Data, &g); err != nil || g.ReceiverID == 0 {
+			return
+		}
+		if g.Quantity <= 0 {
+			g.Quantity = 1
+		}
+
+		h.mu.RLock()
+		senderClient, senderExists := roomClients[event.SenderID]
+		recvClient, recvExists := roomClients[g.ReceiverID]
+		h.mu.RUnlock()
+
+		// Shadow-ban: live_spam sender-in gift-i otağa yayılmır.
+		if senderExists && senderClient.LiveSpam {
+			return
+		}
+
+		// Sender adı (anonim isə gizli). senderName = username, yoxsa name.
+		senderName := "User"
+		var senderAvatar *string
+		if senderExists {
+			if senderClient.Username != "" {
+				senderName = senderClient.Username
+			} else if senderClient.Name != "" {
+				senderName = senderClient.Name
+			}
+			senderAvatar = senderClient.Avatar
+		}
+		if g.IsAnonymous {
+			senderName = "Anonymous"
+			senderAvatar = nil
+		}
+
+		// Receiver adı — otaqdadırsa client cache-dən, yoxsa DB-dən.
+		receiverName := "User"
+		if recvExists {
+			if recvClient.Username != "" {
+				receiverName = recvClient.Username
+			} else if recvClient.Name != "" {
+				receiverName = recvClient.Name
+			}
+		} else {
+			var u struct {
+				Name     string
+				Username string
+			}
+			if database.DB.Table("users").Select("name", "username").
+				Where("id = ?", g.ReceiverID).Scan(&u).Error == nil {
+				if u.Username != "" {
+					receiverName = u.Username
+				} else if u.Name != "" {
+					receiverName = u.Name
+				}
+			}
+		}
+
+		outData, _ := json.Marshal(map[string]interface{}{
+			"sender_id":     event.SenderID,
+			"sender_name":   senderName,
+			"sender_avatar": utils.PrependBaseURL(senderAvatar),
+			"receiver_id":   g.ReceiverID,
+			"receiver_name": receiverName,
+			"gift_id":       g.GiftID,
+			"gift_name":     g.GiftName,
+			"gift_icon_url": g.GiftIconURL,
+			"quantity":      g.Quantity,
+			"is_anonymous":  g.IsAnonymous,
+		})
+		event.Data = outData
+		giftPayload, _ := json.Marshal(event)
+
+		for _, client := range roomClients {
+			select {
+			case client.Send <- giftPayload:
+			default:
+				close(client.Send)
+				go func(c *LiveRoomClient) { h.Unregister <- c }(client)
+			}
+		}
+
 	case "chat_message":
 		var dataMap map[string]interface{}
 		if err := json.Unmarshal(event.Data, &dataMap); err != nil {
