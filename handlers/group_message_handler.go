@@ -267,7 +267,7 @@ func (h *GroupMessageHandler) SendGroupMessage(c *gin.Context) {
 		LEFT JOIN LATERAL (
 			SELECT b.icon_url
 			FROM badges b
-			WHERE b.is_active AND b.is_special
+			WHERE b.is_special
 			  AND b.id = u.selected_badge_id
 			ORDER BY b.priority DESC
 			LIMIT 1
@@ -298,7 +298,7 @@ func (h *GroupMessageHandler) SendGroupMessage(c *gin.Context) {
 				LEFT JOIN LATERAL (
 					SELECT b.icon_url
 					FROM badges b
-					WHERE b.is_active AND b.is_special
+					WHERE b.is_special
 					  AND b.id = u.selected_badge_id
 					ORDER BY b.priority DESC
 					LIMIT 1
@@ -624,7 +624,7 @@ func (h *GroupMessageHandler) GetGroupMessages(c *gin.Context) {
 		LEFT JOIN LATERAL (
 			SELECT b.icon_url
 			FROM badges b
-			WHERE b.is_active AND b.is_special
+			WHERE b.is_special
 			  AND b.id = u.selected_badge_id
 			ORDER BY b.priority DESC
 			LIMIT 1
@@ -635,7 +635,7 @@ func (h *GroupMessageHandler) GetGroupMessages(c *gin.Context) {
 		LEFT JOIN LATERAL (
 			SELECT b.icon_url
 			FROM badges b
-			WHERE b.is_active AND b.is_special
+			WHERE b.is_special
 			  AND b.id = reply_u.selected_badge_id
 			ORDER BY b.priority DESC
 			LIMIT 1
@@ -1385,7 +1385,7 @@ func (h *GroupMessageHandler) GetGroupStarred(c *gin.Context) {
 		LEFT JOIN LATERAL (
 			SELECT b.icon_url
 			FROM badges b
-			WHERE b.is_active AND b.is_special
+			WHERE b.is_special
 			  AND b.id = u.selected_badge_id
 			ORDER BY b.priority DESC
 			LIMIT 1

@@ -527,7 +527,7 @@ func (h *GroupHandler) PreviewByToken(c *gin.Context) {
 		LEFT JOIN LATERAL (
 			SELECT b.icon_url
 			FROM badges b
-			WHERE b.is_active AND b.is_special
+			WHERE b.is_special
 			  AND b.id = u.selected_badge_id
 			ORDER BY b.priority DESC
 			LIMIT 1
@@ -1134,7 +1134,7 @@ func (h *GroupHandler) GetMembers(c *gin.Context) {
 		LEFT JOIN LATERAL (
 			SELECT b.icon_url
 			FROM badges b
-			WHERE b.is_active AND b.is_special
+			WHERE b.is_special
 			  AND b.id = u.selected_badge_id
 			ORDER BY b.priority DESC
 			LIMIT 1

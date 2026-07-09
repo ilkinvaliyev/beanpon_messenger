@@ -74,6 +74,15 @@ type Conversation struct {
 	Blocked   bool       `json:"blocked" gorm:"default:false"`
 	BlockedAt *time.Time `json:"blocked_at"`
 	BlockedBy *uint      `json:"blocked_by"`
+	// Blok müddəti (null = ömürlük). Cron müddəti bitəni avtomatik açır.
+	BlockedUntil *time.Time `json:"blocked_until"`
+	// Cəza ilə açılma (admin təyin edir). enabled=false → cəzasız (yalnız
+	// müddət bitəndə/admin açır). Dolu sütun = həmin üsul mümkündür.
+	PenaltyUnlockEnabled      bool     `json:"penalty_unlock_enabled" gorm:"default:false"`
+	UnlockCoinPrice           *int     `json:"unlock_coin_price"`
+	UnlockMoneyPrice          *float64 `json:"unlock_money_price" gorm:"type:decimal(10,2)"`
+	UnlockMoneyCurrency       *string  `json:"unlock_money_currency" gorm:"type:varchar(3)"`
+	UnlockRevenueCatProductID *string  `json:"unlock_revenuecat_product_id"`
 
 	CreatedAt time.Time      `json:"created_at"`
 	UpdatedAt time.Time      `json:"updated_at"`

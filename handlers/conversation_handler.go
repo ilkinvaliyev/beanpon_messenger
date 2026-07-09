@@ -1019,6 +1019,14 @@ func (h *ConversationHandler) GetConversationDetails(c *gin.Context) {
 			"show_read_receipts":   showReadReceipts,
 			"blocked":              conversation.Blocked || len(userBlocks) > 0,
 			"blocked_by_me":        blockedByMe,
+			// Admin (Filament) bloku info — client vaxtı + cəza ilə açılma
+			// düyməsini göstərmək üçün. Yalnız admin bloku üçün mənalı.
+			"is_admin_block":               conversation.Blocked,
+			"blocked_until":                conversation.BlockedUntil,
+			"penalty_unlock_enabled":       conversation.Blocked && conversation.PenaltyUnlockEnabled,
+			"unlock_coin_price":            conversation.UnlockCoinPrice,
+			"unlock_money_price":           conversation.UnlockMoneyPrice,
+			"unlock_revenuecat_product_id": conversation.UnlockRevenueCatProductID,
 		},
 	}
 

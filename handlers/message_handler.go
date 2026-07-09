@@ -1563,7 +1563,7 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
     LEFT JOIN LATERAL (
         SELECT b.icon_url
         FROM badges b
-        WHERE b.is_active AND b.is_special
+        WHERE b.is_special
           AND b.id = u.selected_badge_id
         ORDER BY b.priority DESC
         LIMIT 1
@@ -2470,7 +2470,7 @@ INNER JOIN users u ON u.id = m.receiver_id
 LEFT JOIN LATERAL (
     SELECT b.icon_url
     FROM badges b
-    WHERE b.is_active AND b.is_special
+    WHERE b.is_special
       AND b.id = u.selected_badge_id
     ORDER BY b.priority DESC
     LIMIT 1
