@@ -82,7 +82,7 @@ type Conversation struct {
 	UnlockCoinPrice           *int     `json:"unlock_coin_price"`
 	UnlockMoneyPrice          *float64 `json:"unlock_money_price" gorm:"type:decimal(10,2)"`
 	UnlockMoneyCurrency       *string  `json:"unlock_money_currency" gorm:"type:varchar(3)"`
-	UnlockRevenueCatProductID *string  `json:"unlock_revenuecat_product_id"`
+	UnlockRevenueCatProductID *string  `json:"unlock_revenuecat_product_id" gorm:"column:unlock_revenuecat_product_id"`
 
 	CreatedAt time.Time      `json:"created_at"`
 	UpdatedAt time.Time      `json:"updated_at"`
