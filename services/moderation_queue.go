@@ -267,16 +267,27 @@ func (q *ModerationQueue) sendTelegramAlert(job ModerationJob, result *Moderatio
 		}
 	}
 
+	// Qəbul edənin (receiver) username-ini də DB-dən çək — göndərən kimi.
+	// Xəta olsa / tapılmasa yalnız ID ilə davam edir.
+	receiverLabel := fmt.Sprintf("%d", job.ReceiverID)
+	var receiver models.User
+	if q.db != nil {
+		if err := q.db.Select("id", "name", "username").
+			First(&receiver, "id = ?", job.ReceiverID).Error; err == nil {
+			receiverLabel = fmt.Sprintf("%d (@%s)", receiver.ID, receiver.Username)
+		}
+	}
+
 	text := fmt.Sprintf(
 		"🚩 Platformadan çıxarma cəhdi\n\n"+
 			"👤 Göndərən: %s\n"+
-			"📩 Qəbul edən ID: %d\n"+
+			"📩 Qəbul edən ID: %s\n"+
 			"🎯 Əminlik: %.2f\n"+
 			"📝 Səbəb: %s\n"+
 			"🆔 Mesaj: %s\n\n"+
 			"💬 Mesaj mətni:\n%s",
 		senderLabel,
-		job.ReceiverID,
+		receiverLabel,
 		result.Confidence,
 		emptyDash(result.Reason),
 		job.MessageID,
