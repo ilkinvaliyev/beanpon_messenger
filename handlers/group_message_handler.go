@@ -502,6 +502,10 @@ func (h *GroupMessageHandler) SendGroupMessage(c *gin.Context) {
 // GET /api/v1/groups/:conversation_id/messages
 func (h *GroupMessageHandler) GetGroupMessages(c *gin.Context) {
 	userID := c.MustGet("user_id").(uint)
+
+	// Soft-throttle: bad_traffic flag-lı user-in qrup mesajları gecikir.
+	throttleBadTraffic(int64(userID))
+
 	convID, err := strconv.ParseUint(c.Param("conversation_id"), 10, 32)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz conversation_id"})

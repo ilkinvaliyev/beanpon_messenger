@@ -401,6 +401,9 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 		return
 	}
 
+	// Soft-throttle: bad_traffic flag-lı user-in mesaj siyahısı gecikir.
+	throttleBadTraffic(int64(userID.(uint)))
+
 	otherUserID, err := strconv.ParseUint(c.Param("user_id"), 10, 32)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz kullanıcı ID"})
@@ -1325,6 +1328,9 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 		return
 	}
+
+	// Soft-throttle: bad_traffic flag-lı user-in conversations siyahısı gecikir.
+	throttleBadTraffic(int64(userID.(uint)))
 
 	statusFilter := c.DefaultQuery("status", "all")
 	// archived filtri: "false" (default) → yalnız arxivlənməmiş; "true" →

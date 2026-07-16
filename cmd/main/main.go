@@ -40,6 +40,9 @@ func main() {
 	// olur, DB-yə düşür). Boot dayanmır.
 	cache.Initialize(cfg.Cache)
 
+	// Soft-throttle: bad_traffic flag-lı user-lərə gecikmə (env saniyə).
+	handlers.InitBadTraffic(cfg.BadTrafficDelaySeconds, cfg.BadTrafficCacheSeconds)
+
 	// ✅ Conversations cədvəlinə reaksiya sütunlarını əlavə et (idempotent)
 	if err := database.DB.Exec(`
 		ALTER TABLE conversations

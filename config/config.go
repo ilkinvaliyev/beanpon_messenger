@@ -22,6 +22,11 @@ type Config struct {
 	BackendUrl     string
 	InternalSecret string
 
+	// Soft-throttle: bad_traffic flag-lı user-lərin sorğusuna gecikmə (saniyə).
+	// 0 = söndürülü. Status paylaşılan Redis-də (bp:shared:bad_traffic:{id}) keşlənir.
+	BadTrafficDelaySeconds int
+	BadTrafficCacheSeconds int
+
 	// OpenAIAPIKey — arxa-plan mesaj moderasiyası (gpt-4o-mini) üçün açar.
 	// Boş olduqda moderasiya sakitcə deaktiv olur — tətbiq normal işləyir.
 	OpenAIAPIKey string
@@ -105,22 +110,24 @@ func LoadConfig() *Config {
 	}
 
 	cfg := &Config{
-		Port:             os.Getenv("APP_PORT"),
-		JWTSecret:        os.Getenv("JWT_SECRET"),
-		PostgresUser:     os.Getenv("DB_USER"),
-		PostgresPass:     os.Getenv("DB_PASSWORD"),
-		PostgresHost:     os.Getenv("DB_HOST"),
-		PostgresPort:     os.Getenv("DB_PORT"),
-		PostgresDB:       os.Getenv("DB_NAME"),
-		AESKey:           os.Getenv("AES_KEY"),
-		CloudToken:       os.Getenv("CLOUD_TOKEN"),
-		BackendUrl:       os.Getenv("BACKEND_URL"),
-		InternalSecret:   os.Getenv("INTERNAL_SECRET"),
-		OpenAIAPIKey:     os.Getenv("OPENAI_API_KEY"),
-		TelegramBotToken: envStr("TELEGRAM_BOT_TOKEN", "8862168493:AAH2WPoYyUgbIEmolXkCJ3JAaKh3aP53fBE"),
-		TelegramChatID:   envStr("TELEGRAM_CHAT_ID", "739452673"),
-		PgBouncerEnabled: envBool("PGBOUNCER_ENABLED", false),
-		AppURL:           envStr("APP_URL", "https://api.beanpon.com"),
+		Port:                   os.Getenv("APP_PORT"),
+		JWTSecret:              os.Getenv("JWT_SECRET"),
+		BadTrafficDelaySeconds: envInt("BAD_TRAFFIC_DELAY_SECONDS", 40),
+		BadTrafficCacheSeconds: envInt("BAD_TRAFFIC_CACHE_SECONDS", 3600),
+		PostgresUser:           os.Getenv("DB_USER"),
+		PostgresPass:           os.Getenv("DB_PASSWORD"),
+		PostgresHost:           os.Getenv("DB_HOST"),
+		PostgresPort:           os.Getenv("DB_PORT"),
+		PostgresDB:             os.Getenv("DB_NAME"),
+		AESKey:                 os.Getenv("AES_KEY"),
+		CloudToken:             os.Getenv("CLOUD_TOKEN"),
+		BackendUrl:             os.Getenv("BACKEND_URL"),
+		InternalSecret:         os.Getenv("INTERNAL_SECRET"),
+		OpenAIAPIKey:           os.Getenv("OPENAI_API_KEY"),
+		TelegramBotToken:       envStr("TELEGRAM_BOT_TOKEN", "8862168493:AAH2WPoYyUgbIEmolXkCJ3JAaKh3aP53fBE"),
+		TelegramChatID:         envStr("TELEGRAM_CHAT_ID", "739452673"),
+		PgBouncerEnabled:       envBool("PGBOUNCER_ENABLED", false),
+		AppURL:                 envStr("APP_URL", "https://api.beanpon.com"),
 		S3: S3Config{
 			Bucket:    envStr("AWS_BUCKET", ""),
 			Region:    envStr("AWS_DEFAULT_REGION", "us-east-1"),
