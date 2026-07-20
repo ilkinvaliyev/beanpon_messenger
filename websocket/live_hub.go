@@ -688,6 +688,34 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 
 		chatPayload, _ := json.Marshal(event)
 
+		// Anonim yayın: göndərən dinleyici isə mesaj HƏR KƏSƏ Anonym####
+		// olaraq gedir (sender_id=0, avatar yox). Göndərənin ÖZÜ isə mesajını
+		// real adı ilə görür — ona görə iki fərqli payload hazırlanır.
+		// Host/broadcaster göndərəndə heç nə dəyişmir (kimliyi açıqdır).
+		anonPayload := chatPayload
+		if _, anonName, isAnon := AnonymizeLiveSender(
+			event.RoomID, event.SenderID, 0, senderName,
+		); isAnon {
+			anonData, _ := json.Marshal(map[string]interface{}{
+				"id":                 chatMsg.ID,
+				"text":               textData,
+				"gif_url":            fullGifURL,
+				"image_url":          fullImageURL,
+				"sound_url":          fullSoundURL,
+				"sound_id":           soundID,
+				"sender_id":          0,
+				"sender_name":        anonName,
+				"sender_avatar":      nil,
+				"sender_avatar_type": nil,
+				"is_anonymous":       true,
+				"reply_to":           replyPreview,
+				"mentions":           mentions,
+			})
+			anonEvent := *event
+			anonEvent.Data = anonData
+			anonPayload, _ = json.Marshal(anonEvent)
+		}
+
 		// Shadow ban: əgər sender live_spam-dırsa, mesaj otağa
 		// broadcast OLUNMUR. Yalnız sender özünə echo alır ki, mesajın
 		// göndərildiyini düşünsün. Heç bir error qaytarılmır.
@@ -697,13 +725,17 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 			if senderIsSpam && client.UserID != event.SenderID {
 				continue
 			}
+			payload := chatPayload
 			if client.UserID != event.SenderID {
 				if models.IsBlocked(database.DB, event.SenderID, client.UserID) {
 					continue
 				}
+				// Başqalarına anonimləşdirilmiş nüsxə gedir (anonim deyilsə
+				// anonPayload elə chatPayload-dur).
+				payload = anonPayload
 			}
 			select {
-			case client.Send <- chatPayload:
+			case client.Send <- payload:
 			default:
 				close(client.Send)
 				go func(c *LiveRoomClient) { h.Unregister <- c }(client)
@@ -914,6 +946,8 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		targetUserID := uint(targetUserIDFloat)
 		if targetClient, exists := roomClients[targetUserID]; exists {
 			targetClient.Role = "broadcaster"
+			// Anonim yayında sahnəyə çıxan kimi kimliyi açılmalıdır.
+			InvalidateLiveAnonCache(event.RoomID)
 			select {
 			case targetClient.Send <- payload:
 			default:
@@ -946,6 +980,8 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		targetUserID := uint(targetUserIDFloat)
 		if targetClient, exists := roomClients[targetUserID]; exists {
 			targetClient.Role = "audience"
+			// Sahnədən düşdü — anonim yayında yenidən gizlənir.
+			InvalidateLiveAnonCache(event.RoomID)
 			select {
 			case targetClient.Send <- payload:
 			default:
@@ -1194,6 +1230,7 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		h.mu.Lock()
 		if targetClient, exists := roomClients[targetUserID]; exists {
 			targetClient.Role = "host"
+			InvalidateLiveAnonCache(event.RoomID)
 			if senderWasHost {
 				sender.Role = "broadcaster" // ← audience deyil
 			}

@@ -322,6 +322,9 @@ func (h *LiveHub) GetLiveRoomMessages(c *gin.Context) {
 		messages = messages[:limit]
 	}
 
+	// Anonim yayın (live_rooms.anonymous_audience): dinləyicilərin mesajları
+	// Anonym#### olur, sender_id 0 gedir. Host/broadcaster açıq qalır; istifadəçi
+	// öz mesajını həmişə real adı ilə görür (viewer = sorğunu edən `userID`).
 	for i := range messages {
 		if messages[i].SenderAvatarType != nil && *messages[i].SenderAvatarType == "gif" {
 			// gif — olduğu kimi qal
@@ -333,6 +336,29 @@ func (h *LiveHub) GetLiveRoomMessages(c *gin.Context) {
 			// gif — olduğu kimi qal
 		} else if messages[i].ReplySenderAvatar != nil {
 			messages[i].ReplySenderAvatar = utils.PrependBaseURL(messages[i].ReplySenderAvatar)
+		}
+
+		// Mesaj sahibi.
+		if sid, name, anon := AnonymizeLiveSender(
+			uint(roomID), messages[i].SenderID, userID, messages[i].SenderName,
+		); anon {
+			messages[i].SenderID = sid
+			messages[i].SenderName = name
+			messages[i].SenderAvatar = nil
+			messages[i].SenderAvatarType = nil
+		}
+
+		// Cavab verilən mesajın sahibi də eyni qaydaya tabedir.
+		if messages[i].ReplySenderID != nil {
+			if sid, name, anon := AnonymizeLiveSender(
+				uint(roomID), *messages[i].ReplySenderID, userID,
+				derefStr(messages[i].ReplySenderName),
+			); anon {
+				messages[i].ReplySenderID = &sid
+				messages[i].ReplySenderName = &name
+				messages[i].ReplySenderAvatar = nil
+				messages[i].ReplySenderAvatarType = nil
+			}
 		}
 
 		if messages[i].ImageURL != nil {
