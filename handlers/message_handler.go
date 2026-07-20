@@ -971,7 +971,7 @@ func (h *MessageHandler) SyncMessages(c *gin.Context) {
         WHERE (m.sender_id = ? OR m.receiver_id = ?)
         AND m.conversation_id IS NULL
         AND m.updated_at > ?
-        ORDER BY m.updated_at ASC
+        ORDER BY m.updated_at ASC, m.id ASC
         LIMIT ?
     `
 
@@ -986,12 +986,24 @@ func (h *MessageHandler) SyncMessages(c *gin.Context) {
 		rows = rows[:limit]
 	}
 
+	// Issue 2: reconnect delta-sync mesaj kaybını azaltmaq üçün TÜHLÜKƏSİZLİK
+	// PƏNCƏRƏSİ (lookback). `updated_at` commit-dən ƏVVƏL ştamplanır, commit
+	// sırası isə fərqli ola bilər → watermark-dan yuxarı çıxan, amma gec commit
+	// olunan mesaj strict `> since` filtri ilə HƏMİŞƏLİK ötürülür. Yakalanmış
+	// (son səhifə) halda watermark-ı bir qədər geri sarırıq ki, növbəti
+	// reconnect həmin pəncərəni yenidən tarasın. İstemçi id ilə dedup etdiyi
+	// üçün təkrar sətirlər zərərsizdir. Sayfalama (hasMore) əsnasında geri
+	// sarma YOXDUR → irəli gedişat pozulmur, döngü riski yoxdur.
+	const syncLookbackMs int64 = 5000
+
 	nextSinceMs := sinceMs
+	var lastRowUpdatedMs int64 = sinceMs
+	hadRows := len(rows) > 0
 	responseMessages := make([]gin.H, 0, len(rows))
 	deletedMessageIDs := make([]string, 0)
 
 	for _, msg := range rows {
-		nextSinceMs = msg.UpdatedAt.UnixMilli()
+		lastRowUpdatedMs = msg.UpdatedAt.UnixMilli()
 
 		// Mənim üçün silinmiş → mətn qaytarılmır, yalnız id (client silsin).
 		deletedForMe := msg.DeletedAt != nil ||
@@ -1070,6 +1082,21 @@ func (h *MessageHandler) SyncMessages(c *gin.Context) {
 		}
 
 		responseMessages = append(responseMessages, responseMessage)
+	}
+
+	// Watermark hesabı (yuxarıdakı lookback şərhinə bax):
+	//  • hasMore  → daha səhifə var: dəqiq irəli get (geri sarma yox).
+	//  • !hasMore → yakalandıq: güvenlik pəncərəsi qədər geri sar ki, növbəti
+	//    reconnect sıra-dışı commit-ləri tutsun. Sətir yoxdursa dəyişmə.
+	if hadRows {
+		if hasMore {
+			nextSinceMs = lastRowUpdatedMs
+		} else {
+			nextSinceMs = lastRowUpdatedMs - syncLookbackMs
+			if nextSinceMs < 0 {
+				nextSinceMs = 0
+			}
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{

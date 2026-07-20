@@ -38,20 +38,27 @@ type Client struct {
 	// mesajları üçün FCM push GÖNDƏRİLMİR (onsuz da görür).
 	ActiveGroupChat *uint
 
-	// closeOnce — `Send` kanalının YALNIZ bir dəfə bağlanmasını təmin edir.
+	// closeOnce — kapanış siqnalının (`done`) YALNIZ bir dəfə verilməsini təmin edir.
 	// Əvvəllər həm registerClient (köhnə bağlantı atılarkən), həm də
 	// unregisterClient eyni kanalı bağlaya bilirdi → ikiqat close panic →
 	// goroutine ölür → həmin user-in soketi səssizcə qopurdu. İndi bütün
 	// close-lar bu Once üzərindən keçir (idempotent).
 	closeOnce sync.Once
+
+	// done — client kapanış siqnalı. `Send` kanalı ARTIQ HEÇ VAXT bağlanmır;
+	// bunun əvəzinə bu kanal bağlanır. Beləliklə paralel `Send <-` yazımları
+	// (sendMessage/sendRecentMessages/broadcast — hamısı non-blocking select)
+	// heç vaxt bağlı kanala yazmır → send-on-closed-channel panic (bütün
+	// prosesi çökdürən) tamamilə aradan qalxır. writePump `done` ilə dayanır.
+	done chan struct{}
 }
 
-// closeSend `Send` kanalını təhlükəsiz (idempotent) bağlayır. İstənilən
-// qədər çağırıla bilər, yalnız ilki effekt edir — beləliklə ikiqat close
-// panic-i mümkün deyil.
+// closeSend client-i təhlükəsiz (idempotent) bağlayır: `Send`-i DEYİL, `done`-u
+// bağlayır. İstənilən qədər çağırıla bilər, yalnız ilki effekt edir. `Send`
+// heç vaxt bağlanmadığı üçün ona paralel yazımlar panic verə bilməz.
 func (c *Client) closeSend() {
 	c.closeOnce.Do(func() {
-		close(c.Send)
+		close(c.done)
 	})
 }
 
@@ -743,6 +750,7 @@ func (h *Hub) HandleWebSocket(c *gin.Context) {
 		Conn:   conn,
 		Send:   make(chan []byte, 256),
 		Hub:    h,
+		done:   make(chan struct{}),
 	}
 
 	h.register <- client
@@ -754,6 +762,11 @@ func (h *Hub) HandleWebSocket(c *gin.Context) {
 // readPump client'tan mesaj oku ve işle
 func (c *Client) readPump() {
 	defer func() {
+		// Müdafiə xətti: readPump içindən (handleIncomingMessage və s.)
+		// gözlənilməz panic bütün prosesi çökdürməsin — yalnız bu client düşsün.
+		if r := recover(); r != nil {
+			log.Printf("readPump panic (user %d): %v", c.UserID, r)
+		}
 		c.Hub.unregister <- c
 	}()
 
@@ -967,49 +980,71 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 		}
 
 		messageID := uuid.New().String()
-		createdAt := time.Now()
+		// Issue 30: REST yolu ilə eyni — UTC saxla ki, `ORDER BY created_at`
+		// iki yol arasında düzgün sıralansın (server TZ ≠ UTC olsa belə).
+		createdAt := time.Now().UTC()
 
-		// Conversation status belirle (nil ise "new", değilse mevcut status)
+		// ── Issue 1: ÖNCE PERSİST, SONRA YAYINLA ────────────────────────────
+		// Əvvəllər mesaj DB-yə yazılmadan HandleNewMessage ilə yayılırdı; async
+		// yazma səssizcə uğursuz olsa mesaj hər iki ekranda görünüb yenidən
+		// açanda YOX olurdu. İndi REST yolu ilə eyni: şifrələ → yaz → (uğurlusa)
+		// conversation-u güncəllə → yay. Yazma xətası → göndərənə message_error,
+		// yayım yoxdur. Wire dəyişmir (köhnə istemçilər eyni davranır).
+		encryptedText, encErr := c.Hub.encryptionService.EncryptMessage(content)
+		if encErr != nil {
+			log.Printf("Mesaj şifreleme hatası (WS): %v", encErr)
+			c.sendMessage(&OutgoingMessage{
+				Type: "message_error",
+				Data: map[string]interface{}{"error": "message_encrypt_failed", "code": "SEND_FAILED"},
+			})
+			return
+		}
+
+		message := models.Message{
+			ID:               messageID,
+			SenderID:         c.UserID,
+			ReceiverID:       &receiverID,
+			StoryID:          storyID,
+			ReplyToMessageID: replyToMessageID,
+			EncryptedText:    encryptedText,
+			Read:             false,
+			CreatedAt:        createdAt,
+			UpdatedAt:        createdAt,
+		}
+
+		if err := c.Hub.db.Create(&message).Error; err != nil {
+			log.Printf("Mesaj DB'ye yazılamadı (WS): %v", err)
+			c.sendMessage(&OutgoingMessage{
+				Type: "message_error",
+				Data: map[string]interface{}{"error": "message_persist_failed", "code": "SEND_FAILED"},
+			})
+			return
+		}
+
+		// ── Issue 8: WS yolu da conversation sayaç/status/last_message_at
+		// güncəlləməsini etsin (REST ilə eyni). Əks halda: pending→active heç
+		// vaxt keçmir, pending mesaj limiti WS-lə keçilə bilir, söhbət siyahısı
+		// köhnə qalırdı. Xəta yalnız loglanır — mesaj artıq yazılıb.
+		if conversation != nil {
+			if uErr := c.Hub.updateConversationOnMessage(conversation, c.UserID); uErr != nil {
+				log.Printf("Conversation güncellemesi başarısız (WS): %v", uErr)
+			}
+		}
+
+		// Yenilənmiş status-u götür (pending→active keçmiş ola bilər) —
+		// HandleNewMessage push qapısı bunu istifadə edir.
 		conversationStatus := "new"
 		if conversation != nil {
 			conversationStatus = conversation.Status
 		}
 
-		// HandleNewMessage'a status geç. WS yolu səssiz göndərməni dəstəkləmir
-		// (yalnız REST), ona görə silent=false.
+		// Artıq commit olunub — indi yay (silent yalnız REST-də var → false).
 		c.Hub.HandleNewMessage(c.UserID, receiverID, messageID, content, msgType, createdAt, replyToMessageID, storyID, conversationStatus, false)
 
-		// DB yazma
-		go func() {
-			encryptedText, err := c.Hub.encryptionService.EncryptMessage(content)
-			if err != nil {
-				log.Printf("Mesaj şifreleme hatası: %v", err)
-				return
-			}
-
-			message := models.Message{
-				ID:               messageID,
-				SenderID:         c.UserID,
-				ReceiverID:       &receiverID,
-				StoryID:          storyID,
-				ReplyToMessageID: replyToMessageID,
-				EncryptedText:    encryptedText,
-				Read:             false,
-				CreatedAt:        createdAt,
-				UpdatedAt:        createdAt,
-			}
-
-			if err := c.Hub.db.Create(&message).Error; err != nil {
-				log.Printf("Mesaj DB'ye yazılamadı: %v", err)
-				return
-			}
-
-			// 🔍 MODERASIYA — mesaj DB-yə yazıldı, arxa-plan analizinə qoy.
-			// Yalnız text mesajları analiz edirik. Qeyri-bloklayıcıdır.
-			if c.Hub.moderationEnqueue != nil && (msgType == "" || msgType == "text") {
-				c.Hub.moderationEnqueue(messageID, c.UserID, receiverID, content, createdAt)
-			}
-		}()
+		// 🔍 MODERASIYA — qeyri-bloklayıcı, arxa planda qalır.
+		if c.Hub.moderationEnqueue != nil && (msgType == "" || msgType == "text") {
+			c.Hub.moderationEnqueue(messageID, c.UserID, receiverID, content, createdAt)
+		}
 
 	case "mark_read":
 		// Mesajları okundu olarak işaretle
@@ -1187,12 +1222,20 @@ func (c *Client) writePump() {
 
 	for {
 		select {
+		case <-c.done:
+			// Client bağlanır: close frame göndər və çıx. `Send` artıq
+			// bağlanmadığı üçün dayanma siqnalı buradan gəlir.
+			_ = c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			_ = c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
+			return
+
 		case message, ok := <-c.Send:
 			err := c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err != nil {
 				return
 			}
 			if !ok {
+				// `Send` artıq heç vaxt bağlanmır; bu dal müdafiə üçün qalır.
 				err := c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
 				if err != nil {
 					return
@@ -1232,21 +1275,31 @@ func (h *Hub) ScheduleGroupPushNotification(
 	delay time.Duration,
 ) {
 	time.AfterFunc(delay, func() {
+		// Issue 21: üzv başına message_reads COUNT ƏVƏZİNƏ tək sorğu — bu mesajı
+		// artıq oxuyan üzvləri bir dəfəyə çək, yaddaşda diff et. 5000-lik qrupda
+		// ~5000 point-query → 1 sorğu (DB connection pool tükənməsi/gecikmə önlənir).
+		readers := make(map[uint]bool, len(memberIDs))
+		if len(memberIDs) > 0 {
+			var readerIDs []uint
+			h.db.Table("message_reads").
+				Where("message_id = ? AND user_id IN ?", messageID, memberIDs).
+				Pluck("user_id", &readerIDs)
+			for _, id := range readerIDs {
+				readers[id] = true
+			}
+		}
+
 		remaining := make([]uint, 0, len(memberIDs))
 		for _, uid := range memberIDs {
 			if uid == senderID {
 				continue
 			}
-			// Hazırda qrup səhifəsindədir — mesajı canlı görür.
-			if h.IsUserInGroupChat(uid, conversationID) {
+			// Gecikmə pəncərəsində OXUDU — push artıq lazımsız.
+			if readers[uid] {
 				continue
 			}
-			// Gecikmə pəncərəsində OXUDU — push artıq lazımsız.
-			var readCount int64
-			h.db.Table("message_reads").
-				Where("message_id = ? AND user_id = ?", messageID, uid).
-				Count(&readCount)
-			if readCount > 0 {
+			// Hazırda qrup səhifəsindədir — mesajı canlı görür.
+			if h.IsUserInGroupChat(uid, conversationID) {
 				continue
 			}
 			remaining = append(remaining, uid)
@@ -1573,6 +1626,19 @@ func (h *Hub) handleAddReaction(userID uint, messageID, emoji string) {
 	if userID != message.SenderID && (message.ReceiverID == nil || userID != *message.ReceiverID) {
 		log.Printf("Kullanıcı %d bu mesaja reaction veremez", userID)
 		return
+	}
+
+	// Issue 16: DM-də bloklanan tərəflər arasında reaksiya (və reaksiya push-u)
+	// getməsin (REST block davranışı ilə uyğun). Qrup mesajları (ReceiverID==nil)
+	// üzvlük ilə idarə olunur — burada yoxlanmır.
+	if message.ReceiverID != nil {
+		other := message.SenderID
+		if userID == message.SenderID {
+			other = *message.ReceiverID
+		}
+		if models.IsBlocked(h.db, userID, other) {
+			return
+		}
 	}
 
 	// ✅ İdempotensiya: eyni istifadəçi eyni emoji-ni təkrar atırsa, push göndərmə
@@ -1953,6 +2019,14 @@ func (h *Hub) BroadcastScreenshotProtectionChange(user1ID, user2ID uint, isDisab
 const spamSilentReason = "__SPAM_SILENT__"
 
 func (h *Hub) getOrCreateConversationWithPermission(senderID, receiverID uint) (*models.Conversation, bool, string, error) {
+	// Issue 16: WS gönderim yolu da REST kimi user block-u tətbiq etsin.
+	// Əvvəllər yalnız REST (message_handler) yoxlayırdı → bloklanan istifadəçi
+	// WS `send_message` frame ilə mesaj çatdıra bilirdi (block bypass/harassment).
+	// REST ilə eyni mesaj qaytarılır (send_message case bunu message_error edir).
+	if models.IsBlocked(h.db, senderID, receiverID) {
+		return nil, false, "Bu kullanıcıya mesaj gönderemezsiniz", nil
+	}
+
 	var conversation models.Conversation
 	err := h.db.Where(
 		"(user1_id = ? AND user2_id = ?) OR (user1_id = ? AND user2_id = ?)",
@@ -1974,10 +2048,17 @@ func (h *Hub) getOrCreateConversationWithPermission(senderID, receiverID uint) (
 			return nil, false, spamSilentReason, nil
 		}
 
-		// Conversation yok, yeni oluştur
+		// Issue 13: user1/user2 həmişə normallaşdırılmış (kiçik id = user1)
+		// saxlanmalıdır — REST GetOrCreateConversation ilə eyni. Əks halda
+		// WS-lə yaradılan `(sender,receiver)` sətri REST-in sıralanmış
+		// axtarışına görünməz və eyni cüt üçün İKİNCİ conversation yaranır.
+		u1, u2 := senderID, receiverID
+		if u1 > u2 {
+			u1, u2 = u2, u1
+		}
 		newConv := models.Conversation{
-			User1ID: senderID,
-			User2ID: receiverID,
+			User1ID: u1,
+			User2ID: u2,
 			Status:  "pending",
 		}
 		if err := h.db.Create(&newConv).Error; err != nil {
@@ -1999,4 +2080,52 @@ func (h *Hub) getOrCreateConversationWithPermission(senderID, receiverID uint) (
 	}
 
 	return &conversation, true, "", nil
+}
+
+// updateConversationOnMessage — handlers.ConversationHandler.UpdateConversationOnMessage
+// ilə EYNİ məntiq, hub-lokal (import dövrü olmaması üçün). WS gönderim yolu da
+// REST kimi sayğac/status/last_message_at güncəlləməsini etsin (Issue 8).
+// `conversation` artıq yüklənib (getOrCreateConversationWithPermission-dən) və
+// bu metod onun sahələrini yerində dəyişib Save edir — REST davranışının eyni.
+func (h *Hub) updateConversationOnMessage(conversation *models.Conversation, senderID uint) error {
+	if conversation == nil {
+		return nil
+	}
+	now := time.Now().UTC()
+
+	if conversation.FirstMessageAt == nil {
+		conversation.FirstMessageAt = &now
+	}
+	conversation.LastMessageAt = &now
+
+	if senderID == conversation.User1ID {
+		conversation.User1MessageCount++
+	} else {
+		conversation.User2MessageCount++
+	}
+	conversation.TotalMessagesCount++
+
+	// Hər iki tərəf yazıbsa → active.
+	if conversation.User1MessageCount > 0 && conversation.User2MessageCount > 0 {
+		conversation.Status = "active"
+		conversation.HasPreviousConversation = true
+		conversation.StatusChangedAt = &now
+	}
+
+	// Pending-də tək tərəfli mesaj limiti.
+	if conversation.Status == "pending" {
+		maxCount := conversation.User1MessageCount
+		if conversation.User2MessageCount > maxCount {
+			maxCount = conversation.User2MessageCount
+		}
+		if (conversation.User1MessageCount == 0 || conversation.User2MessageCount == 0) &&
+			maxCount > conversation.MaxPendingMessages {
+			conversation.Status = "restricted"
+			conversation.StatusChangedAt = &now
+			reason := "Tek taraflı mesaj limiti aşıldı"
+			conversation.RestrictionReason = &reason
+		}
+	}
+
+	return h.db.Save(conversation).Error
 }

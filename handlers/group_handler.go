@@ -55,11 +55,29 @@ func generateInviteToken() (string, error) {
 	return hex.EncodeToString(bytes), nil
 }
 
-// getGroupParticipantIDs group'taki aktif üyelerin ID listesini döndür
+// getGroupParticipantIDs group'taki aktif üyelerin ID listesini döndür.
+// DİQQƏT: bura `invite_status='pending'` (dəvət olunmuş amma qəbul etməmiş)
+// üzvləri də daxildir — üzvlük/dəvət olayları (join/leave/invite/accept) üçün
+// bu doğrudur. Mesaj MƏZMUNU yaymaq üçün getActiveGroupMemberIDs istifadə et.
 func getGroupParticipantIDs(conversationID uint) []uint {
 	var ids []uint
 	database.DB.Model(&models.ConversationParticipant{}).
 		Where("conversation_id = ? AND left_at IS NULL AND deleted_at IS NULL", conversationID).
+		Pluck("user_id", &ids)
+	return ids
+}
+
+// getActiveGroupMemberIDs — YALNIZ tam qoşulmuş (invite_status='active') üzvlər.
+// Issue 7: mesaj məzmunu (new_group_message, edit/delete/read/reaction/pin)
+// yalnız qəbul etmiş üzvlərə getməlidir. Əvvəllər getGroupParticipantIDs
+// istifadə olunurdu və `pending` dəvətli canlı qrup mesajlarını alırdı (məxfilik
+// sızıntısı) — halbuki tarixçəni yükləyə bilmir (GetGroupMessages active tələb edir).
+// COALESCE: köhnə sətirlərdə invite_status NULL ola bilər → 'active' sayılır
+// (geriyə uyğunluq: mövcud üzvlər filtrlənib kənarda qalmasın).
+func getActiveGroupMemberIDs(conversationID uint) []uint {
+	var ids []uint
+	database.DB.Model(&models.ConversationParticipant{}).
+		Where("conversation_id = ? AND left_at IS NULL AND deleted_at IS NULL AND COALESCE(invite_status,'active') = 'active'", conversationID).
 		Pluck("user_id", &ids)
 	return ids
 }
