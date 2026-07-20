@@ -123,27 +123,52 @@ func (h *LiveHub) Run() {
 					Data: eventData,
 				})
 
+				// Anonim yayın: qoşulma bildirişi də gizlənməlidir — əks halda
+				// "X qoşuldu" yazısı kimliyi açıb verirdi. Göndərənin ÖZÜ real
+				// adını görür, qalan hər kəsə Anonym#### gedir.
 				joinData, _ := json.Marshal(map[string]interface{}{
 					"user_id":   client.UserID,
 					"user_name": client.Name,
 				})
-				go func(roomID uint, senderID uint, data json.RawMessage) {
+				anonJoinData := joinData
+				if _, anonName, isAnon := AnonymizeLiveSender(
+					client.RoomID, client.UserID, 0, client.Name,
+				); isAnon {
+					anonJoinData, _ = json.Marshal(map[string]interface{}{
+						"user_id":      0,
+						"user_name":    anonName,
+						"is_anonymous": true,
+					})
+				}
+
+				go func(roomID uint, senderID uint, data, anonData json.RawMessage) {
 					h.mu.RLock()
 					clients := h.rooms[roomID]
 					h.mu.RUnlock()
-					payload, _ := json.Marshal(map[string]interface{}{
-						"type":      "user_joined",
-						"sender_id": senderID,
-						"room_id":   roomID,
-						"data":      data,
-					})
+
+					build := func(d json.RawMessage) []byte {
+						p, _ := json.Marshal(map[string]interface{}{
+							"type":      "user_joined",
+							"sender_id": senderID,
+							"room_id":   roomID,
+							"data":      d,
+						})
+						return p
+					}
+					selfPayload := build(data)
+					othersPayload := build(anonData)
+
 					for _, c := range clients {
+						payload := othersPayload
+						if c.UserID == senderID {
+							payload = selfPayload
+						}
 						select {
 						case c.Send <- payload:
 						default:
 						}
 					}
-				}(client.RoomID, client.UserID, joinData)
+				}(client.RoomID, client.UserID, joinData, anonJoinData)
 			}
 
 			// MAFIA: otaqda aktiv mafia oyunu varsa, qoşulan adama fərdi
@@ -1648,9 +1673,18 @@ func (h *LiveHub) SetLiveSpam(c *gin.Context) {
 			})
 		} else {
 			// Shadow-ban götürüldü: user yenidən "qoşuldu".
+			// Anonim yayında bu bildiriş də kimliyi açmamalıdır.
+			joinUserID := uint(userID)
+			joinName := ar.userName
+			if _, anonName, isAnon := AnonymizeLiveSender(
+				ar.roomID, uint(userID), 0, ar.userName,
+			); isAnon {
+				joinUserID = 0
+				joinName = anonName
+			}
 			d, _ := json.Marshal(map[string]interface{}{
-				"user_id":   uint(userID),
-				"user_name": ar.userName,
+				"user_id":   joinUserID,
+				"user_name": joinName,
 			})
 			visibilityPayload, _ = json.Marshal(map[string]interface{}{
 				"type":    "user_joined",
