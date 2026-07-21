@@ -93,6 +93,53 @@ func liveAnonStateFor(roomID uint) *liveAnonState {
 
 // InvalidateLiveAnonCache — rol degisiminde (sahneye cikma/inme) cagrilir ki
 // yeni broadcaster'in kimligi hemen acilsin.
+// isLiveRoomAnonymous — oda anonim yayin modunda mi (cache'li).
+func isLiveRoomAnonymous(roomID uint) bool {
+	return liveAnonStateFor(roomID).anonymous
+}
+
+// ResolveKickTarget — kick event'lerinde hedef user id'yi cozer.
+//
+// Normal yayinda istemci `target_user_id` gonderir ve is biter. ANONIM
+// yayinda ise dinleyicilerin user_id'si 0 gittigi icin istemci bunun yerine
+// `target_alias` ("Anonym1234") gonderir; burada odadaki adaylar taranarak
+// gercek id bulunur.
+//
+// dataMap: event data'si. candidateIDs: odadaki aktif client id'leri.
+// Donen 0 ise hedef bulunamadi.
+func ResolveKickTarget(roomID uint, dataMap map[string]interface{}, candidateIDs []uint) uint {
+	// 1) Klasik yol — gecerli bir id geldiyse onu kullan.
+	if v, ok := dataMap["target_user_id"].(float64); ok && uint(v) != 0 {
+		return uint(v)
+	}
+	// 2) Anonim yol — alias'tan coz.
+	if alias, ok := dataMap["target_alias"].(string); ok {
+		return ResolveLiveAnonAlias(roomID, alias, candidateIDs)
+	}
+	return 0
+}
+
+// ResolveLiveAnonAlias — anonim takma addan GERCEK user id'yi bulur.
+//
+// Anonim yayinda dinleyicilerin user_id'si 0 gonderildigi icin host, atmak
+// istedigi kisiyi yalnizca "Anonym1234" olarak gorur. Host o alias'i (veya
+// participant_token'i) geri gonderir; burada odadaki adaylar taranip alias
+// yeniden uretilerek eslesen bulunur. Host kimi attigini OGRENMEZ — cozum
+// sunucu tarafinda kalir.
+//
+// Bulunamazsa 0 doner.
+func ResolveLiveAnonAlias(roomID uint, alias string, candidateIDs []uint) uint {
+	if alias == "" {
+		return 0
+	}
+	for _, id := range candidateIDs {
+		if BuildLiveAnonAlias(roomID, id) == alias {
+			return id
+		}
+	}
+	return 0
+}
+
 func InvalidateLiveAnonCache(roomID uint) {
 	liveAnonMu.Lock()
 	delete(liveAnonCache, roomID)

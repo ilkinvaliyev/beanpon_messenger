@@ -997,12 +997,21 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 			return
 		}
 
-		targetUserIDFloat, ok := dataMap["target_user_id"].(float64)
-		if !ok {
+		// Anonim yayinda dinleyicinin user_id'si 0 gelir; o zaman istemci
+		// `target_alias` gonderir ve hedef sunucuda cozulur (host kimi
+		// attigini ogrenmez).
+		h.mu.RLock()
+		ksCandidates := make([]uint, 0, len(roomClients))
+		for id := range roomClients {
+			ksCandidates = append(ksCandidates, id)
+		}
+		h.mu.RUnlock()
+
+		targetUserID := ResolveKickTarget(event.RoomID, dataMap, ksCandidates)
+		if targetUserID == 0 {
 			return
 		}
 
-		targetUserID := uint(targetUserIDFloat)
 		if targetClient, exists := roomClients[targetUserID]; exists {
 			targetClient.Role = "audience"
 			// Sahnədən düşdü — anonim yayında yenidən gizlənir.
@@ -1370,7 +1379,18 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 		if err := json.Unmarshal(event.Data, &d); err != nil {
 			return
 		}
-		targetID := uint(d["target_user_id"].(float64))
+		// Anonim yayin: user_id 0 gelirse `target_alias` uzerinden coz.
+		h.mu.RLock()
+		kflCandidates := make([]uint, 0, len(roomClients))
+		for id := range roomClients {
+			kflCandidates = append(kflCandidates, id)
+		}
+		h.mu.RUnlock()
+
+		targetID := ResolveKickTarget(event.RoomID, d, kflCandidates)
+		if targetID == 0 {
+			return
+		}
 
 		h.mu.RLock()
 		tClient, tExists := roomClients[targetID]
@@ -1389,15 +1409,37 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 			}
 		}()
 
-		payload, _ := json.Marshal(map[string]interface{}{
+		// Anonim yayinda gercek id'yi YAYINLAMA — yoksa atilan anonim
+		// dinleyicinin kimligi tum odaya sizardi. Atilan kisinin KENDISI
+		// gercek id'yi alir (kendi ekranini kapatabilsin diye); digerlerine
+		// alias gider.
+		anonRoom := isLiveRoomAnonymous(event.RoomID)
+
+		realPayload, _ := json.Marshal(map[string]interface{}{
 			"type":    "kicked_from_live",
 			"room_id": event.RoomID,
 			"data":    map[string]interface{}{"target_user_id": targetID},
 		})
+		othersPayload := realPayload
+		if anonRoom {
+			othersPayload, _ = json.Marshal(map[string]interface{}{
+				"type":    "kicked_from_live",
+				"room_id": event.RoomID,
+				"data": map[string]interface{}{
+					"target_user_id": 0,
+					"target_alias":   BuildLiveAnonAlias(event.RoomID, targetID),
+				},
+			})
+		}
+
 		h.mu.RLock()
 		for _, c := range roomClients {
+			p := othersPayload
+			if c.UserID == targetID {
+				p = realPayload
+			}
 			select {
-			case c.Send <- payload:
+			case c.Send <- p:
 			default:
 			}
 		}
