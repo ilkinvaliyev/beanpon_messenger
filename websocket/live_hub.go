@@ -40,6 +40,12 @@ type LiveRoomClient struct {
 	// LiveResource-dakı admin yoxlamasının real-time WS qarşılığıdır.
 	IsAdmin bool
 	Send    chan []byte
+
+	// JoinedAt — bu client-in canlı otağa qoşulma anı (UTC). Ayrılanda
+	// (Unregister) müddət hesablanıb Günün Kartının günlük live_seconds-una
+	// əlavə olunur. Host/broadcaster/audience fərq etməz — hamı bu WS axını ilə
+	// qoşulur. Register-də təyin olunur.
+	JoinedAt time.Time
 }
 
 // canModerate — bu client otaqda host-səviyyəli moderasiya əməliyyatı
@@ -102,6 +108,8 @@ func (h *LiveHub) Run() {
 	for {
 		select {
 		case client := <-h.Register:
+			// Qoşulma anı — ayrılanda günlük live_seconds hesablamaq üçün.
+			client.JoinedAt = time.Now().UTC()
 			h.mu.Lock()
 			if _, ok := h.rooms[client.RoomID]; !ok {
 				h.rooms[client.RoomID] = make(map[uint]*LiveRoomClient)
@@ -197,6 +205,9 @@ func (h *LiveHub) Run() {
 					delete(room, client.UserID)
 					close(client.Send)
 					log.Printf("User %d left Live Room %d", client.UserID, client.RoomID)
+					// Günün Kartı: bu canlı sessiyanın müddətini istifadəçinin
+					// günlük live_seconds-una əlavə et (Bakı günlərinə bölərək).
+					addDailyLiveTime(client.UserID, client.JoinedAt, time.Now().UTC())
 				}
 				count = h.visibleCount(client.RoomID)
 				roomExists = true
