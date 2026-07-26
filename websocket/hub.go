@@ -16,6 +16,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 var upgrader = websocket.Upgrader{
@@ -325,17 +326,12 @@ func (h *Hub) maybeMarkLivePushDelivered(message *Message) {
 			return
 		}
 		if res.RowsAffected == 0 {
-			// WS göndərmə yolu mesajı DB-yə ASYNC yazır (readPump-dakı
-			// goroutine) — sətir hələ mövcud olmaya bilər. Bir dəfə qısa
-			// gözləyib təkrar yoxla; yenə 0 olsa (artıq delivered/read və ya
-			// sətir yoxdur) event getmir — client ack-i onsuz da örtəcək.
-			time.Sleep(1 * time.Second)
-			res = h.db.Model(&models.Message{}).
-				Where("id = ? AND delivered = false", msgID).
-				Update("delivered", true)
-			if res.Error != nil || res.RowsAffected == 0 {
-				return
-			}
+			// Issue 60: burada əvvəl 1 saniyəlik `Sleep` + təkrar cəhd vardı.
+			// Səbəbi WS yolunun mesajı ASYNC yazması idi (Issue 1) — o səbəb
+			// ARTIQ YOXDUR: sətir yayımdan ƏVVƏL komit olunur. RowsAffected==0
+			// indi yalnız "artıq delivered/read" və ya "sətir yoxdur" deməkdir;
+			// gözləməyin faydası yox, sadəcə goroutine-i saxlayırdı.
+			return
 		}
 
 		h.SendToUser(senderID, "message_delivered", map[string]interface{}{
@@ -1012,23 +1008,25 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 			UpdatedAt:        createdAt,
 		}
 
-		if err := c.Hub.db.Create(&message).Error; err != nil {
+		// ── Issue 8 + Issue 40: mesaj insert-i və conversation indeks
+		// yeniləməsi (sayğac/status/last_message_at) TEK TRANSACTION.
+		// Issue 8 WS yoluna yeniləməni gətirmişdi, amma REST-dəki eyni
+		// atomiklik boşluğu ilə: xəta udulurdu → mesaj var, siyahı köhnə.
+		if err := c.Hub.db.Transaction(func(tx *gorm.DB) error {
+			if err := tx.Create(&message).Error; err != nil {
+				return err
+			}
+			if conversation != nil {
+				return applyConversationMessageUpdateDB(tx, conversation, c.UserID)
+			}
+			return nil
+		}); err != nil {
 			log.Printf("Mesaj DB'ye yazılamadı (WS): %v", err)
 			c.sendMessage(&OutgoingMessage{
 				Type: "message_error",
 				Data: map[string]interface{}{"error": "message_persist_failed", "code": "SEND_FAILED"},
 			})
 			return
-		}
-
-		// ── Issue 8: WS yolu da conversation sayaç/status/last_message_at
-		// güncəlləməsini etsin (REST ilə eyni). Əks halda: pending→active heç
-		// vaxt keçmir, pending mesaj limiti WS-lə keçilə bilir, söhbət siyahısı
-		// köhnə qalırdı. Xəta yalnız loglanır — mesaj artıq yazılıb.
-		if conversation != nil {
-			if uErr := c.Hub.updateConversationOnMessage(conversation, c.UserID); uErr != nil {
-				log.Printf("Conversation güncellemesi başarısız (WS): %v", uErr)
-			}
 		}
 
 		// Yenilənmiş status-u götür (pending→active keçmiş ola bilər) —
@@ -1536,6 +1534,10 @@ func (h *Hub) GetUnreadCount(userID uint) int {
 		WHERE receiver_id = ? 
 		AND read = false 
 		AND is_deleted_by_receiver = false
+		-- Issue 59: yalnız DM. Qrup mesajları conversation_id ilə gəlir və ayrı
+		-- axındır; söhbət siyahısındakı CTE onsuz da bu şərti tətbiq edir, ona
+		-- görə rozet ilə sətirlərin cəmi bir-birini tutmurdu.
+		AND conversation_id IS NULL
 	`
 
 	if err := h.db.Raw(query, userID).Scan(&count).Error; err != nil {
@@ -2063,8 +2065,16 @@ func (h *Hub) getOrCreateConversationWithPermission(senderID, receiverID uint) (
 			User2ID: u2,
 			Status:  "pending",
 		}
-		if err := h.db.Create(&newConv).Error; err != nil {
+		// Issue 13: konflikt sükutla udulsun və qazanan sətir oxunsun
+		// (paralel "ilk mesaj" yarışı → iki conversation sətri).
+		if err := h.db.Clauses(clause.OnConflict{DoNothing: true}).Create(&newConv).Error; err != nil {
 			return nil, false, "conversation oluşturulamadı", err
+		}
+		if newConv.ID == 0 {
+			if err := h.db.Where("user1_id = ? AND user2_id = ?", u1, u2).
+				First(&newConv).Error; err != nil {
+				return nil, false, "conversation oluşturulamadı", err
+			}
 		}
 		return &newConv, true, "", nil
 	}
@@ -2084,50 +2094,67 @@ func (h *Hub) getOrCreateConversationWithPermission(senderID, receiverID uint) (
 	return &conversation, true, "", nil
 }
 
-// updateConversationOnMessage — handlers.ConversationHandler.UpdateConversationOnMessage
-// ilə EYNİ məntiq, hub-lokal (import dövrü olmaması üçün). WS gönderim yolu da
-// REST kimi sayğac/status/last_message_at güncəlləməsini etsin (Issue 8).
-// `conversation` artıq yüklənib (getOrCreateConversationWithPermission-dən) və
-// bu metod onun sahələrini yerində dəyişib Save edir — REST davranışının eyni.
-func (h *Hub) updateConversationOnMessage(conversation *models.Conversation, senderID uint) error {
-	if conversation == nil {
-		return nil
-	}
+// applyConversationMessageUpdateDB — handlers.applyConversationMessageUpdate
+// ilə eyni məntiq (paketlər arası ixrac etməmək üçün təkrarlanır).
+func applyConversationMessageUpdateDB(db *gorm.DB, conversation *models.Conversation, senderID uint) error {
 	now := time.Now().UTC()
 
-	if conversation.FirstMessageAt == nil {
-		conversation.FirstMessageAt = &now
+	updates := map[string]interface{}{
+		"last_message_at":      now,
+		"total_messages_count": gorm.Expr("total_messages_count + 1"),
+		"first_message_at":     gorm.Expr("COALESCE(first_message_at, ?)", now),
 	}
-	conversation.LastMessageAt = &now
-
 	if senderID == conversation.User1ID {
-		conversation.User1MessageCount++
+		updates["user1_message_count"] = gorm.Expr("user1_message_count + 1")
 	} else {
-		conversation.User2MessageCount++
+		updates["user2_message_count"] = gorm.Expr("user2_message_count + 1")
 	}
-	conversation.TotalMessagesCount++
+	if err := db.Model(&models.Conversation{}).
+		Where("id = ?", conversation.ID).
+		Updates(updates).Error; err != nil {
+		return err
+	}
 
-	// Hər iki tərəf yazıbsa → active.
-	if conversation.User1MessageCount > 0 && conversation.User2MessageCount > 0 {
+	var fresh models.Conversation
+	if err := db.Select("id", "status", "user1_message_count", "user2_message_count", "max_pending_messages").
+		Where("id = ?", conversation.ID).First(&fresh).Error; err != nil {
+		return nil
+	}
+	conversation.User1MessageCount = fresh.User1MessageCount
+	conversation.User2MessageCount = fresh.User2MessageCount
+	conversation.Status = fresh.Status
+
+	switch {
+	case fresh.User1MessageCount > 0 && fresh.User2MessageCount > 0 && fresh.Status != "active":
+		if err := db.Model(&models.Conversation{}).
+			Where("id = ? AND status <> ?", conversation.ID, "active").
+			Updates(map[string]interface{}{
+				"status":                    "active",
+				"has_previous_conversation": true,
+				"status_changed_at":         now,
+			}).Error; err != nil {
+			return err
+		}
 		conversation.Status = "active"
-		conversation.HasPreviousConversation = true
-		conversation.StatusChangedAt = &now
-	}
 
-	// Pending-də tək tərəfli mesaj limiti.
-	if conversation.Status == "pending" {
-		maxCount := conversation.User1MessageCount
-		if conversation.User2MessageCount > maxCount {
-			maxCount = conversation.User2MessageCount
+	case fresh.Status == "pending":
+		maxCount := fresh.User1MessageCount
+		if fresh.User2MessageCount > maxCount {
+			maxCount = fresh.User2MessageCount
 		}
-		if (conversation.User1MessageCount == 0 || conversation.User2MessageCount == 0) &&
-			maxCount > conversation.MaxPendingMessages {
+		if (fresh.User1MessageCount == 0 || fresh.User2MessageCount == 0) &&
+			maxCount > fresh.MaxPendingMessages {
+			if err := db.Model(&models.Conversation{}).
+				Where("id = ? AND status = ?", conversation.ID, "pending").
+				Updates(map[string]interface{}{
+					"status":             "restricted",
+					"status_changed_at":  now,
+					"restriction_reason": "Tek taraflı mesaj limiti aşıldı",
+				}).Error; err != nil {
+				return err
+			}
 			conversation.Status = "restricted"
-			conversation.StatusChangedAt = &now
-			reason := "Tek taraflı mesaj limiti aşıldı"
-			conversation.RestrictionReason = &reason
 		}
 	}
-
-	return h.db.Save(conversation).Error
+	return nil
 }

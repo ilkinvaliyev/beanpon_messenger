@@ -18,6 +18,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type GroupMessageHandler struct {
@@ -368,7 +369,9 @@ func (h *GroupMessageHandler) SendGroupMessage(c *gin.Context) {
 				ReadAt:         readNow,
 				CreatedAt:      readNow,
 			}
-			database.DB.Create(&read)
+			// Issue 15: idempotent — eyni cüt paralel yollardan yazıla bilir.
+			// Hədəfsiz forma — indekssiz də təhlükəsiz (yuxarıdakı şərhə bax).
+			database.DB.Clauses(clause.OnConflict{DoNothing: true}).Create(&read)
 			// last_read yenilə (unread count sorğusu message_reads-ə baxır,
 			// amma participant last_read-i də tutarlı saxla).
 			database.DB.Model(&models.ConversationParticipant{}).
@@ -675,7 +678,11 @@ func (h *GroupMessageHandler) GetGroupMessages(c *gin.Context) {
 		      WHERE (ub.blocker_id = ? AND ub.blocked_id = m.sender_id)
 		         OR (ub.blocker_id = m.sender_id AND ub.blocked_id = ?)
 		  )
-		ORDER BY m.created_at DESC
+		-- Issue 20: created_at UNİKAL DEYİL (sürətli/toplu göndərmə eyni
+		-- timestamp-ı paylaşır). Yalnız created_at ilə sıralamaq + OFFSET
+		-- səhifə sərhədində sətir ATLADIR və ya TƏKRARLAYIR. id ilə TAM
+		-- sıralama bunu aradan qaldırır (DM yolu ilə eyni).
+		ORDER BY m.created_at DESC, m.id DESC
 		LIMIT ? OFFSET ?
 	`, userID, conversationID, joinedAtFilter, me.ClearedAt,
 		aroundCreatedAt, aroundCreatedAt,
@@ -895,16 +902,26 @@ func (h *GroupMessageHandler) GetMessageReads(c *gin.Context) {
 
 // markGroupMessagesRead — kullanıcının conversation'daki okunmamış mesajlarını işaretle
 func (h *GroupMessageHandler) markGroupMessagesRead(userID, conversationID uint) {
-	// Henüz okunmamış mesaj ID'leri bul
+	// Henüz okunmamış mesaj ID'leri bul.
+	//
+	// Issue 12/15: pəncərə mesaj SİYAHISI ilə eyni olmalıdır — `joined_at`
+	// ƏVVƏLİ və `cleared_at` ƏVVƏLİ mesajlar bu üzv üçün GÖRÜNMÜR, deməli
+	// "oxundu" da yazılmamalıdır. Əvvəl yazılırdı: qrupa yeni qoşulan üzv
+	// bütün köhnə tarixçəyə `message_reads` sətri əlavə edir, bu da BAŞQA
+	// üzvlərin "N nəfər gördü" sayğacını şişirdirdi.
 	var unreadIDs []string
 	database.DB.Raw(`
 		SELECT m.id FROM messages m
+		JOIN conversation_participants cp
+		  ON cp.conversation_id = m.conversation_id AND cp.user_id = ?
 		LEFT JOIN message_reads mr ON mr.message_id = m.id AND mr.user_id = ?
 		WHERE m.conversation_id = ?
 		  AND m.sender_id != ?
 		  AND mr.id IS NULL
 		  AND m.deleted_at IS NULL
-	`, userID, conversationID, userID).Pluck("id", &unreadIDs)
+		  AND m.created_at >= COALESCE(cp.joined_at, '1970-01-01'::timestamptz)
+		  AND m.created_at > COALESCE(cp.cleared_at, '1970-01-01'::timestamptz)
+	`, userID, userID, conversationID, userID).Pluck("id", &unreadIDs)
 
 	if len(unreadIDs) == 0 {
 		return
@@ -922,8 +939,19 @@ func (h *GroupMessageHandler) markGroupMessagesRead(userID, conversationID uint)
 		})
 	}
 
-	// Bulk insert, çakışmada skip
-	database.DB.Clauses().CreateInBatches(reads, 100)
+	// Issue 15: `Clauses()` ARQÜMANSIZ çağırılırdı → "çakışmada skip" yorumu
+	// tətbiq OLUNMURDU. Eyni (message_id, user_id) cütü paralel yollardan
+	// (göndərim anındakı avto-oxundu goroutine-i, çox-cihaz açılış,
+	// MarkGroupConversationRead) təkrar yazıla bilirdi; `read_count` =
+	// COUNT(*) olduğu üçün "N nəfər gördü" gerçək oxuyucu sayını AŞIRDI.
+	// UNIQUE indeks üçün: MIGRATION_message_reads_unique.md
+	// DEPLOY TƏHLÜKƏSİZLİYİ: hədəf sütunlar YAZILMIR. `ON CONFLICT (a,b)`
+	// forması uyğun UNIQUE indeks YOXDURSA Postgres-də DƏRHAL XƏTA verir
+	// ("there is no unique or exclusion constraint matching...") — yəni kod
+	// migration-dan əvvəl deploy olunsa oxundu-işarələmə tamamilə qırılardı.
+	// Hədəfsiz `ON CONFLICT DO NOTHING` isə indekssiz də işləyir (adi INSERT
+	// kimi davranır), indeks yaradıldıqdan sonra isə dublikatları susdurur.
+	database.DB.Clauses(clause.OnConflict{DoNothing: true}).CreateInBatches(reads, 100)
 
 	// participant last_read güncelle
 	lastID := unreadIDs[len(unreadIDs)-1]
@@ -1427,7 +1455,8 @@ func (h *GroupMessageHandler) GetGroupStarred(c *gin.Context) {
 		WHERE gms.conversation_id = ?
 		  AND gms.user_id = ?
 		  AND m.deleted_at IS NULL
-		ORDER BY m.created_at DESC
+		-- Issue 20: created_at unikal deyil → id ilə tam sıralama.
+		ORDER BY m.created_at DESC, m.id DESC
 	`, conversationID, userID).Scan(&rows)
 
 	result := []gin.H{}

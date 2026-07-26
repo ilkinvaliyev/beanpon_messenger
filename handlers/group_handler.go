@@ -1235,12 +1235,20 @@ func (h *GroupHandler) GetMyGroups(c *gin.Context) {
 			-- Flutter epoch-0 ilə siyahının ƏN DİBİNƏ atırdı (görünməz kimi).
 			-- Fallback: qoşulma/yaranma vaxtı → yeni qrup yuxarılarda görünür.
 			COALESCE(c.last_message_at, cp.joined_at, c.created_at) as last_message_at,
+			-- Issue 12: oxunmamış sayğacı, mesaj SİYAHISI ilə EYNİ pəncərəni
+			-- işlətməlidir. Əvvəl bu şərtlər yox idi: qrupa yeni qoşulan üzv
+			-- 500 köhnə mesaj üçün rozet görürdü — halbuki GetGroupMessages
+			-- created_at >= joined_at (və > cleared_at) tətbiq etdiyi üçün
+			-- həmin mesajları AÇA da bilmirdi. Sil-mənim-üçün sonrası da
+			-- təmizlənmiş mesajlar sayılmağa davam edirdi.
 			(SELECT COUNT(*) FROM messages m
 			 LEFT JOIN message_reads mr ON mr.message_id = m.id AND mr.user_id = ?
 			 WHERE m.conversation_id = c.id
 			   AND m.sender_id != ?
 			   AND mr.id IS NULL
 			   AND m.deleted_at IS NULL
+			   AND m.created_at >= COALESCE(cp.joined_at, '1970-01-01'::timestamptz)
+			   AND m.created_at > COALESCE(cp.cleared_at, '1970-01-01'::timestamptz)
 			   AND NOT EXISTS (
 			       SELECT 1 FROM user_blocks ub
 			       WHERE (ub.blocker_id = ? AND ub.blocked_id = m.sender_id)

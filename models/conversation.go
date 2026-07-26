@@ -6,7 +6,18 @@ import (
 )
 
 type Conversation struct {
-	ID                      uint       `json:"id" gorm:"primaryKey"`
+	ID uint `json:"id" gorm:"primaryKey"`
+	// Issue 13: cüt HƏMİŞƏ normallaşdırılmış saxlanılır (kiçik id = user1).
+	// Əvvəl yalnız ayrı-ayrı indekslər vardı: iki paralel "ilk mesaj" hər ikisi
+	// də SELECT-də tapmayıb INSERT edirdi → eyni cüt üçün İKİ conversation →
+	// bölünmüş tarixçə, bölünmüş sayğaclar (pending limiti pozulur), uyuşmayan
+	// mute/pin/nickname/wallpaper. Kod artıq upsert göndərir; DB indeksi üçün
+	// bax: MIGRATION_conversations_pair_unique.md
+	//
+	// GORM `uniqueIndex` TAG-I QOYULMADI (bilərəkdən): bu cədvəl İKİLİ
+	// məqsədlidir — qrup sətirləri (`chat_type='group'`) də buradadır və onlarda
+	// user1/user2 mənasızdır. Tag PARTIAL indeks yarada bilmir; hər hansı gələcək
+	// AutoMigrate qrup sətirlərini qıracaq TAM unique indeks yaradardı.
 	User1ID                 uint       `json:"user1_id" gorm:"not null;index"`
 	User2ID                 uint       `json:"user2_id" gorm:"not null;index"`
 	Status                  string     `json:"status" gorm:"type:varchar(20);default:'pending';check:status IN ('pending','active','restricted')"`

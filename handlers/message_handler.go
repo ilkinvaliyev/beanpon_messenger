@@ -34,6 +34,8 @@ type MessageHandler struct {
 		HandleMessageRead(messageID string, senderID, readerID uint)
 		IsUserOnline(userID uint) bool
 		SendToUser(userID uint, messageType string, data interface{})
+		// Issue 19: oxundu yolunda TEK aqreqat unread yeniləməsi üçün.
+		SendUnreadCountUpdate(userID uint)
 	}
 	// moderationQueue — opsional. nil olduqda moderasiya sakitcə atlanır.
 	moderationQueue moderationEnqueuer
@@ -47,6 +49,7 @@ func NewMessageHandler(encryptionService interface {
 	HandleMessageRead(messageID string, senderID, readerID uint)
 	IsUserOnline(userID uint) bool
 	SendToUser(userID uint, messageType string, data interface{})
+	SendUnreadCountUpdate(userID uint)
 }) *MessageHandler {
 	return &MessageHandler{
 		encryptionService: encryptionService,
@@ -224,15 +227,23 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 		UpdatedAt:        time.Now().UTC(),
 	}
 
-	if err := database.DB.Create(&message).Error; err != nil {
+	// Issue 40: mesaj insert-i + conversation indeks yeniləməsi TEK
+	// TRANSACTION. Əvvəl ayrı-ayrı idi və conversation yeniləməsinin xətası
+	// yalnız log-lanıb UDULURDU: mesaj sətri komit olunur, amma söhbət
+	// siyahısındakı `last_message_at`/sayğaclar/status köhnə qalırdı →
+	// siyahı yenilənmir, pending→active keçmir. İndi ya hər ikisi, ya heç biri.
+	// Redis I/O (mesaj banı yoxlaması) transaction-dan KƏNARDA — açıq bir
+	// transaction-ı şəbəkə gözləməsi ilə saxlamaq hovuzu kilidləyir.
+	skipConvCreate := conversationHandler.ShouldSkipConversationCreate(senderID.(uint), req.ReceiverID)
+	if err := database.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&message).Error; err != nil {
+			return err
+		}
+		return conversationHandler.UpdateConversationOnMessageTx(tx, senderID.(uint), req.ReceiverID, skipConvCreate)
+	}); err != nil {
+		log.Printf("Mesaj/conversation transaction xətası: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Mesaj kaydedilemedi"})
 		return
-	}
-
-	// Conversation durumunu güncelle
-	if err := conversationHandler.UpdateConversationOnMessage(senderID.(uint), req.ReceiverID); err != nil {
-		// Log et ama işlemi durdurmaja
-		log.Printf("Conversation güncellemesi başarısız: %v", err)
 	}
 
 	// WebSocket üzerinden real-time yayınla (hem gönderen hem alıcıya)
@@ -1365,10 +1376,34 @@ func (h *MessageHandler) markReceivedMessagesAsRead(currentUserID, otherUserID u
 		otherUserID, currentUserID,
 	).Updates(map[string]interface{}{"read": true, "delivered": true})
 
-	// Her mesaj için WebSocket bildirimi gönder
-	for _, msg := range unreadMessages {
-		h.wsHub.HandleMessageRead(msg.ID, msg.SenderID, currentUserID)
+	// Issue 19: TOPLU bildiriş. Əvvəl hər mesaj üçün ayrıca
+	// `HandleMessageRead` çağırılırdı; onların HƏR BİRİ göndərənə bir
+	// `message_read` event-i yollayır VƏ `SendUnreadCountUpdate` ilə tam bir
+	// `COUNT(*)` işə salırdı. N oxunmamış mesajlı bir çatı açmaq = N event +
+	// N eyni nəticəli COUNT sorğusu (25-bağlantılıq hovuzda paralel goroutine
+	// olaraq). İndi: göndərən başına TEK event (message_ids massivi ilə —
+	// qrup yolundakı `group_message_read` ilə eyni forma) və TEK unread
+	// yeniləməsi.
+	if len(unreadMessages) == 0 {
+		return
 	}
+	bySender := make(map[uint][]string, 4)
+	for _, msg := range unreadMessages {
+		bySender[msg.SenderID] = append(bySender[msg.SenderID], msg.ID)
+	}
+	readAt := time.Now().UTC()
+	for senderID, ids := range bySender {
+		h.wsHub.SendToUser(senderID, "message_read", map[string]interface{}{
+			// Köhnə istemçilər tək `message_id` gözləyir → geriyə uyğunluq
+			// üçün ilk id-ni də göndəririk; yenilər `message_ids`-i oxuyur.
+			"message_id":  ids[0],
+			"message_ids": ids,
+			"reader_id":   currentUserID,
+			"read_at":     readAt,
+		})
+	}
+	// Oxuyanın öz rozeti — bir dəfə (N dəfə deyil).
+	h.wsHub.SendUnreadCountUpdate(currentUserID)
 }
 
 // MarkAsRead mesajı okundu olarak işaretle
@@ -1925,7 +1960,10 @@ func (h *MessageHandler) GetUnreadCount(c *gin.Context) {
 	var count int64
 	err := database.DB.Model(&models.Message{}).
 		Joins("JOIN users ON users.id = messages.sender_id").
-		Where("messages.receiver_id = ? AND messages.read = false AND messages.is_deleted_by_receiver = false AND users.deleted_at IS NULL", userID).
+		// Issue 59: `conversation_id IS NULL` — yalnız DM. Siyahıdakı
+		// `unread_counts` CTE-si bu şərti tətbiq edir, bu sayğac isə etmirdi →
+		// rozet ilə sətirlərin cəmi bir-birini tutmurdu.
+		Where("messages.receiver_id = ? AND messages.read = false AND messages.is_deleted_by_receiver = false AND messages.conversation_id IS NULL AND users.deleted_at IS NULL", userID).
 		Count(&count).Error
 
 	if err != nil {

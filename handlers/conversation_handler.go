@@ -11,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type ConversationHandler struct {
@@ -41,6 +42,13 @@ func NewConversationHandler(wsHub interface {
 
 // GetOrCreateConversation iki kullanıcı arasında conversation getir veya oluştur
 func (h *ConversationHandler) GetOrCreateConversation(user1ID, user2ID uint) (*models.Conversation, error) {
+	return h.getOrCreateConversationTx(database.DB, user1ID, user2ID)
+}
+
+// getOrCreateConversationTx — Issue 40: verilən handle (adi bağlantı VƏ YA
+// transaction) üzərində işləyir ki, mesaj insert-i ilə eyni transaction-a
+// qoşula bilsin.
+func (h *ConversationHandler) getOrCreateConversationTx(db *gorm.DB, user1ID, user2ID uint) (*models.Conversation, error) {
 	// Küçük ID'yi user1, büyük ID'yi user2 yap (tutarlılık için)
 	if user1ID > user2ID {
 		user1ID, user2ID = user2ID, user1ID
@@ -49,7 +57,7 @@ func (h *ConversationHandler) GetOrCreateConversation(user1ID, user2ID uint) (*m
 	var conversation models.Conversation
 
 	// Önce mevcut conversation'ı ara
-	err := database.DB.Where("user1_id = ? AND user2_id = ?", user1ID, user2ID).First(&conversation).Error
+	err := db.Where("user1_id = ? AND user2_id = ?", user1ID, user2ID).First(&conversation).Error
 
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		// Yeni conversation oluştur
@@ -73,12 +81,12 @@ func (h *ConversationHandler) GetOrCreateConversation(user1ID, user2ID uint) (*m
 		}
 
 		// Follow ilişkilerini kontrol et
-		h.updateFollowRelations(&conversation)
+		h.updateFollowRelations(db, &conversation)
 
 		// 🆕 YENİ: Screenshot protection kontrolü
 		// User1'in ayarlarını kontrol et
 		var user1Settings models.UserSettings
-		if err := database.DB.Where("user_id = ?", user1ID).First(&user1Settings).Error; err == nil {
+		if err := db.Where("user_id = ?", user1ID).First(&user1Settings).Error; err == nil {
 			if user1Settings.ConversationScreenshotDisabled {
 				conversation.User1ScreenshotDisabled = true
 				now := time.Now()
@@ -88,7 +96,7 @@ func (h *ConversationHandler) GetOrCreateConversation(user1ID, user2ID uint) (*m
 
 		// User2'nin ayarlarını kontrol et
 		var user2Settings models.UserSettings
-		if err := database.DB.Where("user_id = ?", user2ID).First(&user2Settings).Error; err == nil {
+		if err := db.Where("user_id = ?", user2ID).First(&user2Settings).Error; err == nil {
 			if user2Settings.ConversationScreenshotDisabled {
 				conversation.User2ScreenshotDisabled = true
 				now := time.Now()
@@ -96,8 +104,24 @@ func (h *ConversationHandler) GetOrCreateConversation(user1ID, user2ID uint) (*m
 			}
 		}
 
-		if err := database.DB.Create(&conversation).Error; err != nil {
+		// Issue 13: SELECT-sonra-INSERT yarışı. İki paralel "ilk mesaj" hər
+		// ikisi də yuxarıdakı SELECT-də tapmır və hər ikisi INSERT edirdi →
+		// eyni cüt üçün İKİ conversation. İndi konflikt sükutla udulur və
+		// qazanan sətir yenidən oxunur (upsert semantikası).
+		// DEPLOY TƏHLÜKƏSİZLİYİ: hədəf sütunlar YAZILMIR — `ON CONFLICT (a,b)`
+		// uyğun UNIQUE indeks yoxdursa Postgres XƏTA verir. Hədəfsiz forma
+		// indekssiz adi INSERT kimi davranır (köhnə davranış, yarış qalır),
+		// indeks yaradıldıqdan sonra isə upsert olur.
+		// Bax: MIGRATION_conversations_pair_unique.md
+		if err := db.Clauses(clause.OnConflict{DoNothing: true}).Create(&conversation).Error; err != nil {
 			return nil, err
+		}
+		if conversation.ID == 0 {
+			// Konflikt oldu (başqa istək bizi qabaqladı) → qazananı oxu.
+			if err := db.Where("user1_id = ? AND user2_id = ?", user1ID, user2ID).
+				First(&conversation).Error; err != nil {
+				return nil, err
+			}
 		}
 	} else if err != nil {
 		return nil, err
@@ -106,17 +130,24 @@ func (h *ConversationHandler) GetOrCreateConversation(user1ID, user2ID uint) (*m
 	return &conversation, nil
 }
 
-// updateFollowRelations follow ilişkilerini güncelle
-func (h *ConversationHandler) updateFollowRelations(conversation *models.Conversation) {
+// updateFollowRelations follow ilişkilerini güncelle.
+//
+// Issue 40 (KRİTİK): `db` PARAMETRİK olmalıdır. Bu funksiya artıq transaction
+// içindən çağırıla bilir; qlobal `database.DB` işlətsəydi transaction öz
+// bağlantısını TUTARKƏN hovuzdan İKİNCİ bağlantı istəyərdi. Hovuz 25 ilə
+// məhduddur (database.go): 25 paralel "ilk mesaj" hər biri bir bağlantı tutub
+// 26-cını gözləyər → heç biri buraxa bilməz → bütün DB girişi kilidlənər.
+// Sorğularda kontekst/timeout yoxdur, yəni kilid ƏBƏDİDİR.
+func (h *ConversationHandler) updateFollowRelations(db *gorm.DB, conversation *models.Conversation) {
 	// follows tablosunu kontrol et (eğer varsa)
 	var count1, count2 int64
 
 	// User1 -> User2 follow kontrolü
-	database.DB.Table("follows").Where("follower_id = ? AND following_id = ?",
+	db.Table("follows").Where("follower_id = ? AND following_id = ?",
 		conversation.User1ID, conversation.User2ID).Count(&count1)
 
 	// User2 -> User1 follow kontrolü
-	database.DB.Table("follows").Where("follower_id = ? AND following_id = ?",
+	db.Table("follows").Where("follower_id = ? AND following_id = ?",
 		conversation.User2ID, conversation.User1ID).Count(&count2)
 
 	conversation.User1FollowsUser2 = count1 > 0
@@ -305,72 +336,150 @@ func (h *ConversationHandler) checkConversationPermission(conversation *models.C
 
 // UpdateConversationOnMessage mesaj gönderildikten sonra conversation güncelle
 func (h *ConversationHandler) UpdateConversationOnMessage(senderID, receiverID uint) error {
+	return h.UpdateConversationOnMessageTx(database.DB, senderID, receiverID,
+		h.ShouldSkipConversationCreate(senderID, receiverID))
+}
+
+// ShouldSkipConversationCreate — Issue 40: mesaj banı yoxlaması REDİS I/O edir
+// (`models.IsMessagingBanned` → cache, 1 sn timeout). Transaction İÇİNDƏ
+// çağırılsaydı yavaş/əlçatmaz Redis açıq bir Postgres transaction-ını (və onun
+// `messages` sətir kilidini) saniyələrlə tutardı. Ona görə çağıran bunu
+// transaction-dan ƏVVƏL çağırır və nəticəni ötürür.
+//
+// `true` → söhbət YOXDURSA yaratma (banlı istifadəçi yeni söhbət aça bilməz).
+func (h *ConversationHandler) ShouldSkipConversationCreate(senderID, receiverID uint) bool {
+	if !models.IsMessagingBanned(database.DB, senderID) {
+		return false
+	}
+	var existing models.Conversation
+	err := database.DB.Where(
+		"(user1_id = ? AND user2_id = ?) OR (user1_id = ? AND user2_id = ?)",
+		senderID, receiverID, receiverID, senderID,
+	).First(&existing).Error
+	// Söhbət yoxdursa → yaratma. Varsa → normal davam (ban yalnız YENİ söhbətə).
+	return errors.Is(err, gorm.ErrRecordNotFound)
+}
+
+// UpdateConversationOnMessageTx — Issue 40: mesaj insert-i ilə EYNİ
+// transaction içində çağırıla bilsin deyə handle parametrik.
+//
+// `skipCreate` — `ShouldSkipConversationCreate`-in transaction-dan ƏVVƏL
+// hesablanmış nəticəsi (Redis I/O transaction içində olmasın deyə).
+func (h *ConversationHandler) UpdateConversationOnMessageTx(db *gorm.DB, senderID, receiverID uint, skipCreate bool) error {
 	// 🚫 SPAM KORUMASI: mesaj banlı kullanıcı YENİ conversation başlatamaz.
 	// Conversation yoksa ve gönderenin mesaj banı varsa sessizce çık
 	// (conversation oluşturulmaz, hata da dönülmez). Conversation zaten
 	// varsa dokunma — bu kontrol yalnızca ilk conversation create için.
-	if models.IsMessagingBanned(database.DB, senderID) {
-		var existing models.Conversation
-		convErr := database.DB.Where(
-			"(user1_id = ? AND user2_id = ?) OR (user1_id = ? AND user2_id = ?)",
-			senderID, receiverID, receiverID, senderID,
-		).First(&existing).Error
-		if errors.Is(convErr, gorm.ErrRecordNotFound) {
-			return nil
-		}
+	if skipCreate {
+		return nil
 	}
 
-	conversation, err := h.GetOrCreateConversation(senderID, receiverID)
+	conversation, err := h.getOrCreateConversationTx(db, senderID, receiverID)
 	if err != nil {
 		return err
 	}
 
-	now := time.Now()
+	return applyConversationMessageUpdate(db, conversation, senderID)
+}
 
-	// İlk mesaj mı?
+// applyConversationMessageUpdate — Issue 14: sayğac artımı ATOMİK SQL ilə.
+//
+// Əvvəl artım Go-da yaddaşdakı nüsxə üzərində edilir, sonra `Save` BÜTÜN
+// sütunları geri yazırdı. İki nəticəsi vardı:
+//  1. İTMİŞ ARTIM — paralel iki göndərmə eyni dəyəri oxuyub eyni nəticəyə
+//     artırırdı (sayğac 2 yerinə 1 artır) → pending limiti yanlış işləyir.
+//  2. EZİLƏN AYARLAR — sətir oxunduqdan sonra `Save`-ə qədər dəyişən ƏLAQƏSİZ
+//     sütunlar (mute/pin/archive/nickname/wallpaper) köhnə dəyərlərlə geri
+//     yazılırdı.
+//
+// İndi: sayğaclar `col = col + 1` ilə DB tərəfində artır; status keçidləri
+// KOMİT OLUNMUŞ dəyərlər yenidən oxunaraq, yalnız status sütunları yenilənərək
+// tətbiq olunur. `db` transaction ola bilər (Issue 40).
+func applyConversationMessageUpdate(db *gorm.DB, conversation *models.Conversation, senderID uint) error {
+	now := time.Now().UTC()
+
+	updates := map[string]interface{}{
+		"last_message_at":      now,
+		"total_messages_count": gorm.Expr("total_messages_count + 1"),
+		// COALESCE → yalnız ilk dəfə yazılır (yarışa dayanıqlı).
+		"first_message_at": gorm.Expr("COALESCE(first_message_at, ?)", now),
+	}
+	if senderID == conversation.User1ID {
+		updates["user1_message_count"] = gorm.Expr("user1_message_count + 1")
+	} else {
+		updates["user2_message_count"] = gorm.Expr("user2_message_count + 1")
+	}
+	if err := db.Model(&models.Conversation{}).
+		Where("id = ?", conversation.ID).
+		Updates(updates).Error; err != nil {
+		return err
+	}
+
+	// Status keçidi üçün KOMİT OLUNMUŞ dəyərləri oxu (yaddaşdakı nüsxə köhnədir).
+	var fresh models.Conversation
+	if err := db.Select("id", "status", "user1_message_count", "user2_message_count", "max_pending_messages", "total_messages_count", "has_previous_conversation").
+		Where("id = ?", conversation.ID).First(&fresh).Error; err != nil {
+		// Sayğaclar artıq yazıldı — status keçidini növbəti mesaj tətbiq edər.
+		return nil
+	}
+
+	// Çağıranın nüsxəsi də təzələnsin (push qapısı statusu oxuyur — Issue 10).
+	conversation.User1MessageCount = fresh.User1MessageCount
+	conversation.User2MessageCount = fresh.User2MessageCount
+	conversation.Status = fresh.Status
+	// Köhnə `Save` yolu bunları da sinxron saxlayırdı — parite üçün.
+	conversation.LastMessageAt = &now
+	conversation.TotalMessagesCount = fresh.TotalMessagesCount
 	if conversation.FirstMessageAt == nil {
 		conversation.FirstMessageAt = &now
 	}
-
-	// Son mesaj zamanını güncelle
-	conversation.LastMessageAt = &now
-
-	// Mesaj sayaçlarını artır
-	if senderID == conversation.User1ID {
-		conversation.User1MessageCount++
-	} else {
-		conversation.User2MessageCount++
-	}
-
-	conversation.TotalMessagesCount++
-
-	// Her iki taraftan da mesaj varsa active yap ve previous conversation işaretle
-	if conversation.User1MessageCount > 0 && conversation.User2MessageCount > 0 {
-		conversation.Status = "active"
+	// `has_previous_conversation` köhnə kodda hər iki sayğac >0 olan HƏR
+	// mesajda yazılırdı; yalnız pending→active keçidində yazsaq, `active`-ə
+	// başqa yolla (updateConversationStatus) keçmiş söhbətlərdə bayraq heç
+	// vaxt qalxmazdı.
+	if fresh.User1MessageCount > 0 && fresh.User2MessageCount > 0 && !conversation.HasPreviousConversation {
+		if err := db.Model(&models.Conversation{}).
+			Where("id = ? AND has_previous_conversation = ?", conversation.ID, false).
+			Update("has_previous_conversation", true).Error; err != nil {
+			return err
+		}
 		conversation.HasPreviousConversation = true
-		conversation.StatusChangedAt = &now
 	}
 
-	// Pending durumda tek taraflı mesaj limitini kontrol et
-	if conversation.Status == "pending" {
-		maxCount := 0
-		if conversation.User1MessageCount > maxCount {
-			maxCount = conversation.User1MessageCount
+	switch {
+	case fresh.User1MessageCount > 0 && fresh.User2MessageCount > 0 && fresh.Status != "active":
+		// Şərtli WHERE: paralel dəyişikliyi əzmə.
+		if err := db.Model(&models.Conversation{}).
+			Where("id = ? AND status <> ?", conversation.ID, "active").
+			Updates(map[string]interface{}{
+				"status":                    "active",
+				"has_previous_conversation": true,
+				"status_changed_at":         now,
+			}).Error; err != nil {
+			return err
 		}
-		if conversation.User2MessageCount > maxCount {
-			maxCount = conversation.User2MessageCount
-		}
+		conversation.Status = "active"
 
-		// Sadece bir taraf yazmışsa ve limit aşılmışsa restricted yap
-		if (conversation.User1MessageCount == 0 || conversation.User2MessageCount == 0) &&
-			maxCount > conversation.MaxPendingMessages {
+	case fresh.Status == "pending":
+		maxCount := fresh.User1MessageCount
+		if fresh.User2MessageCount > maxCount {
+			maxCount = fresh.User2MessageCount
+		}
+		if (fresh.User1MessageCount == 0 || fresh.User2MessageCount == 0) &&
+			maxCount > fresh.MaxPendingMessages {
+			if err := db.Model(&models.Conversation{}).
+				Where("id = ? AND status = ?", conversation.ID, "pending").
+				Updates(map[string]interface{}{
+					"status":             "restricted",
+					"status_changed_at":  now,
+					"restriction_reason": "Tek taraflı mesaj limiti aşıldı",
+				}).Error; err != nil {
+				return err
+			}
 			conversation.Status = "restricted"
-			conversation.StatusChangedAt = &now
-			conversation.RestrictionReason = StringPtr("Tek taraflı mesaj limiti aşıldı")
 		}
 	}
-
-	return database.DB.Save(conversation).Error
+	return nil
 }
 
 // updateConversationStatus conversation durumunu güncelle

@@ -20,6 +20,7 @@ import (
 	"beanpon_messenger/xmpp"
 
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 // AttachXMPP stores the bridge handle on the Hub. Called from main.go after the
@@ -69,46 +70,73 @@ func (h *Hub) IngestDM(senderID, receiverID uint, text, kind, replyToID, storyID
 	}
 
 	messageID := uuid.New().String()
-	createdAt := time.Now()
-
-	conversationStatus := "new"
-	if conversation != nil {
-		conversationStatus = conversation.Status
-	}
+	// Issue 30: REST/WS ilə eyni — UTC. Sütun `timestamp without time zone`
+	// olduqda yerli vaxt yazmaq yolları arasında sıralamanı pozurdu.
+	createdAt := time.Now().UTC()
 
 	var replyPtr *string
 	if replyToID != "" {
 		replyPtr = &replyToID
 	}
 
-	// Fan-out (also persists the conversation update + push). silent=false.
+	// ── Issue 64 (+1, +8, +40): ƏVVƏL PERSİST, SONRA YAY ────────────────────
+	//
+	// Bu yol WS-in KÖHNƏ (səhv) sırasını təkrarlayırdı: `HandleNewMessage` ilə
+	// yayım, ARDINDAN fire-and-forget goroutine-də `db.Create`. Şifrələmə və
+	// ya yazma uğursuz olsa, mesaj hər iki ekranda görünüb DB-də heç vaxt
+	// yaranmırdı — yenidən açanda YOX olurdu (Issue 1-in eyni sinifi).
+	// Üstəlik `updateConversationOnMessage` heç çağırılmırdı: sayğaclar,
+	// pending→active keçidi və `last_message_at` yenilənmirdi (Issue 8).
+	//
+	// İndi WS yolu ilə birebir: şifrələ → (insert + conversation yeniləməsi
+	// TEK transaction) → yalnız uğurda yay.
+	encryptedText, encErr := h.encryptionService.EncryptMessage(text)
+	if encErr != nil {
+		log.Printf("XMPP IngestDM encrypt failed: %v", encErr)
+		h.SendToUser(senderID, "message_error", map[string]interface{}{
+			"error": "message_encrypt_failed", "code": "SEND_FAILED",
+		})
+		return
+	}
+	msg := models.Message{
+		ID:               messageID,
+		SenderID:         senderID,
+		ReceiverID:       &receiverID,
+		ReplyToMessageID: replyPtr,
+		EncryptedText:    encryptedText,
+		Read:             false,
+		CreatedAt:        createdAt,
+		UpdatedAt:        createdAt,
+	}
+	if dbErr := h.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&msg).Error; err != nil {
+			return err
+		}
+		if conversation != nil {
+			return applyConversationMessageUpdateDB(tx, conversation, senderID)
+		}
+		return nil
+	}); dbErr != nil {
+		log.Printf("XMPP IngestDM DB write failed: %v", dbErr)
+		h.SendToUser(senderID, "message_error", map[string]interface{}{
+			"error": "message_persist_failed", "code": "SEND_FAILED",
+		})
+		return
+	}
+
+	// Status yeniləndikdən SONRA oxu (pending→active keçmiş ola bilər) —
+	// push qapısı bunu istifadə edir.
+	conversationStatus := "new"
+	if conversation != nil {
+		conversationStatus = conversation.Status
+	}
+
+	// Komit olundu — indi yay. silent=false.
 	h.HandleNewMessage(senderID, receiverID, messageID, text, kind, createdAt, replyPtr, nil, conversationStatus, false)
 
-	// Persist + moderation, mirroring the WS path's async DB write.
-	go func() {
-		encryptedText, encErr := h.encryptionService.EncryptMessage(text)
-		if encErr != nil {
-			log.Printf("XMPP IngestDM encrypt failed: %v", encErr)
-			return
-		}
-		msg := models.Message{
-			ID:               messageID,
-			SenderID:         senderID,
-			ReceiverID:       &receiverID,
-			ReplyToMessageID: replyPtr,
-			EncryptedText:    encryptedText,
-			Read:             false,
-			CreatedAt:        createdAt,
-			UpdatedAt:        createdAt,
-		}
-		if dbErr := h.db.Create(&msg).Error; dbErr != nil {
-			log.Printf("XMPP IngestDM DB write failed: %v", dbErr)
-			return
-		}
-		if h.moderationEnqueue != nil && kind == "text" {
-			h.moderationEnqueue(messageID, senderID, receiverID, text, createdAt)
-		}
-	}()
+	if h.moderationEnqueue != nil && kind == "text" {
+		h.moderationEnqueue(messageID, senderID, receiverID, text, createdAt)
+	}
 }
 
 // IngestGroup handles a group message that arrived over XMPP. Phase 1 keeps the
