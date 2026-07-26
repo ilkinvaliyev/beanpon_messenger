@@ -1,0 +1,731 @@
+--- a/cmd/main/main.go
++++ b/cmd/main/main.go
+@@ -202,6 +202,13 @@
+ 	// Gin router'ını oluştur
+ 	router := gin.Default()
+ 
++	// Issue 54: multipart parse zamanı RAM-da saxlanılacaq maksimum həcm.
++	// Gin default-u 32 MB-dır; bundan böyük hissələr müvəqqəti fayla axır.
++	// 8 MB → tipik şəkil/səs tamamilə RAM-da qalır, böyük videolar isə diskə
++	// düşür (RAM zirvəsi paralel upload sayına vurulmur). Faylın ÖZ hard
++	// limiti upload_handler.go-dakı http.MaxBytesReader ilə qoyulur.
++	router.MaxMultipartMemory = 8 << 20 // 8 MB
++
+ 	p := ginprom.New(
+ 		ginprom.Engine(router),
+ 		ginprom.Namespace("beanpon"),
+--- a/handlers/group_handler.go
++++ b/handlers/group_handler.go
+@@ -1270,6 +1270,18 @@
+ 	`, userID, userID, userID, userID, userID).Scan(&groups)
+ 
+ 	for i := range groups {
++		// Issue 7 (REST əkizi): WS fan-out-u `invite_status='active'` ilə
++		// məhdudlaşdırmaq TƏK BAŞINA yetmir — bu endpoint hər qrupun SON
++		// mesajının DÜZ MƏTNİNİ qaytarır və dəvəti hələ qəbul etməmiş üzv onu
++		// sadəcə siyahını yeniləyərək oxuya bilirdi. Pending üzv üçün mesaj
++		// önizləməsi və oxunmamış sayı gizlədilir (dəvət kartı görünür, məzmun yox).
++		if groups[i].InviteStatus != "" && groups[i].InviteStatus != "active" {
++			empty := ""
++			groups[i].LastMessageText = &empty
++			groups[i].LastSenderUsername = nil
++			groups[i].UnreadCount = 0
++			continue
++		}
+ 		if groups[i].LastMessageText != nil {
+ 			decrypted, err := h.encryptionService.DecryptMessage(*groups[i].LastMessageText)
+ 			if err == nil {
+@@ -1374,8 +1386,14 @@
+ 
+ 	// 📌 Pinned mesaj (banner üçün): id + decrypt text + göndərən username.
+ 	// Mesaj silinmişsə (deleted_at) pin sayılmır.
++	//
++	// Issue 7 (REST əkizi): dəvəti hələ QƏBUL ETMƏMİŞ üzv (`invite_status`
++	// 'active' deyil) mesaj MƏZMUNU görməməlidir — sabitlənmiş mesajın mətni
++	// də məzmundur. Tarixçəni onsuz da yükləyə bilmir (GetGroupMessages
++	// 'active' tələb edir); bu qapı açıq qalırdı.
++	isActiveMember := me.InviteStatus == nil || *me.InviteStatus == "active"
+ 	var pinnedMessage interface{} = nil
+-	if conv.PinnedMessageID != nil {
++	if conv.PinnedMessageID != nil && isActiveMember {
+ 		var pinned models.Message
+ 		if err := database.DB.Where("id = ? AND deleted_at IS NULL",
+ 			*conv.PinnedMessageID).First(&pinned).Error; err == nil {
+--- a/handlers/group_message_handler.go
++++ b/handlers/group_message_handler.go
+@@ -320,8 +320,13 @@
+ 		}
+ 	}
+ 
+-	// Tüm üyelere WebSocket ile gönder
+-	memberIDs := getGroupParticipantIDs(conversationID)
++	// Tüm üyelere WebSocket ile gönder.
++	// Issue 7: YALNIZ tam qoşulmuş (invite_status='active') üzvlər. `pending`
++	// dəvətli mesaj MƏZMUNUNU almamalıdır — tarixçəni onsuz da yükləyə bilmir
++	// (GetGroupMessages 'active' tələb edir), canlı axını alması məxfilik
++	// sızıntısı idi. Üzvlük/dəvət olayları (join/leave/kick/update) üçün
++	// filtrsiz getGroupParticipantIDs istifadə olunmağa davam edir.
++	memberIDs := getActiveGroupMemberIDs(conversationID)
+ 	wsPayload := map[string]interface{}{
+ 		"id":                            messageID,
+ 		"conversation_id":               conversationID,
+@@ -516,7 +521,7 @@
+ 	// PENDING dəvət (hələ qəbul etməyib) mesajları OXUYA BİLMƏZ.
+ 	var me models.ConversationParticipant
+ 	err = database.DB.Where(
+-		"conversation_id = ? AND user_id = ? AND deleted_at IS NULL AND COALESCE(invite_status, 'active') = 'active'",
++		"conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL AND COALESCE(invite_status, 'active') = 'active'",
+ 		conversationID, userID,
+ 	).First(&me).Error
+ 	if err != nil {
+@@ -526,6 +531,18 @@
+ 
+ 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+ 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
++	// Sanitizasiya (DM GetMessages ilə eyni): `strconv.Atoi` xətası yeyilirdi.
++	// `?limit=abc` → 0 → `LIMIT 0` → boş səhifə; mənfi dəyər → `LIMIT -1` /
++	// `OFFSET -50` → Postgres xətası; `page` daşması → mənfi offset.
++	if limit < 1 || limit > 100 {
++		limit = 50
++	}
++	if page < 1 {
++		page = 1
++	}
++	if page > 100000 {
++		page = 100000
++	}
+ 	offset := (page - 1) * limit
+ 
+ 	// peek=true — ÖNİZLƏMƏ rejimi (uzun-bas preview): mesajlar OXUNDU
+@@ -727,7 +744,11 @@
+ 		}
+ 	}
+ 
+-	var result []gin.H
++	// DM GetMessages ilə eyni: nil slice JSON-da `null` olur, istemçi isə
++	// `data`-nı massiv gözləyir və `null` gördükdə cavabı BOZUQ sayıb atır
++	// (Issue 5 qoruması) → `GroupChatViewModel.loadInitial` erkən qayıdır,
++	// `hasMore` true qalır və sonsuz spinner yaranır.
++	result := make([]gin.H, 0, len(messages))
+ 	for _, msg := range messages {
+ 		text, _ := h.encryptionService.DecryptMessage(msg.EncryptedText)
+ 
+@@ -829,9 +850,13 @@
+ 	}
+ 
+ 	// Üye mi?
++	// Issue 7: `invite_status='active'` şərti — dəvəti qəbul etməmiş (və ya
++	// pending-ə salınmış) üzv qrupun oxuyucu siyahısını (ad/username/avatar +
++	// oxuma vaxtları) görməməlidir. `findGroupMessage` (:986) onsuz da bu
++	// şərti tətbiq edir; bu endpoint istisna qalmışdı.
+ 	var me models.ConversationParticipant
+ 	err := database.DB.Where(
+-		"conversation_id = ? AND user_id = ? AND deleted_at IS NULL",
++		"conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL AND COALESCE(invite_status,'active') = 'active'",
+ 		*msg.ConversationID, userID,
+ 	).First(&me).Error
+ 	if err != nil {
+@@ -915,7 +940,7 @@
+ 	h.wsHub.SendDismissThreadPush(userID, fmt.Sprintf("group_%d", conversationID))
+ 
+ 	// Gönderenlere WebSocket ile bildir
+-	memberIDs := getGroupParticipantIDs(conversationID)
++	memberIDs := getActiveGroupMemberIDs(conversationID)
+ 	h.wsHub.SendToMultipleUsers(memberIDs, "group_message_read", map[string]interface{}{
+ 		"conversation_id": conversationID,
+ 		"reader_id":       userID,
+@@ -945,7 +970,7 @@
+ 	// mesajları oxuya bilməz → oxundu da işarələyə bilməz).
+ 	var me models.ConversationParticipant
+ 	err = database.DB.Where(
+-		"conversation_id = ? AND user_id = ? AND deleted_at IS NULL AND COALESCE(invite_status, 'active') = 'active'",
++		"conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL AND COALESCE(invite_status, 'active') = 'active'",
+ 		conversationID, userID,
+ 	).First(&me).Error
+ 	if err != nil {
+@@ -1034,14 +1059,14 @@
+ 		database.DB.Table("conversations").
+ 			Where("id = ?", conversationID).
+ 			Update("pinned_message_id", nil)
+-		h.wsHub.SendToMultipleUsers(getGroupParticipantIDs(conversationID),
++		h.wsHub.SendToMultipleUsers(getActiveGroupMemberIDs(conversationID),
+ 			"group_message_pinned", map[string]interface{}{
+ 				"conversation_id": conversationID,
+ 				"pinned_message":  nil, // pin götürüldü
+ 			})
+ 	}
+ 
+-	memberIDs := getGroupParticipantIDs(conversationID)
++	memberIDs := getActiveGroupMemberIDs(conversationID)
+ 	h.wsHub.SendToMultipleUsers(memberIDs, "group_message_deleted", map[string]interface{}{
+ 		"conversation_id": conversationID,
+ 		"message_id":      messageID,
+@@ -1122,7 +1147,7 @@
+ 		}
+ 	}
+ 
+-	memberIDs := getGroupParticipantIDs(conversationID)
++	memberIDs := getActiveGroupMemberIDs(conversationID)
+ 	h.wsHub.SendToMultipleUsers(memberIDs, "group_message_pinned", map[string]interface{}{
+ 		"conversation_id": conversationID,
+ 		"pinned_message":  newPinned,
+@@ -1188,7 +1213,7 @@
+ 		"edited_at":       now,
+ 	}
+ 
+-	memberIDs := getGroupParticipantIDs(conversationID)
++	memberIDs := getActiveGroupMemberIDs(conversationID)
+ 	h.wsHub.SendToMultipleUsers(memberIDs, "group_message_edited", editPayload)
+ 
+ 	c.JSON(http.StatusOK, gin.H{
+@@ -1278,7 +1303,7 @@
+ 		"opened_by":        userID,
+ 	}
+ 
+-	memberIDs := getGroupParticipantIDs(conversationID)
++	memberIDs := getActiveGroupMemberIDs(conversationID)
+ 	h.wsHub.SendToMultipleUsers(memberIDs, "group_message_edited", editPayload)
+ 
+ 	c.JSON(http.StatusOK, gin.H{"message": "Açıldı", "data": editPayload})
+@@ -1347,9 +1372,13 @@
+ 	}
+ 	conversationID := uint(convID)
+ 
++	// Issue 7: ulduzlanmış mesajların MƏTNİ də qrup məzmunudur → yalnız TAM
++	// qoşulmuş üzv görə bilər. Qeyd: `group_message_stars` sətirləri qrupdan
++	// çıxanda silinmir; yenidən DƏVƏT olunan (pending) köhnə üzv bu endpoint-lə
++	// mesaj mətnini oxuya bilirdi.
+ 	var me models.ConversationParticipant
+ 	err = database.DB.Where(
+-		"conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL",
++		"conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL AND COALESCE(invite_status,'active') = 'active'",
+ 		conversationID, userID,
+ 	).First(&me).Error
+ 	if err != nil {
+@@ -1461,7 +1490,7 @@
+ 		WHERE message_id = ? AND user_id = ?
+ 	`, messageID, userID).Scan(&existing)
+ 
+-	memberIDs := getGroupParticipantIDs(conversationID)
++	memberIDs := getActiveGroupMemberIDs(conversationID)
+ 
+ 	if existing.Emoji != nil && *existing.Emoji == body.Emoji {
+ 		if err := database.DB.Exec(`
+--- a/handlers/message_handler.go
++++ b/handlers/message_handler.go
+@@ -412,12 +412,123 @@
+ 
+ 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+ 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
++	// Sanitizasiya: `strconv.Atoi` xətası yeyilirdi → `?limit=abc` limit=0
++	// verirdi. Bu, `has_more = len(rows) >= limit` şərtini BOŞ səhifədə belə
++	// həmişə true edir (istemçidə sonsuz döngü); mənfi dəyər isə
++	// `LIMIT -1 / OFFSET -50` ilə Postgres xətası → 500.
++	if limit < 1 || limit > 100 {
++		limit = 50
++	}
++	if page < 1 {
++		page = 1
++	}
++	// Yuxarı hədd: `(page-1)*limit` int daşması ilə MƏNFİ offset verə bilir
++	// (`?page=200000000000000000`) → Postgres `OFFSET must not be negative` → 500.
++	if page > 100000 {
++		page = 100000
++	}
+ 	offset := (page - 1) * limit
+ 
+ 	// peek=true — ÖNİZLƏMƏ rejimi (uzun-bas preview): mesajlar OXUNDU
+ 	// İŞARƏLƏNMİR. WhatsApp davranışı — peek görüldü sayılmır.
+ 	peek := c.DefaultQuery("peek", "false") == "true"
+ 
++	// ── Issue 73/20: KEYSET (cursor) sayfalama — `before=<message_id>` ──────
++	//
++	// OFFSET sayfalaması iki cür pozulurdu:
++	//   • Canlı mesaj gəldikcə siyahının BAŞI böyüyür → "səhifə 2" sürüşür,
++	//     istemçiyə tamamilə TANIŞ id-lər qayıdır. iOS ChatViewModel.loadOlder
++	//     bunu "yeni heç nə yoxdur" sayıb `page`-i ARTIRMIRDI → eyni səhifə
++	//     sonsuza qədər yenidən çəkilirdi (spinner heç bitmirdi).
++	//   • Server tərəfdə silinmə offset-ləri sürüşdürür → ARADA mesaj ATLANIR.
++	//
++	// `before` verilibsə həmin mesajdan KÖHNƏ olanlar qaytarılır. Müqayisə
++	// TAM sıralamadır — `(created_at, id)` cütü — çünki `created_at` unikal
++	// deyil (sürətli/toplu göndərmə eyni ms-i paylaşır) və yalnız
++	// `created_at <` istifadə etsək sərhəddəki sətirlər HƏMİŞƏLİK düşərdi.
++	//
++	// Geriyə uyğunluq: `before` YOXDURSA davranış tamamilə əvvəlki kimidir
++	// (page/offset) — köhnə istemçilər təsirlənmir.
++	// `before_ms` — anchor sətri server tərəfdə SİLİNİBSƏ istifadə olunan
++	// ehtiyat kursor (istemçidəki `created_at`, epoch ms). Onsuz stale kursor
++	// halında offset-ə düşərdik və HƏMİŞƏ ən yeni səhifə qayıdardı → istemçi
++	// heç vaxt geriyə gedə bilməzdi (eyni sonsuz döngü).
++	beforeID := strings.TrimSpace(c.Query("before"))
++	beforeMs, _ := strconv.ParseInt(c.DefaultQuery("before_ms", "0"), 10, 64)
++	// `before_ms` üçün ağlabatan pəncərə (1970 … 2100). Hədsiz dəyər
++	// `time.UnixMilli` ilə timestamptz sərhədini aşıb driver-də 500 verir.
++	const maxBeforeMs int64 = 4102444800000 // 2100-01-01
++	if beforeMs < 0 || beforeMs > maxBeforeMs {
++		beforeMs = 0
++	}
++
++	// `messages.id` UUID sütunudur (models/message.go). Kursor sentinel-ləri
++	// də UUID OLMALIDIR — boş sətir `invalid input syntax for type uuid` verir.
++	const maxUUID = "ffffffff-ffff-ffff-ffff-ffffffffffff"
++
++	var beforeCreatedAt *time.Time
++	// DİQQƏT: keyset İŞLƏNMƏSƏ BELƏ bu dəyər HƏMİŞƏ etibarlı UUID olmalıdır.
++	// Sorquda `?::uuid` var; Postgres sabit qatlamada (`''::uuid`) DƏRHAL
++	// `invalid input syntax for type uuid` verir — `?::timestamptz IS NULL`
++	// qısa-qapanması buna ZƏMANƏT vermir.
++	beforeCursorID := maxUUID
++	if beforeID != "" {
++		var anchor struct {
++			CreatedAt time.Time `gorm:"column:created_at"`
++		}
++		// Anchor yalnız BU söhbətdən ola bilər (IDOR qapalı). `id = ?::uuid`
++		// olduğu üçün formatı pozuq `before` Postgres xətası verir — Scan xətası
++		// kimi tutulur və aşağıdakı fallback işə düşür.
++		e := database.DB.Raw(`
++			SELECT created_at FROM messages
++			WHERE id = ?::uuid
++			  AND ((sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?))
++			LIMIT 1
++		`, beforeID, userID, otherUserID, otherUserID, userID).Scan(&anchor).Error
++		if e == nil && !anchor.CreatedAt.IsZero() {
++			ts := anchor.CreatedAt
++			beforeCreatedAt = &ts
++			beforeCursorID = beforeID
++		}
++	}
++	if beforeCreatedAt == nil && beforeMs > 0 {
++		// Anchor tapılmadı (sətir silinib / format pozuq) → istemçinin
++		// bildirdiyi vaxta düş.
++		//
++		// DİQQƏT — MİLLİSANİYƏ YUVARLAQLAŞMASI: `created_at` timestamptz-dir
++		// (mikrosaniyə). `before_ms` ms-ə kəsildiyi üçün strict `<` işlətsək
++		// eyni ms içindəki DAHA KÖHNƏ sətirlər (məs. .000200 < .000750) heç
++		// vaxt qayıtmazdı — Issue 20-nin eyni sinif xətası. Ona görə pəncərəni
++		// bir ms İRƏLİ sürüb sentinel kimi ƏN BÖYÜK uuid-i veririk: bütün ms
++		// dilimi daxil olur. Təkrar sətirlər zərərsizdir (istemçi id ilə dedup
++		// edir); İTKİ isə geri qaytarıla bilməzdir.
++		ts := time.UnixMilli(beforeMs).UTC().Add(time.Millisecond)
++		beforeCreatedAt = &ts
++		beforeCursorID = maxUUID
++	} else if beforeCreatedAt == nil && beforeID != "" {
++		// `before` göndərilib, amma nə anchor tapıldı, nə də `before_ms` var.
++		// SESSİZCƏ offset-ə düşmək TƏHLÜKƏLİDİR: page=1 ilə ƏN YENİ səhifə
++		// "daha köhnə tarixçə" kimi qaytarılardı → dublikat + sonsuz döngü.
++		// Boş, "daha yoxdur" səhifəsi qaytarmaq təhlükəsizdir.
++		c.JSON(http.StatusOK, gin.H{
++			"data":                    []gin.H{},
++			"page":                    page,
++			"limit":                   limit,
++			"total":                   0,
++			"has_more":                false,
++			"next_before":             nil,
++			"first_unread_message_id": nil,
++			"is_online":               h.wsHub.IsUserOnline(uint(otherUserID)),
++			"cursor_invalid":          true,
++		})
++		return
++	}
++	if beforeCreatedAt != nil {
++		offset = 0 // keyset rejimində offset MƏNASIZDIR
++	}
++	// keysetMode — cavabdakı `has_more`/`first_unread` davranışını seçir.
++	keysetMode := beforeCreatedAt != nil
++
+ 	var messages []struct {
+ 		ID                   string     `gorm:"column:id"`
+ 		SenderID             uint       `gorm:"column:sender_id"`
+@@ -462,18 +573,25 @@
+         LEFT JOIN stories s ON m.story_id = s.id
+         WHERE ((m.sender_id = ? AND m.receiver_id = ?) OR (m.sender_id = ? AND m.receiver_id = ?))
+         AND (
+-            CASE 
++            CASE
+                 WHEN m.sender_id = ? THEN m.is_deleted_by_sender = false
+                 ELSE m.is_deleted_by_receiver = false
+             END
+         )
+-        ORDER BY m.created_at DESC 
++        -- Issue 73: keyset cursor. before YOXDURSA (NULL) bu şərt həmişə TRUE.
++        AND (
++            ?::timestamptz IS NULL
++            OR (m.created_at, m.id) < (?::timestamptz, ?::uuid)
++        )
++        -- Issue 20: created_at unikal deyil → id ilə TAM sıralama.
++        ORDER BY m.created_at DESC, m.id DESC
+         LIMIT ? OFFSET ?
+     `
+ 
+ 	err = database.DB.Raw(query,
+ 		userID, otherUserID, otherUserID, userID,
+ 		userID,
++		beforeCreatedAt, beforeCreatedAt, beforeCursorID,
+ 		limit, offset,
+ 	).Scan(&messages).Error
+ 
+@@ -482,7 +600,11 @@
+ 		return
+ 	}
+ 
+-	var responseMessages []gin.H
++	// DİQQƏT: `var x []gin.H` (nil slice) JSON-da `null` olur. İstemçi
++	// `data`-nı massiv kimi parse edir və `null` gördükdə cavabı BOZUQ sayıb
++	// atır (Issue 5 qoruması) → `has_more:false` siqnalı ÇATMIR və sonsuz
++	// spinner qayıdır. Boş massiv `[]` olaraq serialize olunmalıdır.
++	responseMessages := make([]gin.H, 0, len(messages))
+ 	for _, msg := range messages {
+ 		decryptedText, err := h.encryptionService.DecryptMessage(msg.EncryptedText)
+ 		if err != nil {
+@@ -558,8 +680,10 @@
+ 	// edəcək). Qarşı tərəfdən gələn, oxunmamış (read=false) ən KÖHNƏ mesaj.
+ 	// Flutter açılışda buna konumlanıb "Yeni mesajlar" ayracı qoyur.
+ 	// Yalnız 1-ci səhifədə + peek deyil.
++	// Issue 73: keyset (before) səhifəsində "ilk oxunmamış" ayracı hesablanmır
++	// — o yalnız çatın İLK açılışına aiddir (qrup handler-i ilə eyni davranış).
+ 	var firstUnreadID *string
+-	if !peek && page == 1 {
++	if !peek && page == 1 && !keysetMode {
+ 		var unreadRow struct {
+ 			ID string `gorm:"column:id"`
+ 		}
+@@ -605,11 +729,33 @@
+ 		return
+ 	}
+ 
++	// Issue 73: `has_more` — istemçi artıq `total` ilə yerli mesaj sayını
++	// müqayisə etməyə məcbur deyil (o müqayisə optimistik/canlı mesajları da
++	// sayırdı və vaxtından əvvəl "son səhifə" deyirdi).
++	//   • keyset (before) rejimi: tam səhifə gəldisə daha var say;
++	//   • offset rejimi: oxunan+offset < total.
++	hasMore := false
++	if keysetMode {
++		hasMore = len(responseMessages) >= limit
++	} else {
++		hasMore = int64(offset+len(responseMessages)) < totalCount
++	}
++
++	// Issue 73: növbəti keyset kursoru — ən KÖHNƏ (siyahının sonuncu) mesajın
++	// id-si. Siyahı `created_at DESC, id DESC` sıralıdır.
++	var nextBefore *string
++	if len(messages) > 0 {
++		last := messages[len(messages)-1].ID
++		nextBefore = &last
++	}
++
+ 	c.JSON(http.StatusOK, gin.H{
+ 		"data":                    responseMessages,
+ 		"page":                    page,
+ 		"limit":                   limit,
+ 		"total":                   int(totalCount),
++		"has_more":                hasMore,
++		"next_before":             nextBefore,
+ 		"first_unread_message_id": firstUnreadID,
+ 		"is_online":               h.wsHub.IsUserOnline(uint(otherUserID)),
+ 	})
+@@ -1856,7 +2002,7 @@
+ 		return
+ 	}
+ 
+-	// 🔔 WebSocket bildirimi hər iki tərəfə
++	// 🔔 WebSocket bildirimi
+ 	deletePayload := map[string]interface{}{
+ 		"message_id":  message.ID,
+ 		"deleted_by":  userID,
+@@ -1864,9 +2010,21 @@
+ 		"deleted_at":  now,
+ 	}
+ 
+-	h.wsHub.SendToUser(message.SenderID, "message_deleted", deletePayload)
+-	if message.ReceiverID != nil {
+-		h.wsHub.SendToUser(*message.ReceiverID, "message_deleted", deletePayload)
++	// Issue 11 (vacib): `delete_type == "me"` YALNIZ silən istifadəçini
++	// maraqlandırır — sətir qarşı tərəf üçün hələ də görünür və
++	// `GetMessages`-də qayıdır. Əvvəllər bu event HƏR İKİ tərəfə göndərilirdi;
++	// istemçi tərəfdə silmə artıq KALICI keş "mezar daşı"na yazıldığı üçün bu,
++	// qarşı tərəfin mesajı HƏMİŞƏLİK itirməsi demək olardı (istifadəçi heç nə
++	// silmədiyi halda). İndi "me" yalnız silənə (öz digər cihazlarına), "both"
++	// isə hər ikisinə gedir.
++	h.wsHub.SendToUser(userID, "message_deleted", deletePayload)
++	if body.DeleteType == "both" {
++		if userID != message.SenderID {
++			h.wsHub.SendToUser(message.SenderID, "message_deleted", deletePayload)
++		}
++		if message.ReceiverID != nil && *message.ReceiverID != userID {
++			h.wsHub.SendToUser(*message.ReceiverID, "message_deleted", deletePayload)
++		}
+ 	}
+ 
+ 	c.JSON(http.StatusOK, gin.H{
+--- a/handlers/upload_handler.go
++++ b/handlers/upload_handler.go
+@@ -9,7 +9,9 @@
+ 
+ import (
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
++	"io"
+ 	"net/http"
+ 	"os"
+ 	"os/exec"
+@@ -24,6 +26,46 @@
+ 	"github.com/google/uuid"
+ )
+ 
++// ── Issue 54: yükləmə ölçü limitləri ────────────────────────────────────────
++//
++// Əvvəllər HEÇ BİR limit yox idi: `readMultipart` client-in bildirdiyi
++// `fh.Size` qədər buffer ayırırdı (`make([]byte, fh.Size)`) və faylı bütünlüklə
++// RAM-a oxuyurdu. Kimliyi doğrulanmış istənilən istifadəçi çox-yüz-MB-lıq
++// (və ya paralel) upload ilə prosesi OOM edə bilirdi.
++//
++// İndi üç qat müdafiə var:
++//  1. `http.MaxBytesReader` — request GÖVDƏSİ hard cap (multipart parse
++//     mərhələsində kəsilir, disk/RAM-a heç nə yazılmır).
++//  2. `fileHeader.Size` yoxlaması — buffer AYRILMADAN əvvəl rədd.
++//  3. `readMultipart` daxilində `io.LimitReader` — Content-Length yalan
++//     danışsa belə ayrılan yaddaş sərhədlidir.
++//
++// Rəqəmlər: Cloudflare edge onsuz da 100 MB-da kəsir → media üçün ondan
++// yuxarı qalxmağın mənası yoxdur. Səs mesajları praktikada « 25 MB.
++const (
++	maxVoiceUploadBytes int64 = 25 << 20  // 25 MB
++	maxMediaUploadBytes int64 = 100 << 20 // 100 MB
++	// multipartOverheadBytes — form sərhədləri, `duration` kimi digər
++	// field-lər üçün kiçik pay. Gövdə limiti = fayl limiti + bu.
++	multipartOverheadBytes int64 = 1 << 20 // 1 MB
++)
++
++// limitRequestBody — gövdəni hard cap-lə sarır. MÜTLƏQ hər hansı form oxuma
++// (`c.PostForm`, `c.FormFile`, `c.Request.ParseMultipartForm`) çağırışından
++// ƏVVƏL çağırılmalıdır, çünki parse gövdəni bir dəfə axıdır.
++func limitRequestBody(c *gin.Context, maxFileBytes int64) {
++	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxFileBytes+multipartOverheadBytes)
++}
++
++// isBodyTooLarge — MaxBytesReader-in qaytardığı xətanı tanıyır (Go 1.19+).
++func isBodyTooLarge(err error) bool {
++	var maxErr *http.MaxBytesError
++	return errors.As(err, &maxErr)
++}
++
++// tooLargeMB — istifadəçiyə göstərilən limit (MB).
++func tooLargeMB(maxBytes int64) int64 { return maxBytes >> 20 }
++
+ // UploadHandler — voice/media S3 upload + waveform.
+ type UploadHandler struct {
+ 	s3 *services.S3Uploader
+@@ -49,6 +91,36 @@
+ 	}
+ 	userID := uid.(uint)
+ 
++	// Issue 54: gövdə limiti — form parse-dan ƏVVƏL.
++	limitRequestBody(c, maxVoiceUploadBytes)
++
++	// DİQQƏT (sıralama): `c.FormFile` BİRİNCİ çağırılmalıdır. Əvvəl
++	// `c.PostForm("duration")` vardı; o da multipart parse-ı tetikləyir, amma
++	// Gin `initFormCache` parse XƏTASINI UDUR → limit aşımı 413 yerinə
++	// mənasız "Geçersiz duration" (422) qaytarırdı.
++	fileHeader, err := c.FormFile("voice")
++	if err != nil {
++		if isBodyTooLarge(err) {
++			c.JSON(http.StatusRequestEntityTooLarge, gin.H{
++				"error":    fmt.Sprintf("Ses dosyası çok büyük (en fazla %d MB)", tooLargeMB(maxVoiceUploadBytes)),
++				"code":     "FILE_TOO_LARGE",
++				"max_size": maxVoiceUploadBytes,
++			})
++			return
++		}
++		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "Ses dosyası bulunamadı"})
++		return
++	}
++	// Issue 54: buffer AYRILMADAN əvvəl ölçü yoxlaması.
++	if fileHeader.Size > maxVoiceUploadBytes {
++		c.JSON(http.StatusRequestEntityTooLarge, gin.H{
++			"error":    fmt.Sprintf("Ses dosyası çok büyük (en fazla %d MB)", tooLargeMB(maxVoiceUploadBytes)),
++			"code":     "FILE_TOO_LARGE",
++			"max_size": maxVoiceUploadBytes,
++		})
++		return
++	}
++
+ 	// duration — required|integer|min:1|max:10000.
+ 	durationStr := c.PostForm("duration")
+ 	duration, err := strconv.Atoi(durationStr)
+@@ -57,12 +129,6 @@
+ 		return
+ 	}
+ 
+-	fileHeader, err := c.FormFile("voice")
+-	if err != nil {
+-		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "Ses dosyası bulunamadı"})
+-		return
+-	}
+-
+ 	// Uzantı — bəzi client-lər filename-siz blob göndərir, MIME-dən təxmin et.
+ 	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(fileHeader.Filename), "."))
+ 	if ext == "" {
+@@ -71,7 +137,7 @@
+ 	filename := uuid.NewString() + "." + ext
+ 
+ 	// Faylın bütün baytlarını oxu.
+-	data, err := readMultipart(c, "voice")
++	data, err := readMultipart(c, "voice", maxVoiceUploadBytes)
+ 	if err != nil || len(data) == 0 {
+ 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ses dosyası okunamadı"})
+ 		return
+@@ -136,11 +202,31 @@
+ 	}
+ 	userID := uid.(uint)
+ 
++	// Issue 54: gövdə limiti — form parse-dan ƏVVƏL.
++	limitRequestBody(c, maxMediaUploadBytes)
++
+ 	fileHeader, err := c.FormFile("media")
+ 	if err != nil {
++		if isBodyTooLarge(err) {
++			c.JSON(http.StatusRequestEntityTooLarge, gin.H{
++				"error":    fmt.Sprintf("Medya dosyası çok büyük (en fazla %d MB)", tooLargeMB(maxMediaUploadBytes)),
++				"code":     "FILE_TOO_LARGE",
++				"max_size": maxMediaUploadBytes,
++			})
++			return
++		}
+ 		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "Medya dosyası bulunamadı"})
+ 		return
+ 	}
++	// Issue 54: buffer AYRILMADAN əvvəl ölçü yoxlaması.
++	if fileHeader.Size > maxMediaUploadBytes {
++		c.JSON(http.StatusRequestEntityTooLarge, gin.H{
++			"error":    fmt.Sprintf("Medya dosyası çok büyük (en fazla %d MB)", tooLargeMB(maxMediaUploadBytes)),
++			"code":     "FILE_TOO_LARGE",
++			"max_size": maxMediaUploadBytes,
++		})
++		return
++	}
+ 
+ 	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(fileHeader.Filename), "."))
+ 	isImage := imageExts[ext]
+@@ -152,7 +238,7 @@
+ 
+ 	filename := uuid.NewString() + "." + ext
+ 
+-	data, err := readMultipart(c, "media")
++	data, err := readMultipart(c, "media", maxMediaUploadBytes)
+ 	if err != nil || len(data) == 0 {
+ 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Medya dosyası okunamadı"})
+ 		return
+@@ -181,27 +267,63 @@
+ 	})
+ }
+ 
+-// readMultipart — form field-dəki faylın bütün baytlarını oxuyur.
+-func readMultipart(c *gin.Context, field string) ([]byte, error) {
++// readMultipart — form field-dəki faylın baytlarını oxuyur, `maxBytes` ilə
++// sərhədli.
++//
++// Issue 54: əvvəl `make([]byte, fh.Size)` ilə client-in bildirdiyi ölçü qədər
++// yaddaş HEÇ BİR yoxlama olmadan ayrılırdı. İndi:
++//   - `fh.Size` limitdən böyükdürsə heç nə ayrılmır, dərhal xəta;
++//   - oxuma `io.LimitReader` ilə sərhədlidir (Content-Length yalan danışsa belə);
++//   - ilkin buffer tutumu `fh.Size` ilə limitin KİÇİYİ qədərdir.
++func readMultipart(c *gin.Context, field string, maxBytes int64) ([]byte, error) {
+ 	fh, err := c.FormFile(field)
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	if fh.Size > maxBytes {
++		return nil, fmt.Errorf("upload too large: %d > %d", fh.Size, maxBytes)
++	}
+ 	f, err := fh.Open()
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 	defer f.Close()
+-	buf := make([]byte, fh.Size)
+-	total := 0
+-	for total < len(buf) {
+-		n, err := f.Read(buf[total:])
+-		total += n
++
++	capHint := fh.Size
++	if capHint < 0 || capHint > maxBytes {
++		capHint = maxBytes
++	}
++	// +1 tutum: normal halda fayl DƏQİQ `capHint` baytdır; əlavə 1 bayt
++	// olmasa `readAllInto` son oxumadan sonra EOF-u aşkar etmək üçün massivi
++	// ~1.25x böyüdüb HAMISINI kopyalayır (zirvə yaddaş ~2.25N).
++	buf := make([]byte, 0, capHint+1)
++	// LimitReader maxBytes+1 → limitin AŞILDIĞINI aşkar edə bilirik.
++	data, err := readAllInto(buf, io.LimitReader(f, maxBytes+1))
++	if err != nil {
++		return nil, err
++	}
++	if int64(len(data)) > maxBytes {
++		return nil, fmt.Errorf("upload too large: exceeds %d bytes", maxBytes)
++	}
++	return data, nil
++}
++
++// readAllInto — verilmiş tutumlu buffer üzərində io.ReadAll ekvivalenti
++// (əlavə realloc-ları azaldır).
++func readAllInto(buf []byte, r io.Reader) ([]byte, error) {
++	for {
++		if len(buf) == cap(buf) {
++			buf = append(buf, 0)[:len(buf)]
++		}
++		n, err := r.Read(buf[len(buf):cap(buf)])
++		buf = buf[:len(buf)+n]
+ 		if err != nil {
+-			break
++			if errors.Is(err, io.EOF) {
++				return buf, nil
++			}
++			return buf, err
+ 		}
+ 	}
+-	return buf[:total], nil
+ }
+ 
+ // generateWaveform — Laravel uploadVoice waveform məntiqi:
+--- a/websocket/hub.go
++++ b/websocket/hub.go
+@@ -1592,10 +1592,12 @@
+ 		WHERE u.id = ?
+ 	`, userID).Scan(&sender)
+ 
+-	// Qrupun aktiv üzvlərini çək (left_at IS NULL).
++	// Qrupun aktiv üzvlərini çək.
++	// Issue 7: `invite_status='active'` şərti — dəvəti qəbul etməmiş üzv
++	// qrupun canlı fəaliyyətini (kim yazır, adı/avatarı) görməməlidir.
+ 	var memberIDs []uint
+ 	h.db.Model(&models.ConversationParticipant{}).
+-		Where("conversation_id = ? AND left_at IS NULL AND deleted_at IS NULL", conversationID).
++		Where("conversation_id = ? AND left_at IS NULL AND deleted_at IS NULL AND COALESCE(invite_status,'active') = 'active'", conversationID).
+ 		Pluck("user_id", &memberIDs)
+ 
+ 	for _, mid := range memberIDs {
+--- a/websocket/hub_xmpp.go
++++ b/websocket/hub_xmpp.go
+@@ -121,12 +121,17 @@
+ }
+ 
+ // GroupMemberIDs exposes group membership for legacy fan-out. Mirrors the
+-// handlers-package getGroupParticipantIDs query, using the Hub's own db handle
++// handlers-package getActiveGroupMemberIDs query, using the Hub's own db handle
+ // (that helper is unexported in the handlers package).
++//
++// Issue 7: this list feeds MESSAGE CONTENT delivery, so it must exclude
++// `invite_status='pending'` rows — an invitee who has not accepted must not
++// receive live group messages (they cannot load history either). COALESCE
++// keeps legacy rows with a NULL invite_status treated as active.
+ func (h *Hub) GroupMemberIDs(conversationID uint) []uint {
+ 	var ids []uint
+ 	h.db.Model(&models.ConversationParticipant{}).
+-		Where("conversation_id = ? AND left_at IS NULL AND deleted_at IS NULL", conversationID).
++		Where("conversation_id = ? AND left_at IS NULL AND deleted_at IS NULL AND COALESCE(invite_status,'active') = 'active'", conversationID).
+ 		Pluck("user_id", &ids)
+ 	return ids
+ }

@@ -412,11 +412,122 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
+	// Sanitizasiya: `strconv.Atoi` xətası yeyilirdi → `?limit=abc` limit=0
+	// verirdi. Bu, `has_more = len(rows) >= limit` şərtini BOŞ səhifədə belə
+	// həmişə true edir (istemçidə sonsuz döngü); mənfi dəyər isə
+	// `LIMIT -1 / OFFSET -50` ilə Postgres xətası → 500.
+	if limit < 1 || limit > 100 {
+		limit = 50
+	}
+	if page < 1 {
+		page = 1
+	}
+	// Yuxarı hədd: `(page-1)*limit` int daşması ilə MƏNFİ offset verə bilir
+	// (`?page=200000000000000000`) → Postgres `OFFSET must not be negative` → 500.
+	if page > 100000 {
+		page = 100000
+	}
 	offset := (page - 1) * limit
 
 	// peek=true — ÖNİZLƏMƏ rejimi (uzun-bas preview): mesajlar OXUNDU
 	// İŞARƏLƏNMİR. WhatsApp davranışı — peek görüldü sayılmır.
 	peek := c.DefaultQuery("peek", "false") == "true"
+
+	// ── Issue 73/20: KEYSET (cursor) sayfalama — `before=<message_id>` ──────
+	//
+	// OFFSET sayfalaması iki cür pozulurdu:
+	//   • Canlı mesaj gəldikcə siyahının BAŞI böyüyür → "səhifə 2" sürüşür,
+	//     istemçiyə tamamilə TANIŞ id-lər qayıdır. iOS ChatViewModel.loadOlder
+	//     bunu "yeni heç nə yoxdur" sayıb `page`-i ARTIRMIRDI → eyni səhifə
+	//     sonsuza qədər yenidən çəkilirdi (spinner heç bitmirdi).
+	//   • Server tərəfdə silinmə offset-ləri sürüşdürür → ARADA mesaj ATLANIR.
+	//
+	// `before` verilibsə həmin mesajdan KÖHNƏ olanlar qaytarılır. Müqayisə
+	// TAM sıralamadır — `(created_at, id)` cütü — çünki `created_at` unikal
+	// deyil (sürətli/toplu göndərmə eyni ms-i paylaşır) və yalnız
+	// `created_at <` istifadə etsək sərhəddəki sətirlər HƏMİŞƏLİK düşərdi.
+	//
+	// Geriyə uyğunluq: `before` YOXDURSA davranış tamamilə əvvəlki kimidir
+	// (page/offset) — köhnə istemçilər təsirlənmir.
+	// `before_ms` — anchor sətri server tərəfdə SİLİNİBSƏ istifadə olunan
+	// ehtiyat kursor (istemçidəki `created_at`, epoch ms). Onsuz stale kursor
+	// halında offset-ə düşərdik və HƏMİŞƏ ən yeni səhifə qayıdardı → istemçi
+	// heç vaxt geriyə gedə bilməzdi (eyni sonsuz döngü).
+	beforeID := strings.TrimSpace(c.Query("before"))
+	beforeMs, _ := strconv.ParseInt(c.DefaultQuery("before_ms", "0"), 10, 64)
+	// `before_ms` üçün ağlabatan pəncərə (1970 … 2100). Hədsiz dəyər
+	// `time.UnixMilli` ilə timestamptz sərhədini aşıb driver-də 500 verir.
+	const maxBeforeMs int64 = 4102444800000 // 2100-01-01
+	if beforeMs < 0 || beforeMs > maxBeforeMs {
+		beforeMs = 0
+	}
+
+	// `messages.id` UUID sütunudur (models/message.go). Kursor sentinel-ləri
+	// də UUID OLMALIDIR — boş sətir `invalid input syntax for type uuid` verir.
+	const maxUUID = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+
+	var beforeCreatedAt *time.Time
+	// DİQQƏT: keyset İŞLƏNMƏSƏ BELƏ bu dəyər HƏMİŞƏ etibarlı UUID olmalıdır.
+	// Sorquda `?::uuid` var; Postgres sabit qatlamada (`''::uuid`) DƏRHAL
+	// `invalid input syntax for type uuid` verir — `?::timestamptz IS NULL`
+	// qısa-qapanması buna ZƏMANƏT vermir.
+	beforeCursorID := maxUUID
+	if beforeID != "" {
+		var anchor struct {
+			CreatedAt time.Time `gorm:"column:created_at"`
+		}
+		// Anchor yalnız BU söhbətdən ola bilər (IDOR qapalı). `id = ?::uuid`
+		// olduğu üçün formatı pozuq `before` Postgres xətası verir — Scan xətası
+		// kimi tutulur və aşağıdakı fallback işə düşür.
+		e := database.DB.Raw(`
+			SELECT created_at FROM messages
+			WHERE id = ?::uuid
+			  AND ((sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?))
+			LIMIT 1
+		`, beforeID, userID, otherUserID, otherUserID, userID).Scan(&anchor).Error
+		if e == nil && !anchor.CreatedAt.IsZero() {
+			ts := anchor.CreatedAt
+			beforeCreatedAt = &ts
+			beforeCursorID = beforeID
+		}
+	}
+	if beforeCreatedAt == nil && beforeMs > 0 {
+		// Anchor tapılmadı (sətir silinib / format pozuq) → istemçinin
+		// bildirdiyi vaxta düş.
+		//
+		// DİQQƏT — MİLLİSANİYƏ YUVARLAQLAŞMASI: `created_at` timestamptz-dir
+		// (mikrosaniyə). `before_ms` ms-ə kəsildiyi üçün strict `<` işlətsək
+		// eyni ms içindəki DAHA KÖHNƏ sətirlər (məs. .000200 < .000750) heç
+		// vaxt qayıtmazdı — Issue 20-nin eyni sinif xətası. Ona görə pəncərəni
+		// bir ms İRƏLİ sürüb sentinel kimi ƏN BÖYÜK uuid-i veririk: bütün ms
+		// dilimi daxil olur. Təkrar sətirlər zərərsizdir (istemçi id ilə dedup
+		// edir); İTKİ isə geri qaytarıla bilməzdir.
+		ts := time.UnixMilli(beforeMs).UTC().Add(time.Millisecond)
+		beforeCreatedAt = &ts
+		beforeCursorID = maxUUID
+	} else if beforeCreatedAt == nil && beforeID != "" {
+		// `before` göndərilib, amma nə anchor tapıldı, nə də `before_ms` var.
+		// SESSİZCƏ offset-ə düşmək TƏHLÜKƏLİDİR: page=1 ilə ƏN YENİ səhifə
+		// "daha köhnə tarixçə" kimi qaytarılardı → dublikat + sonsuz döngü.
+		// Boş, "daha yoxdur" səhifəsi qaytarmaq təhlükəsizdir.
+		c.JSON(http.StatusOK, gin.H{
+			"data":                    []gin.H{},
+			"page":                    page,
+			"limit":                   limit,
+			"total":                   0,
+			"has_more":                false,
+			"next_before":             nil,
+			"first_unread_message_id": nil,
+			"is_online":               h.wsHub.IsUserOnline(uint(otherUserID)),
+			"cursor_invalid":          true,
+		})
+		return
+	}
+	if beforeCreatedAt != nil {
+		offset = 0 // keyset rejimində offset MƏNASIZDIR
+	}
+	// keysetMode — cavabdakı `has_more`/`first_unread` davranışını seçir.
+	keysetMode := beforeCreatedAt != nil
 
 	var messages []struct {
 		ID                   string     `gorm:"column:id"`
@@ -462,18 +573,25 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
         LEFT JOIN stories s ON m.story_id = s.id
         WHERE ((m.sender_id = ? AND m.receiver_id = ?) OR (m.sender_id = ? AND m.receiver_id = ?))
         AND (
-            CASE 
+            CASE
                 WHEN m.sender_id = ? THEN m.is_deleted_by_sender = false
                 ELSE m.is_deleted_by_receiver = false
             END
         )
-        ORDER BY m.created_at DESC 
+        -- Issue 73: keyset cursor. before YOXDURSA (NULL) bu şərt həmişə TRUE.
+        AND (
+            ?::timestamptz IS NULL
+            OR (m.created_at, m.id) < (?::timestamptz, ?::uuid)
+        )
+        -- Issue 20: created_at unikal deyil → id ilə TAM sıralama.
+        ORDER BY m.created_at DESC, m.id DESC
         LIMIT ? OFFSET ?
     `
 
 	err = database.DB.Raw(query,
 		userID, otherUserID, otherUserID, userID,
 		userID,
+		beforeCreatedAt, beforeCreatedAt, beforeCursorID,
 		limit, offset,
 	).Scan(&messages).Error
 
@@ -482,7 +600,11 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 		return
 	}
 
-	var responseMessages []gin.H
+	// DİQQƏT: `var x []gin.H` (nil slice) JSON-da `null` olur. İstemçi
+	// `data`-nı massiv kimi parse edir və `null` gördükdə cavabı BOZUQ sayıb
+	// atır (Issue 5 qoruması) → `has_more:false` siqnalı ÇATMIR və sonsuz
+	// spinner qayıdır. Boş massiv `[]` olaraq serialize olunmalıdır.
+	responseMessages := make([]gin.H, 0, len(messages))
 	for _, msg := range messages {
 		decryptedText, err := h.encryptionService.DecryptMessage(msg.EncryptedText)
 		if err != nil {
@@ -558,8 +680,10 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 	// edəcək). Qarşı tərəfdən gələn, oxunmamış (read=false) ən KÖHNƏ mesaj.
 	// Flutter açılışda buna konumlanıb "Yeni mesajlar" ayracı qoyur.
 	// Yalnız 1-ci səhifədə + peek deyil.
+	// Issue 73: keyset (before) səhifəsində "ilk oxunmamış" ayracı hesablanmır
+	// — o yalnız çatın İLK açılışına aiddir (qrup handler-i ilə eyni davranış).
 	var firstUnreadID *string
-	if !peek && page == 1 {
+	if !peek && page == 1 && !keysetMode {
 		var unreadRow struct {
 			ID string `gorm:"column:id"`
 		}
@@ -605,11 +729,33 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 		return
 	}
 
+	// Issue 73: `has_more` — istemçi artıq `total` ilə yerli mesaj sayını
+	// müqayisə etməyə məcbur deyil (o müqayisə optimistik/canlı mesajları da
+	// sayırdı və vaxtından əvvəl "son səhifə" deyirdi).
+	//   • keyset (before) rejimi: tam səhifə gəldisə daha var say;
+	//   • offset rejimi: oxunan+offset < total.
+	hasMore := false
+	if keysetMode {
+		hasMore = len(responseMessages) >= limit
+	} else {
+		hasMore = int64(offset+len(responseMessages)) < totalCount
+	}
+
+	// Issue 73: növbəti keyset kursoru — ən KÖHNƏ (siyahının sonuncu) mesajın
+	// id-si. Siyahı `created_at DESC, id DESC` sıralıdır.
+	var nextBefore *string
+	if len(messages) > 0 {
+		last := messages[len(messages)-1].ID
+		nextBefore = &last
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"data":                    responseMessages,
 		"page":                    page,
 		"limit":                   limit,
 		"total":                   int(totalCount),
+		"has_more":                hasMore,
+		"next_before":             nextBefore,
 		"first_unread_message_id": firstUnreadID,
 		"is_online":               h.wsHub.IsUserOnline(uint(otherUserID)),
 	})
@@ -1856,7 +2002,7 @@ func (h *MessageHandler) DeleteMessage(c *gin.Context) {
 		return
 	}
 
-	// 🔔 WebSocket bildirimi hər iki tərəfə
+	// 🔔 WebSocket bildirimi
 	deletePayload := map[string]interface{}{
 		"message_id":  message.ID,
 		"deleted_by":  userID,
@@ -1864,9 +2010,21 @@ func (h *MessageHandler) DeleteMessage(c *gin.Context) {
 		"deleted_at":  now,
 	}
 
-	h.wsHub.SendToUser(message.SenderID, "message_deleted", deletePayload)
-	if message.ReceiverID != nil {
-		h.wsHub.SendToUser(*message.ReceiverID, "message_deleted", deletePayload)
+	// Issue 11 (vacib): `delete_type == "me"` YALNIZ silən istifadəçini
+	// maraqlandırır — sətir qarşı tərəf üçün hələ də görünür və
+	// `GetMessages`-də qayıdır. Əvvəllər bu event HƏR İKİ tərəfə göndərilirdi;
+	// istemçi tərəfdə silmə artıq KALICI keş "mezar daşı"na yazıldığı üçün bu,
+	// qarşı tərəfin mesajı HƏMİŞƏLİK itirməsi demək olardı (istifadəçi heç nə
+	// silmədiyi halda). İndi "me" yalnız silənə (öz digər cihazlarına), "both"
+	// isə hər ikisinə gedir.
+	h.wsHub.SendToUser(userID, "message_deleted", deletePayload)
+	if body.DeleteType == "both" {
+		if userID != message.SenderID {
+			h.wsHub.SendToUser(message.SenderID, "message_deleted", deletePayload)
+		}
+		if message.ReceiverID != nil && *message.ReceiverID != userID {
+			h.wsHub.SendToUser(*message.ReceiverID, "message_deleted", deletePayload)
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{

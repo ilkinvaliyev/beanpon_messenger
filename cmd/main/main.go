@@ -202,6 +202,13 @@ func main() {
 	// Gin router'ını oluştur
 	router := gin.Default()
 
+	// Issue 54: multipart parse zamanı RAM-da saxlanılacaq maksimum həcm.
+	// Gin default-u 32 MB-dır; bundan böyük hissələr müvəqqəti fayla axır.
+	// 8 MB → tipik şəkil/səs tamamilə RAM-da qalır, böyük videolar isə diskə
+	// düşür (RAM zirvəsi paralel upload sayına vurulmur). Faylın ÖZ hard
+	// limiti upload_handler.go-dakı http.MaxBytesReader ilə qoyulur.
+	router.MaxMultipartMemory = 8 << 20 // 8 MB
+
 	p := ginprom.New(
 		ginprom.Engine(router),
 		ginprom.Namespace("beanpon"),

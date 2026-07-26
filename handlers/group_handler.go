@@ -1270,6 +1270,18 @@ func (h *GroupHandler) GetMyGroups(c *gin.Context) {
 	`, userID, userID, userID, userID, userID).Scan(&groups)
 
 	for i := range groups {
+		// Issue 7 (REST əkizi): WS fan-out-u `invite_status='active'` ilə
+		// məhdudlaşdırmaq TƏK BAŞINA yetmir — bu endpoint hər qrupun SON
+		// mesajının DÜZ MƏTNİNİ qaytarır və dəvəti hələ qəbul etməmiş üzv onu
+		// sadəcə siyahını yeniləyərək oxuya bilirdi. Pending üzv üçün mesaj
+		// önizləməsi və oxunmamış sayı gizlədilir (dəvət kartı görünür, məzmun yox).
+		if groups[i].InviteStatus != "" && groups[i].InviteStatus != "active" {
+			empty := ""
+			groups[i].LastMessageText = &empty
+			groups[i].LastSenderUsername = nil
+			groups[i].UnreadCount = 0
+			continue
+		}
 		if groups[i].LastMessageText != nil {
 			decrypted, err := h.encryptionService.DecryptMessage(*groups[i].LastMessageText)
 			if err == nil {
@@ -1374,8 +1386,14 @@ func (h *GroupHandler) GetGroupDetail(c *gin.Context) {
 
 	// 📌 Pinned mesaj (banner üçün): id + decrypt text + göndərən username.
 	// Mesaj silinmişsə (deleted_at) pin sayılmır.
+	//
+	// Issue 7 (REST əkizi): dəvəti hələ QƏBUL ETMƏMİŞ üzv (`invite_status`
+	// 'active' deyil) mesaj MƏZMUNU görməməlidir — sabitlənmiş mesajın mətni
+	// də məzmundur. Tarixçəni onsuz da yükləyə bilmir (GetGroupMessages
+	// 'active' tələb edir); bu qapı açıq qalırdı.
+	isActiveMember := me.InviteStatus == nil || *me.InviteStatus == "active"
 	var pinnedMessage interface{} = nil
-	if conv.PinnedMessageID != nil {
+	if conv.PinnedMessageID != nil && isActiveMember {
 		var pinned models.Message
 		if err := database.DB.Where("id = ? AND deleted_at IS NULL",
 			*conv.PinnedMessageID).First(&pinned).Error; err == nil {

@@ -1592,10 +1592,12 @@ func (h *Hub) handleGroupTyping(userID uint, data interface{}, isTyping bool) {
 		WHERE u.id = ?
 	`, userID).Scan(&sender)
 
-	// Qrupun aktiv üzvlərini çək (left_at IS NULL).
+	// Qrupun aktiv üzvlərini çək.
+	// Issue 7: `invite_status='active'` şərti — dəvəti qəbul etməmiş üzv
+	// qrupun canlı fəaliyyətini (kim yazır, adı/avatarı) görməməlidir.
 	var memberIDs []uint
 	h.db.Model(&models.ConversationParticipant{}).
-		Where("conversation_id = ? AND left_at IS NULL AND deleted_at IS NULL", conversationID).
+		Where("conversation_id = ? AND left_at IS NULL AND deleted_at IS NULL AND COALESCE(invite_status,'active') = 'active'", conversationID).
 		Pluck("user_id", &memberIDs)
 
 	for _, mid := range memberIDs {

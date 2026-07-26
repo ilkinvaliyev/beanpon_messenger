@@ -121,12 +121,17 @@ func (h *Hub) IngestGroup(senderID, conversationID uint, text, kind string) {
 }
 
 // GroupMemberIDs exposes group membership for legacy fan-out. Mirrors the
-// handlers-package getGroupParticipantIDs query, using the Hub's own db handle
+// handlers-package getActiveGroupMemberIDs query, using the Hub's own db handle
 // (that helper is unexported in the handlers package).
+//
+// Issue 7: this list feeds MESSAGE CONTENT delivery, so it must exclude
+// `invite_status='pending'` rows — an invitee who has not accepted must not
+// receive live group messages (they cannot load history either). COALESCE
+// keeps legacy rows with a NULL invite_status treated as active.
 func (h *Hub) GroupMemberIDs(conversationID uint) []uint {
 	var ids []uint
 	h.db.Model(&models.ConversationParticipant{}).
-		Where("conversation_id = ? AND left_at IS NULL AND deleted_at IS NULL", conversationID).
+		Where("conversation_id = ? AND left_at IS NULL AND deleted_at IS NULL AND COALESCE(invite_status,'active') = 'active'", conversationID).
 		Pluck("user_id", &ids)
 	return ids
 }

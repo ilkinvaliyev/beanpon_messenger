@@ -9,7 +9,9 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -23,6 +25,46 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
+
+// ── Issue 54: yükləmə ölçü limitləri ────────────────────────────────────────
+//
+// Əvvəllər HEÇ BİR limit yox idi: `readMultipart` client-in bildirdiyi
+// `fh.Size` qədər buffer ayırırdı (`make([]byte, fh.Size)`) və faylı bütünlüklə
+// RAM-a oxuyurdu. Kimliyi doğrulanmış istənilən istifadəçi çox-yüz-MB-lıq
+// (və ya paralel) upload ilə prosesi OOM edə bilirdi.
+//
+// İndi üç qat müdafiə var:
+//  1. `http.MaxBytesReader` — request GÖVDƏSİ hard cap (multipart parse
+//     mərhələsində kəsilir, disk/RAM-a heç nə yazılmır).
+//  2. `fileHeader.Size` yoxlaması — buffer AYRILMADAN əvvəl rədd.
+//  3. `readMultipart` daxilində `io.LimitReader` — Content-Length yalan
+//     danışsa belə ayrılan yaddaş sərhədlidir.
+//
+// Rəqəmlər: Cloudflare edge onsuz da 100 MB-da kəsir → media üçün ondan
+// yuxarı qalxmağın mənası yoxdur. Səs mesajları praktikada « 25 MB.
+const (
+	maxVoiceUploadBytes int64 = 25 << 20  // 25 MB
+	maxMediaUploadBytes int64 = 100 << 20 // 100 MB
+	// multipartOverheadBytes — form sərhədləri, `duration` kimi digər
+	// field-lər üçün kiçik pay. Gövdə limiti = fayl limiti + bu.
+	multipartOverheadBytes int64 = 1 << 20 // 1 MB
+)
+
+// limitRequestBody — gövdəni hard cap-lə sarır. MÜTLƏQ hər hansı form oxuma
+// (`c.PostForm`, `c.FormFile`, `c.Request.ParseMultipartForm`) çağırışından
+// ƏVVƏL çağırılmalıdır, çünki parse gövdəni bir dəfə axıdır.
+func limitRequestBody(c *gin.Context, maxFileBytes int64) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxFileBytes+multipartOverheadBytes)
+}
+
+// isBodyTooLarge — MaxBytesReader-in qaytardığı xətanı tanıyır (Go 1.19+).
+func isBodyTooLarge(err error) bool {
+	var maxErr *http.MaxBytesError
+	return errors.As(err, &maxErr)
+}
+
+// tooLargeMB — istifadəçiyə göstərilən limit (MB).
+func tooLargeMB(maxBytes int64) int64 { return maxBytes >> 20 }
 
 // UploadHandler — voice/media S3 upload + waveform.
 type UploadHandler struct {
@@ -49,17 +91,41 @@ func (h *UploadHandler) UploadVoice(c *gin.Context) {
 	}
 	userID := uid.(uint)
 
+	// Issue 54: gövdə limiti — form parse-dan ƏVVƏL.
+	limitRequestBody(c, maxVoiceUploadBytes)
+
+	// DİQQƏT (sıralama): `c.FormFile` BİRİNCİ çağırılmalıdır. Əvvəl
+	// `c.PostForm("duration")` vardı; o da multipart parse-ı tetikləyir, amma
+	// Gin `initFormCache` parse XƏTASINI UDUR → limit aşımı 413 yerinə
+	// mənasız "Geçersiz duration" (422) qaytarırdı.
+	fileHeader, err := c.FormFile("voice")
+	if err != nil {
+		if isBodyTooLarge(err) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{
+				"error":    fmt.Sprintf("Ses dosyası çok büyük (en fazla %d MB)", tooLargeMB(maxVoiceUploadBytes)),
+				"code":     "FILE_TOO_LARGE",
+				"max_size": maxVoiceUploadBytes,
+			})
+			return
+		}
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "Ses dosyası bulunamadı"})
+		return
+	}
+	// Issue 54: buffer AYRILMADAN əvvəl ölçü yoxlaması.
+	if fileHeader.Size > maxVoiceUploadBytes {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{
+			"error":    fmt.Sprintf("Ses dosyası çok büyük (en fazla %d MB)", tooLargeMB(maxVoiceUploadBytes)),
+			"code":     "FILE_TOO_LARGE",
+			"max_size": maxVoiceUploadBytes,
+		})
+		return
+	}
+
 	// duration — required|integer|min:1|max:10000.
 	durationStr := c.PostForm("duration")
 	duration, err := strconv.Atoi(durationStr)
 	if err != nil || duration < 1 || duration > 10000 {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "Geçersiz duration"})
-		return
-	}
-
-	fileHeader, err := c.FormFile("voice")
-	if err != nil {
-		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "Ses dosyası bulunamadı"})
 		return
 	}
 
@@ -71,7 +137,7 @@ func (h *UploadHandler) UploadVoice(c *gin.Context) {
 	filename := uuid.NewString() + "." + ext
 
 	// Faylın bütün baytlarını oxu.
-	data, err := readMultipart(c, "voice")
+	data, err := readMultipart(c, "voice", maxVoiceUploadBytes)
 	if err != nil || len(data) == 0 {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ses dosyası okunamadı"})
 		return
@@ -136,9 +202,29 @@ func (h *UploadHandler) UploadMedia(c *gin.Context) {
 	}
 	userID := uid.(uint)
 
+	// Issue 54: gövdə limiti — form parse-dan ƏVVƏL.
+	limitRequestBody(c, maxMediaUploadBytes)
+
 	fileHeader, err := c.FormFile("media")
 	if err != nil {
+		if isBodyTooLarge(err) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{
+				"error":    fmt.Sprintf("Medya dosyası çok büyük (en fazla %d MB)", tooLargeMB(maxMediaUploadBytes)),
+				"code":     "FILE_TOO_LARGE",
+				"max_size": maxMediaUploadBytes,
+			})
+			return
+		}
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "Medya dosyası bulunamadı"})
+		return
+	}
+	// Issue 54: buffer AYRILMADAN əvvəl ölçü yoxlaması.
+	if fileHeader.Size > maxMediaUploadBytes {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{
+			"error":    fmt.Sprintf("Medya dosyası çok büyük (en fazla %d MB)", tooLargeMB(maxMediaUploadBytes)),
+			"code":     "FILE_TOO_LARGE",
+			"max_size": maxMediaUploadBytes,
+		})
 		return
 	}
 
@@ -152,7 +238,7 @@ func (h *UploadHandler) UploadMedia(c *gin.Context) {
 
 	filename := uuid.NewString() + "." + ext
 
-	data, err := readMultipart(c, "media")
+	data, err := readMultipart(c, "media", maxMediaUploadBytes)
 	if err != nil || len(data) == 0 {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Medya dosyası okunamadı"})
 		return
@@ -181,27 +267,63 @@ func (h *UploadHandler) UploadMedia(c *gin.Context) {
 	})
 }
 
-// readMultipart — form field-dəki faylın bütün baytlarını oxuyur.
-func readMultipart(c *gin.Context, field string) ([]byte, error) {
+// readMultipart — form field-dəki faylın baytlarını oxuyur, `maxBytes` ilə
+// sərhədli.
+//
+// Issue 54: əvvəl `make([]byte, fh.Size)` ilə client-in bildirdiyi ölçü qədər
+// yaddaş HEÇ BİR yoxlama olmadan ayrılırdı. İndi:
+//   - `fh.Size` limitdən böyükdürsə heç nə ayrılmır, dərhal xəta;
+//   - oxuma `io.LimitReader` ilə sərhədlidir (Content-Length yalan danışsa belə);
+//   - ilkin buffer tutumu `fh.Size` ilə limitin KİÇİYİ qədərdir.
+func readMultipart(c *gin.Context, field string, maxBytes int64) ([]byte, error) {
 	fh, err := c.FormFile(field)
 	if err != nil {
 		return nil, err
+	}
+	if fh.Size > maxBytes {
+		return nil, fmt.Errorf("upload too large: %d > %d", fh.Size, maxBytes)
 	}
 	f, err := fh.Open()
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	buf := make([]byte, fh.Size)
-	total := 0
-	for total < len(buf) {
-		n, err := f.Read(buf[total:])
-		total += n
+
+	capHint := fh.Size
+	if capHint < 0 || capHint > maxBytes {
+		capHint = maxBytes
+	}
+	// +1 tutum: normal halda fayl DƏQİQ `capHint` baytdır; əlavə 1 bayt
+	// olmasa `readAllInto` son oxumadan sonra EOF-u aşkar etmək üçün massivi
+	// ~1.25x böyüdüb HAMISINI kopyalayır (zirvə yaddaş ~2.25N).
+	buf := make([]byte, 0, capHint+1)
+	// LimitReader maxBytes+1 → limitin AŞILDIĞINI aşkar edə bilirik.
+	data, err := readAllInto(buf, io.LimitReader(f, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("upload too large: exceeds %d bytes", maxBytes)
+	}
+	return data, nil
+}
+
+// readAllInto — verilmiş tutumlu buffer üzərində io.ReadAll ekvivalenti
+// (əlavə realloc-ları azaldır).
+func readAllInto(buf []byte, r io.Reader) ([]byte, error) {
+	for {
+		if len(buf) == cap(buf) {
+			buf = append(buf, 0)[:len(buf)]
+		}
+		n, err := r.Read(buf[len(buf):cap(buf)])
+		buf = buf[:len(buf)+n]
 		if err != nil {
-			break
+			if errors.Is(err, io.EOF) {
+				return buf, nil
+			}
+			return buf, err
 		}
 	}
-	return buf[:total], nil
 }
 
 // generateWaveform — Laravel uploadVoice waveform məntiqi:

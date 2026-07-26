@@ -320,8 +320,13 @@ func (h *GroupMessageHandler) SendGroupMessage(c *gin.Context) {
 		}
 	}
 
-	// Tüm üyelere WebSocket ile gönder
-	memberIDs := getGroupParticipantIDs(conversationID)
+	// Tüm üyelere WebSocket ile gönder.
+	// Issue 7: YALNIZ tam qoşulmuş (invite_status='active') üzvlər. `pending`
+	// dəvətli mesaj MƏZMUNUNU almamalıdır — tarixçəni onsuz da yükləyə bilmir
+	// (GetGroupMessages 'active' tələb edir), canlı axını alması məxfilik
+	// sızıntısı idi. Üzvlük/dəvət olayları (join/leave/kick/update) üçün
+	// filtrsiz getGroupParticipantIDs istifadə olunmağa davam edir.
+	memberIDs := getActiveGroupMemberIDs(conversationID)
 	wsPayload := map[string]interface{}{
 		"id":                            messageID,
 		"conversation_id":               conversationID,
@@ -516,7 +521,7 @@ func (h *GroupMessageHandler) GetGroupMessages(c *gin.Context) {
 	// PENDING dəvət (hələ qəbul etməyib) mesajları OXUYA BİLMƏZ.
 	var me models.ConversationParticipant
 	err = database.DB.Where(
-		"conversation_id = ? AND user_id = ? AND deleted_at IS NULL AND COALESCE(invite_status, 'active') = 'active'",
+		"conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL AND COALESCE(invite_status, 'active') = 'active'",
 		conversationID, userID,
 	).First(&me).Error
 	if err != nil {
@@ -526,6 +531,18 @@ func (h *GroupMessageHandler) GetGroupMessages(c *gin.Context) {
 
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
+	// Sanitizasiya (DM GetMessages ilə eyni): `strconv.Atoi` xətası yeyilirdi.
+	// `?limit=abc` → 0 → `LIMIT 0` → boş səhifə; mənfi dəyər → `LIMIT -1` /
+	// `OFFSET -50` → Postgres xətası; `page` daşması → mənfi offset.
+	if limit < 1 || limit > 100 {
+		limit = 50
+	}
+	if page < 1 {
+		page = 1
+	}
+	if page > 100000 {
+		page = 100000
+	}
 	offset := (page - 1) * limit
 
 	// peek=true — ÖNİZLƏMƏ rejimi (uzun-bas preview): mesajlar OXUNDU
@@ -727,7 +744,11 @@ func (h *GroupMessageHandler) GetGroupMessages(c *gin.Context) {
 		}
 	}
 
-	var result []gin.H
+	// DM GetMessages ilə eyni: nil slice JSON-da `null` olur, istemçi isə
+	// `data`-nı massiv gözləyir və `null` gördükdə cavabı BOZUQ sayıb atır
+	// (Issue 5 qoruması) → `GroupChatViewModel.loadInitial` erkən qayıdır,
+	// `hasMore` true qalır və sonsuz spinner yaranır.
+	result := make([]gin.H, 0, len(messages))
 	for _, msg := range messages {
 		text, _ := h.encryptionService.DecryptMessage(msg.EncryptedText)
 
@@ -829,9 +850,13 @@ func (h *GroupMessageHandler) GetMessageReads(c *gin.Context) {
 	}
 
 	// Üye mi?
+	// Issue 7: `invite_status='active'` şərti — dəvəti qəbul etməmiş (və ya
+	// pending-ə salınmış) üzv qrupun oxuyucu siyahısını (ad/username/avatar +
+	// oxuma vaxtları) görməməlidir. `findGroupMessage` (:986) onsuz da bu
+	// şərti tətbiq edir; bu endpoint istisna qalmışdı.
 	var me models.ConversationParticipant
 	err := database.DB.Where(
-		"conversation_id = ? AND user_id = ? AND deleted_at IS NULL",
+		"conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL AND COALESCE(invite_status,'active') = 'active'",
 		*msg.ConversationID, userID,
 	).First(&me).Error
 	if err != nil {
@@ -915,7 +940,7 @@ func (h *GroupMessageHandler) markGroupMessagesRead(userID, conversationID uint)
 	h.wsHub.SendDismissThreadPush(userID, fmt.Sprintf("group_%d", conversationID))
 
 	// Gönderenlere WebSocket ile bildir
-	memberIDs := getGroupParticipantIDs(conversationID)
+	memberIDs := getActiveGroupMemberIDs(conversationID)
 	h.wsHub.SendToMultipleUsers(memberIDs, "group_message_read", map[string]interface{}{
 		"conversation_id": conversationID,
 		"reader_id":       userID,
@@ -945,7 +970,7 @@ func (h *GroupMessageHandler) MarkGroupConversationRead(c *gin.Context) {
 	// mesajları oxuya bilməz → oxundu da işarələyə bilməz).
 	var me models.ConversationParticipant
 	err = database.DB.Where(
-		"conversation_id = ? AND user_id = ? AND deleted_at IS NULL AND COALESCE(invite_status, 'active') = 'active'",
+		"conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL AND COALESCE(invite_status, 'active') = 'active'",
 		conversationID, userID,
 	).First(&me).Error
 	if err != nil {
@@ -1034,14 +1059,14 @@ func (h *GroupMessageHandler) DeleteGroupMessage(c *gin.Context) {
 		database.DB.Table("conversations").
 			Where("id = ?", conversationID).
 			Update("pinned_message_id", nil)
-		h.wsHub.SendToMultipleUsers(getGroupParticipantIDs(conversationID),
+		h.wsHub.SendToMultipleUsers(getActiveGroupMemberIDs(conversationID),
 			"group_message_pinned", map[string]interface{}{
 				"conversation_id": conversationID,
 				"pinned_message":  nil, // pin götürüldü
 			})
 	}
 
-	memberIDs := getGroupParticipantIDs(conversationID)
+	memberIDs := getActiveGroupMemberIDs(conversationID)
 	h.wsHub.SendToMultipleUsers(memberIDs, "group_message_deleted", map[string]interface{}{
 		"conversation_id": conversationID,
 		"message_id":      messageID,
@@ -1122,7 +1147,7 @@ func (h *GroupMessageHandler) handlePinUnpin(c *gin.Context, pin bool) {
 		}
 	}
 
-	memberIDs := getGroupParticipantIDs(conversationID)
+	memberIDs := getActiveGroupMemberIDs(conversationID)
 	h.wsHub.SendToMultipleUsers(memberIDs, "group_message_pinned", map[string]interface{}{
 		"conversation_id": conversationID,
 		"pinned_message":  newPinned,
@@ -1188,7 +1213,7 @@ func (h *GroupMessageHandler) EditGroupMessage(c *gin.Context) {
 		"edited_at":       now,
 	}
 
-	memberIDs := getGroupParticipantIDs(conversationID)
+	memberIDs := getActiveGroupMemberIDs(conversationID)
 	h.wsHub.SendToMultipleUsers(memberIDs, "group_message_edited", editPayload)
 
 	c.JSON(http.StatusOK, gin.H{
@@ -1278,7 +1303,7 @@ func (h *GroupMessageHandler) MarkGroupViewOnceOpened(c *gin.Context) {
 		"opened_by":        userID,
 	}
 
-	memberIDs := getGroupParticipantIDs(conversationID)
+	memberIDs := getActiveGroupMemberIDs(conversationID)
 	h.wsHub.SendToMultipleUsers(memberIDs, "group_message_edited", editPayload)
 
 	c.JSON(http.StatusOK, gin.H{"message": "Açıldı", "data": editPayload})
@@ -1347,9 +1372,13 @@ func (h *GroupMessageHandler) GetGroupStarred(c *gin.Context) {
 	}
 	conversationID := uint(convID)
 
+	// Issue 7: ulduzlanmış mesajların MƏTNİ də qrup məzmunudur → yalnız TAM
+	// qoşulmuş üzv görə bilər. Qeyd: `group_message_stars` sətirləri qrupdan
+	// çıxanda silinmir; yenidən DƏVƏT olunan (pending) köhnə üzv bu endpoint-lə
+	// mesaj mətnini oxuya bilirdi.
 	var me models.ConversationParticipant
 	err = database.DB.Where(
-		"conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL",
+		"conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL AND COALESCE(invite_status,'active') = 'active'",
 		conversationID, userID,
 	).First(&me).Error
 	if err != nil {
@@ -1461,7 +1490,7 @@ func (h *GroupMessageHandler) SetGroupReaction(c *gin.Context) {
 		WHERE message_id = ? AND user_id = ?
 	`, messageID, userID).Scan(&existing)
 
-	memberIDs := getGroupParticipantIDs(conversationID)
+	memberIDs := getActiveGroupMemberIDs(conversationID)
 
 	if existing.Emoji != nil && *existing.Emoji == body.Emoji {
 		if err := database.DB.Exec(`
