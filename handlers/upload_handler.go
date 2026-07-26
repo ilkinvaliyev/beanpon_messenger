@@ -8,6 +8,8 @@ package handlers
 // düz fallback qaytarılır (Laravel ilə birebir).
 
 import (
+	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -78,6 +80,25 @@ func tooLargeMB(maxBytes int64) int64 { return maxBytes >> 20 }
 // qeyri-müəyyəndirsə (`application/octet-stream`) uzantıya güvənilir —
 // bəzi konteynerlər (m4a/3gp/webm) sabit imza vermir, yoxsa legitim
 // yükləmələri rədd edərdik.
+// ── REQRESSİYA DÜZƏLİŞİ: iOS SƏS MESAJLARI RƏDD OLUNURDU ───────────────────
+//
+// `http.DetectContentType` WHATWG sniff cədvəlini tətbiq edir və ORADA
+// ISO-BMFF üçün TƏK bir imza var: `ftyp` qutusunun markaları arasında "mp4"
+// keçirsə → **"video/mp4"**. iOS-un `AVAudioRecorder`-ı isə `.m4a` faylını
+// `ftyp M4A ` major markası + `mp42`/`isom` uyğun markaları ilə yazır.
+//
+// Nəticə: HƏR iOS səs mesajı "video" kimi iylənirdi, `UploadVoice` onu
+// "Desteklenmeyen ses formatı" (422) ilə rədd edirdi və istifadəçi yalnız
+// "medya gönderilemedi" görürdü. YALNIZ səs sınırdı — şəkil/video yolları
+// uzantı ilə eyni ailəyə düşdüyü üçün heç nə hiss etdirmirdi.
+//
+// ISO-BMFF konteyneri səs və video üçün EYNİDİR; ona görə markaya baxmadan
+// "video" demək YANLIŞDIR. Aşağıda əvvəlcə marka oxunur:
+//   - səs markası (M4A/M4B/M4P/F4A/F4B) → qəti "audio"
+//   - başqa hər hansı ISO-BMFF        → QƏTİ DEYİL → "" (uzantıya güvən)
+//
+// Bu, sniff-in əsl məqsədini (HTML/SVG/şəkil maskalanması) tam saxlayır:
+// ISO-BMFF heç vaxt HTML və ya SVG deyil.
 func sniffFamily(data []byte) string {
 	if len(data) == 0 {
 		return ""
@@ -85,6 +106,21 @@ func sniffFamily(data []byte) string {
 	head := data
 	if len(head) > 512 {
 		head = head[:512]
+	}
+	// ISO-BMFF (mp4/m4a/mov/3gp) — `http.DetectContentType`-dan ƏVVƏL.
+	if iso, ok := isoBMFFFamily(head); ok {
+		return iso
+	}
+	// İŞARƏLƏMƏ YOXLAMASI `http.DetectContentType`-dan ƏVVƏL OLMALIDIR.
+	//
+	// Go-nun sniff cədvəlində `<SVG` YOXDUR: XML elanı olmayan bir SVG
+	// "text/plain; charset=utf-8" kimi görünür, `<?xml`-li olan isə
+	// "text/xml" — heç biri "image/svg" prefiksinə düşmür. Yəni aşağıdakı
+	// "unsafe" dalı YALNIZ `<html>` ilə başlayanları tuturdu; `.jpg` adı ilə
+	// göndərilən bir SVG (içində `<script>`) rahatca keçib S3-ə yazılır və
+	// etibarlı domendən inline servis edildikdə SAXLANMIŞ XSS olurdu.
+	if isMarkupPayload(head) {
+		return "unsafe"
 	}
 	ct := http.DetectContentType(head)
 	switch {
@@ -96,13 +132,75 @@ func sniffFamily(data []byte) string {
 		return "audio"
 	case ct == "application/ogg":
 		return "audio"
-	case strings.HasPrefix(ct, "text/html"), strings.HasPrefix(ct, "image/svg"):
+	case strings.HasPrefix(ct, "text/html"), strings.HasPrefix(ct, "image/svg"),
+		strings.HasPrefix(ct, "text/xml"), strings.HasPrefix(ct, "application/xml"):
 		// Aşkar TƏHLÜKƏLİ: etibarlı S3 yolu altında inline servis edilsə
 		// saxlanmış-XSS potensialı. Heç vaxt media/səs kimi qəbul etmə.
 		return "unsafe"
 	default:
 		return "" // qeyri-müəyyən → uzantıya güvən
 	}
+}
+
+// markupPrefixes — brauzerin İCRA EDƏ biləcəyi işarələmə başlanğıcları.
+// Hamısı kiçik hərflə; müqayisə hərf hassasiyyətsizdir (SVG/svg/Svg).
+var markupPrefixes = [][]byte{
+	[]byte("<?xml"), []byte("<svg"), []byte("<!doctype"), []byte("<html"),
+	[]byte("<head"), []byte("<script"), []byte("<iframe"), []byte("<!--"),
+	[]byte("<body"), []byte("<a "), []byte("<math"), []byte("<plist"),
+}
+
+// isMarkupPayload — baytların əvvəlindəki boşluqlar atıldıqdan sonra icra
+// edilə bilən bir işarələmə ilə başlayırmı. `http.DetectContentType` bunların
+// bir hissəsini "text/plain" kimi qaytardığı üçün ayrıca yoxlanılır.
+func isMarkupPayload(head []byte) bool {
+	trimmed := bytes.TrimLeft(head, " \t\r\n\f\v\x00")
+	if len(trimmed) == 0 || trimmed[0] != '<' {
+		return false
+	}
+	lower := bytes.ToLower(trimmed)
+	for _, p := range markupPrefixes {
+		if bytes.HasPrefix(lower, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// isoBMFFAudioBrands — yalnız SƏS daşıyan ISO-BMFF markaları.
+// (`M4A `/`M4B `/`M4P ` Apple; `F4A `/`F4B ` Adobe.) Siyahıdakı bütün açarlar
+// 4 baytdır — ISO-BMFF markası tərifinə görə sabit uzunluqdadır.
+var isoBMFFAudioBrands = map[string]bool{
+	"M4A ": true, "M4B ": true, "M4P ": true,
+	"F4A ": true, "F4B ": true,
+}
+
+// isoBMFFFamily — `ftyp` qutusunu oxuyur.
+//
+// Qaytarır:
+//   - ("audio", true)  → markalar arasında qəti səs markası var
+//   - ("", true)       → ISO-BMFF-dir, amma ailə QƏTİ DEYİL (uzantıya güvən)
+//   - ("", false)      → ümumiyyətlə ISO-BMFF deyil (adi sniff-ə keç)
+func isoBMFFFamily(head []byte) (string, bool) {
+	if len(head) < 12 || !bytes.Equal(head[4:8], []byte("ftyp")) {
+		return "", false
+	}
+	boxSize := int(binary.BigEndian.Uint32(head[:4]))
+	// Qutu başlığı ən azı 16 bayt (size+ftyp+major+minor). Bozuq/nəhəng
+	// dəyərləri əldəki bufferlə məhdudlaşdır — panika olmasın.
+	if boxSize < 16 || boxSize > len(head) {
+		boxSize = len(head)
+	}
+	// Major marka head[8:12]; uyğun markalar head[16:] (12:16 minor versiyadır).
+	if isoBMFFAudioBrands[string(head[8:12])] {
+		return "audio", true
+	}
+	for st := 16; st+4 <= boxSize; st += 4 {
+		if isoBMFFAudioBrands[string(head[st:st+4])] {
+			return "audio", true
+		}
+	}
+	return "", true
 }
 
 // UploadHandler — voice/media S3 upload + waveform.
