@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -22,6 +23,13 @@ import (
 
 // errGroupFull — atomik limit yoxlamasında "qrup dolu" sentinel xətası.
 var errGroupFull = errors.New("group full")
+
+// Issue 58: LeaveGroup transaction-ından qaytarılan sentinel xətalar —
+// HTTP statusunu ayırd etmək üçün (404 vs 500).
+var (
+	errGroupNotFound  = errors.New("group not found")
+	errNotGroupMember = errors.New("not a group member")
+)
 
 type GroupHandler struct {
 	wsHub interface {
@@ -55,13 +63,58 @@ func generateInviteToken() (string, error) {
 	return hex.EncodeToString(bytes), nil
 }
 
+// ── Issue 18 — dəvət linklərinin ÖMÜRLÜK olması ─────────────────────────────
+//
+// PROBLEM
+// `conversations.invite_token_expires_at` sütunu MÖVCUD idi və qoşulma
+// yollarında (`PreviewByToken`, `JoinByToken`) yoxlanılırdı — amma HEÇ BİR
+// yerdə TƏYİN EDİLMİRDİ. Nə qrup yaradılanda, nə də `RefreshInviteToken`-də.
+// Yəni yoxlama həmişə `nil` görüb keçirdi və hər dəvət linki ƏBƏDİ idi:
+//   - bir dəfə paylaşılan link (skrinşot, forward, arxivlənmiş söhbət, indeks-
+//     lənmiş veb səhifə) aylar sonra da qrupa giriş verirdi;
+//   - `RefreshInviteToken` yalnız tokeni dəyişirdi — köhnə linki "ləğv etmək"
+//     kimi görünürdü, amma müddət anlayışı olmadığı üçün admin "bu link nə
+//     vaxta qədər etibarlıdır" sualına cavab verə bilmirdi.
+//
+// HƏLL
+// Yeni yaradılan və yenilənən tokenlərə TTL yazılır. Müddət `INVITE_TOKEN_TTL_HOURS`
+// mühit dəyişəni ilə tənzimlənir (default 168 saat = 7 gün). `0` → müddətsiz
+// (köhnə davranış, açıq şəkildə seçilməli).
+//
+// GERİYƏ UYĞUNLUQ: mövcud qrupların `invite_token_expires_at` dəyəri NULL
+// qalır → onların linkləri işləməyə davam edir. Yalnız yeni yaradılan/yenilənən
+// tokenlər müddətli olur. Miqrasiya tələb OLUNMUR.
+const defaultInviteTokenTTLHours = 168 // 7 gün
+
+// inviteTokenExpiry — yeni token üçün bitmə vaxtı. nil = müddətsiz.
+func inviteTokenExpiry(now time.Time) *time.Time {
+	hours := defaultInviteTokenTTLHours
+	if raw := strings.TrimSpace(os.Getenv("INVITE_TOKEN_TTL_HOURS")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 0 {
+			hours = parsed
+		}
+	}
+	if hours == 0 {
+		return nil // açıq şəkildə müddətsiz
+	}
+	exp := now.Add(time.Duration(hours) * time.Hour)
+	return &exp
+}
+
 // getGroupParticipantIDs group'taki aktif üyelerin ID listesini döndür.
 // DİQQƏT: bura `invite_status='pending'` (dəvət olunmuş amma qəbul etməmiş)
 // üzvləri də daxildir — üzvlük/dəvət olayları (join/leave/invite/accept) üçün
 // bu doğrudur. Mesaj MƏZMUNU yaymaq üçün getActiveGroupMemberIDs istifadə et.
 func getGroupParticipantIDs(conversationID uint) []uint {
+	return getGroupParticipantIDsTx(database.DB, conversationID)
+}
+
+// getGroupParticipantIDsTx — eyni sorğu, amma verilmiş `db`/transaction
+// üzərində (Issue 58: LeaveGroup siyahını öz transaction-ından oxumalıdır,
+// əks halda transaction-da edilən dəyişikliyi görmür).
+func getGroupParticipantIDsTx(db *gorm.DB, conversationID uint) []uint {
 	var ids []uint
-	database.DB.Model(&models.ConversationParticipant{}).
+	db.Model(&models.ConversationParticipant{}).
 		Where("conversation_id = ? AND left_at IS NULL AND deleted_at IS NULL", conversationID).
 		Pluck("user_id", &ids)
 	return ids
@@ -429,6 +482,10 @@ func (h *GroupHandler) CreateGroup(c *gin.Context) {
 		"created_at":   now,
 		"updated_at":   now,
 	}
+	// Issue 18: dəvət linkinə TTL. nil olduqda sütun yazılmır (müddətsiz).
+	if exp := inviteTokenExpiry(now); exp != nil {
+		conv["invite_token_expires_at"] = *exp
+	}
 
 	result := database.DB.Table("conversations").Create(&conv)
 	if result.Error != nil {
@@ -708,56 +765,135 @@ func (h *GroupHandler) LeaveGroup(c *gin.Context) {
 	}
 	conversationID := uint(convID)
 
-	var participant models.ConversationParticipant
-	err = database.DB.Where("conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL",
-		conversationID, userID).First(&participant).Error
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Bu grubun üyesi değilsiniz"})
+	// ── Issue 58 — LeaveGroup ATOMİK DEYİLDİ ────────────────────────────────
+	//
+	// Əvvəlki axın 3–4 ayrı yazı əməliyyatı idi, transaction YOX, kilid YOX:
+	//
+	//  1. YARIMÇIQ QALAN VƏZİYYƏT. Son admin çıxanda əvvəl onun `left_at`-ı
+	//     yazılır, SONRA qrup soft-delete edilirdi. İkinci yazı uğursuz olsa
+	//     (bağlantı qopması, hovuz timeout-u, deploy) admin qrupdan çıxmış,
+	//     qrup isə İDARƏÇİSİZ AÇIQ qalırdı — heç kim üzv əlavə edə, ayarları
+	//     dəyişə və ya qrupu bağlaya bilmirdi. Geri dönüşü yalnız DB-dən
+	//     əl ilə düzəltmək idi.
+	//
+	//  2. TOCTOU YARIŞI (əsas problem). İki admin EYNİ VAXTDA çıxanda hər
+	//     ikisi "başqa admin varmı?" sorğusunu qarşı tərəf HƏLƏ çıxmamış
+	//     icra edir → hər ikisi `adminCount == 1` görür → HEÇ BİRİ qrupu
+	//     bağlamır. Nəticə: qrup sıfır adminlə sağ qalır — düzəltmək
+	//     istədiyimiz vəziyyətin məhz özü.
+	//
+	//  3. WS bildirişi iki yazının ARASINDA göndərilirdi: istifadəçilər
+	//     `group_deleted` alır, sonra silmə uğursuz olursa qrup serverdə
+	//     qalır — istemçi ilə server ayrılır.
+	//
+	// HƏLL: hamısı TEK transaction; `conversations` sətri `FOR UPDATE` ilə
+	// kilidlənir (paralel çıxışlar ardıcıllaşır); WS yayımı yalnız KOMİTDƏN
+	// SONRA. Bildiriş siyahısı transaction daxilində götürülür.
+	var (
+		now            = time.Now()
+		groupDeleted   bool
+		memberIDs      []uint
+		leaverUsername string
+	)
+
+	txErr := database.DB.Transaction(func(tx *gorm.DB) error {
+		// Sətir kilidi — bu qrup üzərindəki paralel LeaveGroup-ları seriallaşdırır.
+		var conv models.Conversation
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND chat_type = 'group' AND deleted_at IS NULL", conversationID).
+			First(&conv).Error; err != nil {
+			// Yalnız "sətir yoxdur" 404-dür. Şəbəkə/kilid/hovuz xətası 500
+			// olmalıdır — əks halda istemçi "üzv deyilsiniz" görüb qrupu
+			// siyahıdan silərdi (məlumat itkisi kimi görünən UI xətası).
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errGroupNotFound
+			}
+			return err
+		}
+
+		var participant models.ConversationParticipant
+		if err := tx.Where("conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL",
+			conversationID, userID).First(&participant).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errNotGroupMember
+			}
+			return err
+		}
+
+		// Bildiriş siyahısı — çıxış YAZILMADAN ƏVVƏL (çıxan da xəbər alsın
+		// deyil, sadəcə qalan üzvlər siyahısı bu nöqtədə dəqiqdir).
+		memberIDs = getGroupParticipantIDsTx(tx, conversationID)
+
+		if err := tx.Model(&models.ConversationParticipant{}).
+			Where("id = ?", participant.ID).
+			Update("left_at", now).Error; err != nil {
+			return err
+		}
+
+		// Admin/owner çıxır və BAŞQA admin/owner YOXDURSA → qrup SİLİNİR
+		// (istifadəçi tələbi: idarəçisiz qrup qalmasın). Üzvlərə group_deleted
+		// göndərilir — Flutter siyahıdan çıxarır və çatı bağlayır.
+		// DİQQƏT: sayım artıq ÇIXIŞ YAZILDIQDAN SONRA edilir — beləliklə
+		// paralel çıxan ikinci admin özündən əvvəlkinin getdiyini GÖRÜR.
+		if participant.Role == "owner" || participant.Role == "admin" {
+			var adminCount int64
+			if err := tx.Model(&models.ConversationParticipant{}).
+				Where("conversation_id = ? AND role IN ('owner','admin') AND left_at IS NULL AND deleted_at IS NULL",
+					conversationID).Count(&adminCount).Error; err != nil {
+				return err
+			}
+			if adminCount == 0 {
+				if err := tx.Model(&models.Conversation{}).
+					Where("id = ?", conversationID).
+					Update("deleted_at", now).Error; err != nil {
+					return err
+				}
+				groupDeleted = true
+				return nil
+			}
+		}
+
+		// Çıxanın adı — Flutter çatda "X qrupu tərk etdi" sistem sətri göstərsin.
+		tx.Raw(`SELECT username FROM users WHERE id = ?`, userID).Scan(&leaverUsername)
+		return nil
+	})
+
+	if txErr != nil {
+		switch {
+		case errors.Is(txErr, errGroupNotFound):
+			// Qrup artıq silinib — istemçinin "fantom üzvlüyü" qalmasın deyə
+			// UĞURLU cavab: onsuz da çıxmış sayılır.
+			c.JSON(http.StatusOK, gin.H{"message": "Grup kapatıldı", "group_deleted": true})
+		case errors.Is(txErr, errNotGroupMember):
+			c.JSON(http.StatusNotFound, gin.H{"error": "Bu grubun üyesi değilsiniz"})
+		default:
+			log.Printf("LeaveGroup transaction xətası (conv=%d, user=%d): %v", conversationID, userID, txErr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Gruptan ayrılınamadı"})
+		}
 		return
 	}
 
-	// Admin/owner çıxır və BAŞQA admin/owner YOXDURSA → qrup SİLİNİR
-	// (istifadəçi tələbi: idarəçisiz qrup qalmasın). Üzvlərə group_deleted
-	// göndərilir — Flutter siyahıdan çıxarır və çatı bağlayır.
-	if participant.Role == "owner" || participant.Role == "admin" {
-		var adminCount int64
-		database.DB.Model(&models.ConversationParticipant{}).
-			Where("conversation_id = ? AND role IN ('owner','admin') AND user_id != ? AND left_at IS NULL AND deleted_at IS NULL",
-				conversationID, userID).Count(&adminCount)
-
-		if adminCount == 0 {
-			now := time.Now()
-			// Çıxan adminin participant qeydini bağla.
-			database.DB.Model(&participant).Update("left_at", now)
-
-			// Qalan üzvlərə xəbər ver (siyahı silinmədən ƏVVƏL götürülür).
-			memberIDs := getGroupParticipantIDs(conversationID)
-
-			// Qrupu soft-delete et.
-			database.DB.Model(&models.Conversation{}).
-				Where("id = ?", conversationID).
-				Update("deleted_at", now)
-
-			h.wsHub.SendToMultipleUsers(memberIDs, "group_deleted", gin.H{
-				"conversation_id": conversationID,
-				"reason":          "admin_left",
-			})
-
-			c.JSON(http.StatusOK, gin.H{"message": "Grup kapatıldı", "group_deleted": true})
-			return
+	// ── KOMİTDƏN SONRA: yayım ────────────────────────────────────────────────
+	// Çıxanı siyahıdan çıxarırıq (o, HTTP cavabı ilə onsuz da xəbərdardır;
+	// `group_deleted` üçün isə qalanlara getməlidir).
+	notify := make([]uint, 0, len(memberIDs))
+	for _, mid := range memberIDs {
+		if mid == userID {
+			continue
 		}
+		notify = append(notify, mid)
 	}
 
-	now := time.Now()
-	database.DB.Model(&participant).Update("left_at", now)
+	if groupDeleted {
+		h.wsHub.SendToMultipleUsers(notify, "group_deleted", gin.H{
+			"conversation_id": conversationID,
+			"reason":          "admin_left",
+		})
+		c.JSON(http.StatusOK, gin.H{"message": "Grup kapatıldı", "group_deleted": true})
+		return
+	}
 
-	// Çıxanın adı — Flutter çatda "X qrupu tərk etdi" sistem sətri göstərsin.
-	var leaverUsername string
-	database.DB.Raw(`SELECT username FROM users WHERE id = ?`, userID).Scan(&leaverUsername)
-
-	// Diğer üyelere bildir
-	memberIDs := getGroupParticipantIDs(conversationID)
-	h.wsHub.SendToMultipleUsers(memberIDs, "group_member_left", gin.H{
+	h.wsHub.SendToMultipleUsers(notify, "group_member_left", gin.H{
 		"conversation_id": conversationID,
 		"user_id":         userID,
 		"username":        leaverUsername,
@@ -1328,11 +1464,27 @@ func (h *GroupHandler) RefreshInviteToken(c *gin.Context) {
 		return
 	}
 
-	database.DB.Table("conversations").
-		Where("id = ?", conversationID).
-		Update("invite_token", token)
+	// Issue 18: yenilənən tokenə də TTL yazılır. Əvvəl yalnız `invite_token`
+	// dəyişirdi və `invite_token_expires_at` KÖHNƏ dəyərində (adətən NULL)
+	// qalırdı — yəni "linki yenilə" düyməsi müddətsiz link yaradırdı.
+	updates := map[string]interface{}{"invite_token": token}
+	exp := inviteTokenExpiry(time.Now())
+	// nil olduqda da YAZILIR (NULL) — TTL sonradan söndürülübsə köhnə
+	// bitmə tarixi qalıb yeni linki dərhal etibarsız etməsin.
+	updates["invite_token_expires_at"] = exp
 
-	c.JSON(http.StatusOK, gin.H{"invite_token": token})
+	if err := database.DB.Table("conversations").
+		Where("id = ?", conversationID).
+		Updates(updates).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Token güncellenemedi"})
+		return
+	}
+
+	resp := gin.H{"invite_token": token}
+	if exp != nil {
+		resp["invite_token_expires_at"] = exp.UTC().Format(time.RFC3339)
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // GET /api/v1/groups/:conversation_id

@@ -3,6 +3,7 @@ package handlers
 import (
 	"beanpon_messenger/database"
 	"beanpon_messenger/models"
+	"beanpon_messenger/services"
 	"beanpon_messenger/utils"
 	"bytes"
 	"encoding/json"
@@ -29,6 +30,8 @@ type GroupMessageHandler struct {
 	wsHub interface {
 		IsUserOnline(userID uint) bool
 		IsUserInGroupChat(userID, conversationID uint) bool
+		// Issue 23: üzv başına kilid əvəzinə tək kilidli toplu süzgəc.
+		FilterUsersInGroupChat(userIDs []uint, conversationID uint) []uint
 		SendToUser(userID uint, messageType string, data interface{})
 		SendToMultipleUsers(userIDs []uint, messageType string, data interface{})
 		SendGroupPushNotification(conversationID, senderID uint, groupName, message string, memberIDs []uint)
@@ -45,6 +48,8 @@ func NewGroupMessageHandler(
 	wsHub interface {
 		IsUserOnline(userID uint) bool
 		IsUserInGroupChat(userID, conversationID uint) bool
+		// Issue 23: üzv başına kilid əvəzinə tək kilidli toplu süzgəc.
+		FilterUsersInGroupChat(userIDs []uint, conversationID uint) []uint
 		SendToUser(userID uint, messageType string, data interface{})
 		SendToMultipleUsers(userIDs []uint, messageType string, data interface{})
 		SendGroupPushNotification(conversationID, senderID uint, groupName, message string, memberIDs []uint)
@@ -112,8 +117,18 @@ func (h *GroupMessageHandler) SendGroupMessage(c *gin.Context) {
 	var req struct {
 		Text             string  `json:"text" binding:"required"`
 		ReplyToMessageID *string `json:"reply_to_message_id"`
+		// Issue 9: istemçi tərəfli idempotentlik açarı (UUID).
+		// Bax handlers/idempotency.go. Opsional.
+		ClientMessageID *string `json:"client_message_id,omitempty"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Issue 9: mesaj ID-si — istemçi verdisə onu işlət.
+	newMessageID, _, err := resolveMessageID(req.ClientMessageID)
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -215,7 +230,11 @@ func (h *GroupMessageHandler) SendGroupMessage(c *gin.Context) {
 		return
 	}
 
-	messageID := uuid.New().String()
+	// Issue 56: mətn hələ açıqdır — S3 media açarlarını "istifadə olunub"
+	// işarələ ki, sahibsiz media təmizləyicisi onlara toxunmasın.
+	services.MarkMediaReferenced(req.Text)
+
+	messageID := newMessageID
 	now := time.Now()
 
 	message := models.Message{
@@ -228,8 +247,46 @@ func (h *GroupMessageHandler) SendGroupMessage(c *gin.Context) {
 		UpdatedAt:        now,
 	}
 
-	if err := database.DB.Create(&message).Error; err != nil {
+	// Issue 9: `ON CONFLICT (id) DO NOTHING` — eyni `client_message_id` ilə
+	// təkrar göndərmə YENİ sətir yaratmır. PK-nin unikal indeksi həmişə var,
+	// ona görə hədəfli forma burada təhlükəsizdir.
+	createRes := database.DB.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "id"}},
+		DoNothing: true,
+	}).Create(&message)
+	if createRes.Error != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Mesaj kaydedilemedi"})
+		return
+	}
+	if createRes.RowsAffected == 0 {
+		// Təkrar cəhd — sayğac, avto-oxundu, WS fan-out və push TƏKRARLANMIR.
+		var existing models.Message
+		if err := database.DB.Unscoped().Where("id = ?", messageID).First(&existing).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Mesaj kaydedilemedi"})
+			return
+		}
+		if existing.SenderID != senderID ||
+			existing.ConversationID == nil || *existing.ConversationID != conversationID {
+			c.JSON(http.StatusConflict, gin.H{"error": "client_message_id artıq istifadə olunub"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"message":   "Mesaj gönderildi",
+			"duplicate": true,
+			"data": gin.H{
+				"id":                  existing.ID,
+				"conversation_id":     conversationID,
+				"chat_type":           "group",
+				"sender_id":           existing.SenderID,
+				"text":                req.Text,
+				"reply_to_message_id": existing.ReplyToMessageID,
+				"reply_to_message":    nil,
+				"is_edited":           existing.IsEdited,
+				"is_starred_by_me":    false,
+				"reactions":           []gin.H{},
+				"created_at":          existing.CreatedAt.UTC().Format(time.RFC3339),
+			},
+		})
 		return
 	}
 
@@ -353,33 +410,59 @@ func (h *GroupMessageHandler) SendGroupMessage(c *gin.Context) {
 	// görür → dərhal okundu işarələnir. Bunsuz səhifə açıqkən gələn mesajlar
 	// yalnız NÖVBƏTİ GetGroupMessages-də işarələnirdi — istifadəçi qrupdan
 	// çıxıb siyahıya dönəndə "oxunmamış" sayılırdı.
+	//
+	// Issue 23 — TOPLU (batched) yazım. Əvvəl bu döngü üzv başına
+	//   1 × `IsUserInGroupChat` (hub RWMutex al-burax)
+	// + 1 × `INSERT message_reads`
+	// + 1 × `UPDATE conversation_participants`
+	// edirdi → 500 üzvlü qrupda mesaj başına 500 kilid + 1000 DB gedişi.
+	// Hər gediş hovuzdan bağlantı tutur (25 limitli) → burst zamanı bütün
+	// digər sorğular hovuz gözləməsinə düşürdü. İndi: 1 kilid + 2 sorğu.
 	go func() {
 		readNow := time.Now()
-		for _, mid := range memberIDs {
+
+		// Tək kilid altında "səhifəsi açıq" üzvləri süz.
+		activeViewers := h.wsHub.FilterUsersInGroupChat(memberIDs, conversationID)
+		targets := make([]uint, 0, len(activeViewers))
+		for _, mid := range activeViewers {
 			if mid == senderID {
 				continue
 			}
-			if !h.wsHub.IsUserInGroupChat(mid, conversationID) {
-				continue // səhifə açıq deyil — normal unread qalır
-			}
-			read := models.MessageRead{
+			targets = append(targets, mid)
+		}
+		if len(targets) == 0 {
+			return
+		}
+
+		reads := make([]models.MessageRead, 0, len(targets))
+		for _, mid := range targets {
+			reads = append(reads, models.MessageRead{
 				MessageID:      messageID,
 				UserID:         mid,
 				ConversationID: conversationID,
 				ReadAt:         readNow,
 				CreatedAt:      readNow,
-			}
-			// Issue 15: idempotent — eyni cüt paralel yollardan yazıla bilir.
-			// Hədəfsiz forma — indekssiz də təhlükəsiz (yuxarıdakı şərhə bax).
-			database.DB.Clauses(clause.OnConflict{DoNothing: true}).Create(&read)
-			// last_read yenilə (unread count sorğusu message_reads-ə baxır,
-			// amma participant last_read-i də tutarlı saxla).
-			database.DB.Model(&models.ConversationParticipant{}).
-				Where("conversation_id = ? AND user_id = ?", conversationID, mid).
-				Updates(map[string]interface{}{
-					"last_read_at":         readNow,
-					"last_read_message_id": messageID,
-				})
+			})
+		}
+		// Issue 15: idempotent — eyni cüt paralel yollardan yazıla bilir.
+		// Hədəfsiz forma — indekssiz də təhlükəsiz (yuxarıdakı şərhə bax).
+		// CreateInBatches: çox böyük qruplarda tək INSERT-in parametr
+		// limitini (PG: 65535 bind dəyəri) aşmasının qarşısını alır.
+		if err := database.DB.
+			Clauses(clause.OnConflict{DoNothing: true}).
+			CreateInBatches(&reads, 500).Error; err != nil {
+			log.Printf("qrup avto-oxundu toplu insert xətası (conv=%d): %v", conversationID, err)
+		}
+
+		// last_read yenilə (unread count sorğusu message_reads-ə baxır,
+		// amma participant last_read-i də tutarlı saxla). Tək UPDATE.
+		if err := database.DB.Model(&models.ConversationParticipant{}).
+			Where("conversation_id = ? AND user_id IN ?", conversationID, targets).
+			Updates(map[string]interface{}{
+				"last_read_at":         readNow,
+				"last_read_message_id": messageID,
+			}).Error; err != nil {
+			log.Printf("qrup avto-oxundu last_read yeniləmə xətası (conv=%d): %v", conversationID, err)
 		}
 	}()
 
@@ -465,9 +548,14 @@ func (h *GroupMessageHandler) SendGroupMessage(c *gin.Context) {
 	// 1) MENTION push — dərhal (gecikməsiz), xüsusi mətn.
 	//    Yalnız hazırda qrup səhifəsində OLMAYANLARA (onsuz da görür).
 	if len(mentionTargets) > 0 {
+		// Issue 23: üzv başına ayrıca kilid əvəzinə tək kilidli toplu süzgəc.
+		inChat := make(map[uint]struct{})
+		for _, uid := range h.wsHub.FilterUsersInGroupChat(mentionTargets, conversationID) {
+			inChat[uid] = struct{}{}
+		}
 		immediate := make([]uint, 0, len(mentionTargets))
 		for _, uid := range mentionTargets {
-			if !h.wsHub.IsUserInGroupChat(uid, conversationID) {
+			if _, open := inChat[uid]; !open {
 				immediate = append(immediate, uid)
 			}
 		}
@@ -909,6 +997,28 @@ func (h *GroupMessageHandler) markGroupMessagesRead(userID, conversationID uint)
 	// "oxundu" da yazılmamalıdır. Əvvəl yazılırdı: qrupa yeni qoşulan üzv
 	// bütün köhnə tarixçəyə `message_reads` sətri əlavə edir, bu da BAŞQA
 	// üzvlərin "N nəfər gördü" sayğacını şişirdirdi.
+	//
+	// ── Issue 57: NƏTİCƏ ÇOXLUĞU SƏRHƏDSİZ İDİ ──────────────────────────────
+	// Əvvəl bu sorğu `LIMIT`-siz idi və nəticə TAM olaraq Go yaddaşına
+	// yığılırdı. Uzun müddət açılmamış məşğul qrupda (5000 üzv limitli qrup,
+	// gündə minlərlə mesaj) bu, YÜZ MİNLƏRLƏ UUID demək idi:
+	//   1. yüz minlərlə sətir + struct → tək sorğuda onlarla MB yaddaş;
+	//   2. `CreateInBatches(reads, 100)` → 100-lük partiyalarla MİNLƏRLƏ
+	//      INSERT gedişi, hər biri hovuzdan bağlantı tutur → digər bütün
+	//      sorğular hovuz gözləməsinə düşür, istək timeout olur;
+	//   3. sonda `message_ids` massivi WS ilə BÜTÜN aktiv üzvlərə yayılırdı →
+	//      çox meqabaytlıq frame → hər alıcının 256-lıq `Send` buferi dolur →
+	//      yavaş istehlakçı sayılıb BAĞLANTIDAN ATILIR (bax Issue 22).
+	// Yəni bir nəfərin köhnə qrupu açması bütün qrupu offline edə bilirdi.
+	//
+	// İndi iki hissəyə bölünür:
+	//   (a) WS yayımı üçün YALNIZ ƏN SON `readBroadcastCap` id çəkilir —
+	//       istemçi onsuz da yalnız ekrandakı baloncuqların tikini yeniləyir;
+	//   (b) işarələmənin ÖZÜ tək `INSERT … SELECT` ifadəsi ilə DB tərəfində
+	//       aparılır — nə yaddaşa yığılır, nə də gediş sayı sətir sayı ilə
+	//       artır (1 gediş, sətir sayından asılı olmayaraq).
+	const readBroadcastCap = 500
+
 	var unreadIDs []string
 	database.DB.Raw(`
 		SELECT m.id FROM messages m
@@ -921,40 +1031,49 @@ func (h *GroupMessageHandler) markGroupMessagesRead(userID, conversationID uint)
 		  AND m.deleted_at IS NULL
 		  AND m.created_at >= COALESCE(cp.joined_at, '1970-01-01'::timestamptz)
 		  AND m.created_at > COALESCE(cp.cleared_at, '1970-01-01'::timestamptz)
-	`, userID, userID, conversationID, userID).Pluck("id", &unreadIDs)
+		ORDER BY m.created_at DESC, m.id DESC
+		LIMIT ?
+	`, userID, userID, conversationID, userID, readBroadcastCap).Pluck("id", &unreadIDs)
 
 	if len(unreadIDs) == 0 {
 		return
 	}
 
 	now := time.Now()
-	var reads []models.MessageRead
-	for _, msgID := range unreadIDs {
-		reads = append(reads, models.MessageRead{
-			MessageID:      msgID,
-			UserID:         userID,
-			ConversationID: conversationID,
-			ReadAt:         now,
-			CreatedAt:      now,
-		})
+
+	// (b) TAM işarələmə — set-based, tək gediş, yaddaşsız.
+	//
+	// Issue 15: hədəf sütunlar YAZILMIR. `ON CONFLICT (a,b)` forması uyğun
+	// UNIQUE indeks YOXDURSA Postgres-də DƏRHAL XƏTA verir ("there is no
+	// unique or exclusion constraint matching...") — yəni kod migration-dan
+	// əvvəl deploy olunsa oxundu-işarələmə tamamilə qırılardı. Hədəfsiz
+	// `ON CONFLICT DO NOTHING` isə indekssiz də işləyir (adi INSERT kimi
+	// davranır), indeks yaradıldıqdan sonra isə dublikatları susdurur.
+	// UNIQUE indeks üçün: MIGRATION_message_reads_unique.md
+	if err := database.DB.Exec(`
+		INSERT INTO message_reads (message_id, user_id, conversation_id, read_at, created_at)
+		SELECT m.id, ?, ?, ?, ?
+		FROM messages m
+		JOIN conversation_participants cp
+		  ON cp.conversation_id = m.conversation_id AND cp.user_id = ?
+		LEFT JOIN message_reads mr ON mr.message_id = m.id AND mr.user_id = ?
+		WHERE m.conversation_id = ?
+		  AND m.sender_id != ?
+		  AND mr.id IS NULL
+		  AND m.deleted_at IS NULL
+		  AND m.created_at >= COALESCE(cp.joined_at, '1970-01-01'::timestamptz)
+		  AND m.created_at > COALESCE(cp.cleared_at, '1970-01-01'::timestamptz)
+		ON CONFLICT DO NOTHING
+	`, userID, conversationID, now, now, userID, userID, conversationID, userID).Error; err != nil {
+		log.Printf("qrup oxundu işarələmə xətası (conv=%d, user=%d): %v", conversationID, userID, err)
+		return
 	}
 
-	// Issue 15: `Clauses()` ARQÜMANSIZ çağırılırdı → "çakışmada skip" yorumu
-	// tətbiq OLUNMURDU. Eyni (message_id, user_id) cütü paralel yollardan
-	// (göndərim anındakı avto-oxundu goroutine-i, çox-cihaz açılış,
-	// MarkGroupConversationRead) təkrar yazıla bilirdi; `read_count` =
-	// COUNT(*) olduğu üçün "N nəfər gördü" gerçək oxuyucu sayını AŞIRDI.
-	// UNIQUE indeks üçün: MIGRATION_message_reads_unique.md
-	// DEPLOY TƏHLÜKƏSİZLİYİ: hədəf sütunlar YAZILMIR. `ON CONFLICT (a,b)`
-	// forması uyğun UNIQUE indeks YOXDURSA Postgres-də DƏRHAL XƏTA verir
-	// ("there is no unique or exclusion constraint matching...") — yəni kod
-	// migration-dan əvvəl deploy olunsa oxundu-işarələmə tamamilə qırılardı.
-	// Hədəfsiz `ON CONFLICT DO NOTHING` isə indekssiz də işləyir (adi INSERT
-	// kimi davranır), indeks yaradıldıqdan sonra isə dublikatları susdurur.
-	database.DB.Clauses(clause.OnConflict{DoNothing: true}).CreateInBatches(reads, 100)
-
-	// participant last_read güncelle
-	lastID := unreadIDs[len(unreadIDs)-1]
+	// participant last_read güncelle.
+	// Issue 57 əlavəsi: əvvəl `unreadIDs[len-1]` götürülürdü, HALBUKİ sorğuda
+	// HEÇ BİR `ORDER BY` yox idi → `last_read_message_id` TƏSADÜFİ bir sətir
+	// olurdu. İndi sıralama açıqdır və ilk element ƏN YENİ mesajdır.
+	lastID := unreadIDs[0]
 	database.DB.Model(&models.ConversationParticipant{}).
 		Where("conversation_id = ? AND user_id = ?", conversationID, userID).
 		Updates(map[string]interface{}{
@@ -967,14 +1086,24 @@ func (h *GroupMessageHandler) markGroupMessagesRead(userID, conversationID uint)
 	// new-group-message payload-u ilə eyni: "group_{id}".
 	h.wsHub.SendDismissThreadPush(userID, fmt.Sprintf("group_%d", conversationID))
 
-	// Gönderenlere WebSocket ile bildir
-	memberIDs := getActiveGroupMemberIDs(conversationID)
-	h.wsHub.SendToMultipleUsers(memberIDs, "group_message_read", map[string]interface{}{
+	// Gönderenlere WebSocket ile bildir.
+	//
+	// Issue 57: `message_ids` artıq TAM siyahı DEYİL — ən son `readBroadcastCap`
+	// mesajla məhdudlaşır (səbəb üçün yuxarıdakı şərhə bax). Ona görə əlavə
+	// olaraq `read_up_to` göndərilir: istemçi bu tarixdən ƏVVƏLKİ bütün öz
+	// mesajlarını da "oxundu" işarələyə bilər. `truncated` bayrağı köhnə
+	// istemçilər üçün additivdir (tanımayan istemçi əvvəlki kimi davranır).
+	truncated := len(unreadIDs) >= readBroadcastCap
+	readPayload := map[string]interface{}{
 		"conversation_id": conversationID,
 		"reader_id":       userID,
 		"message_ids":     unreadIDs,
 		"read_at":         now,
-	})
+		"read_up_to":      now.UTC().Format(time.RFC3339),
+		"truncated":       truncated,
+	}
+	memberIDs := getActiveGroupMemberIDs(conversationID)
+	h.wsHub.SendToMultipleUsers(memberIDs, "group_message_read", readPayload)
 }
 
 // POST /api/v1/groups/:conversation_id/mark-read

@@ -16,6 +16,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // moderationEnqueuer — şübhəli mesaj analizi üçün queue-ya iş qoymaq üçün
@@ -88,9 +89,20 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 		// (mesaj normal çatır, WS yayılır). Opsional — köhnə client-lər
 		// göndərməsə false olur (adi davranış).
 		Silent bool `json:"silent,omitempty"`
+		// Issue 9: istemçi tərəfli idempotentlik açarı (UUID). Bax
+		// handlers/idempotency.go. Opsional — verilməzsə server UUID yaradır.
+		ClientMessageID *string `json:"client_message_id,omitempty"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Issue 9: mesaj ID-si — istemçi verdisə onu işlət (təkrar göndərmə
+	// dublikat yaratmasın), yoxsa server UUID-i.
+	messageID, _, err := resolveMessageID(req.ClientMessageID)
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -214,9 +226,16 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 		}
 	}
 
+	// Issue 56: bütün icazə qapılarından (blok, spam-ban, CanSendMessage,
+	// story yoxlaması) SONRA — mətn hələ ŞİFRƏLƏNMƏYİB, S3 media açarlarını
+	// məhz burada çıxarıb "istifadə olunub" işarələyirik. Şifrələmədən sonra
+	// bu mümkün deyil. Rədd edilən göndərmələrdə işarələməmək vacibdir: əks
+	// halda heç vaxt istifadə olunmayan media əbədi qalardı.
+	services.MarkMediaReferenced(req.Text)
+
 	// Veritabanına kaydet
 	message := models.Message{
-		ID:               uuid.New().String(),
+		ID:               messageID,
 		SenderID:         senderID.(uint),
 		ReceiverID:       &req.ReceiverID,
 		EncryptedText:    encryptedText,
@@ -235,14 +254,87 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 	// Redis I/O (mesaj banı yoxlaması) transaction-dan KƏNARDA — açıq bir
 	// transaction-ı şəbəkə gözləməsi ilə saxlamaq hovuzu kilidləyir.
 	skipConvCreate := conversationHandler.ShouldSkipConversationCreate(senderID.(uint), req.ReceiverID)
+
+	// Issue 9: `duplicate` — istemçi eyni `client_message_id` ilə TƏKRAR
+	// göndərdi. Sətir onsuz da var; sayğac/yayım/push TƏKRARLANMAMALIDIR.
+	var duplicate *models.Message
+	// Issue 10: push qapısı üçün GERÇƏK söhbət statusu. Aşağıda
+	// `HandleNewMessage`-ə əvvəl SABİT `"active"` ötürülürdü — WS yolu isə
+	// həqiqi statusu ötürür. Bu uyğunsuzluq eyni mesajın nəqliyyatdan asılı
+	// olaraq push doğurub-doğurmamasına səbəb olurdu.
+	conversationStatus := ""
 	if err := database.DB.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Create(&message).Error; err != nil {
-			return err
+		res := tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "id"}},
+			DoNothing: true,
+		}).Create(&message)
+		if res.Error != nil {
+			return res.Error
 		}
-		return conversationHandler.UpdateConversationOnMessageTx(tx, senderID.(uint), req.ReceiverID, skipConvCreate)
+		if res.RowsAffected == 0 {
+			// Yumşaq silinmiş sətir də tapılmalıdır — əks halda silinmiş
+			// mesajın ID-si ilə INSERT sonsuz "tapılmadı" döngüsünə düşərdi.
+			var existing models.Message
+			if err := tx.Unscoped().Where("id = ?", message.ID).First(&existing).Error; err != nil {
+				return err
+			}
+			duplicate = &existing
+			return nil
+		}
+		status, uErr := conversationHandler.UpdateConversationOnMessageTx(tx, senderID.(uint), req.ReceiverID, skipConvCreate)
+		if uErr != nil {
+			return uErr
+		}
+		conversationStatus = status
+		return nil
 	}); err != nil {
 		log.Printf("Mesaj/conversation transaction xətası: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Mesaj kaydedilemedi"})
+		return
+	}
+
+	if duplicate != nil {
+		// ── Təkrar cəhdin ƏSL təkrar olduğunu TAM YOXLA ────────────────────
+		// Yalnız `sender_id`-ni yoxlamaq KİFAYƏT DEYİL: eyni istifadəçi eyni
+		// `client_message_id`-ni FƏRQLİ bir söhbətdə (qrupda, ya da BAŞQA
+		// alıcıya DM-də) işlətsə — istemçi səhvi, offline növbədə id təkrar
+		// istifadəsi və s. — server 200 `duplicate:true` qaytarardı və YENİ
+		// mesaj HEÇ VAXT yaradılmazdı. Yəni istifadəçi "göndərildi" görür,
+		// mesaj isə heç yerə çatmır (SƏSSİZ İTKİ). Ona görə alıcı VƏ söhbət
+		// növü də uyğun gəlməlidir; gəlmirsə 409.
+		sameSender := duplicate.SenderID == senderID.(uint)
+		sameReceiver := duplicate.ReceiverID != nil && *duplicate.ReceiverID == req.ReceiverID
+		isDM := duplicate.ConversationID == nil
+		if !sameSender || !sameReceiver || !isDM {
+			c.JSON(http.StatusConflict, gin.H{
+				"error": "client_message_id artıq başqa mesaj üçün istifadə olunub",
+				"code":  "CLIENT_MESSAGE_ID_TAKEN",
+			})
+			return
+		}
+
+		// Eyni göndərənin eyni alıcıya təkrar cəhdi → EYNİ nəticə, yan effekt YOX.
+		// Mətn DB-dəki SAXLANMIŞ nüsxədən qaytarılır (istemçinin bu dəfə
+		// göndərdiyi mətndən DEYİL) — əks halda cavab serverdə olmayan bir
+		// məzmunu təsdiqləmiş olardı.
+		dupText, decErr := h.encryptionService.DecryptMessage(duplicate.EncryptedText)
+		if decErr != nil {
+			dupText = req.Text
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"message":   "Mesaj başarıyla gönderildi",
+			"duplicate": true,
+			"data": gin.H{
+				"id":                  duplicate.ID,
+				"sender_id":           duplicate.SenderID,
+				"receiver_id":         duplicate.ReceiverID,
+				"reply_to_message_id": duplicate.ReplyToMessageID,
+				"text":                dupText,
+				"read":                duplicate.Read,
+				"created_at":          duplicate.CreatedAt,
+				"is_online":           h.wsHub.IsUserOnline(req.ReceiverID),
+			},
+		})
 		return
 	}
 
@@ -256,8 +348,8 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 		message.CreatedAt,
 		req.ReplyToMessageID, // YENİ parametre
 		req.StoryID,
-		"active",
-		req.Silent, // səssiz göndərmə → push getməsin
+		conversationStatus, // Issue 10: sabit "active" DEYİL, gerçək status
+		req.Silent,         // səssiz göndərmə → push getməsin
 	)
 
 	// 🔍 MODERASIYA — mesaj şifrələnib göndərildi, indi arxa planda analizə
@@ -353,6 +445,8 @@ func (h *MessageHandler) BroadcastMessage(c *gin.Context) {
 		if encErr != nil {
 			continue
 		}
+		// Issue 56: media istinadını işarələ (şifrələmədən əvvəlki mətndən).
+		services.MarkMediaReferenced(req.Text)
 
 		rid := receiverID
 		message := models.Message{
@@ -368,8 +462,17 @@ func (h *MessageHandler) BroadcastMessage(c *gin.Context) {
 			continue
 		}
 
-		if err := conversationHandler.UpdateConversationOnMessage(senderID, receiverID); err != nil {
-			log.Printf("Broadcast conversation güncellemesi başarısız (rcv=%d): %v", receiverID, err)
+		// Issue 10: push qapısı GERÇƏK statusdan qidalansın (sabit "active"
+		// deyil) — REST/WS arasında bildiriş davranışı fərqlənməsin.
+		convStatus, cuErr := conversationHandler.UpdateConversationOnMessageTx(
+			database.DB, senderID, receiverID,
+			conversationHandler.ShouldSkipConversationCreate(senderID, receiverID),
+		)
+		if cuErr != nil {
+			// Statusu oxuya bilmədik — köhnə davranışa (push GET) qayıt ki,
+			// keçici bir DB xətası bildirişi səssizcə udmasın.
+			log.Printf("Broadcast conversation güncellemesi başarısız (rcv=%d): %v", receiverID, cuErr)
+			convStatus = "active"
 		}
 
 		h.wsHub.HandleNewMessage(
@@ -381,7 +484,7 @@ func (h *MessageHandler) BroadcastMessage(c *gin.Context) {
 			message.CreatedAt,
 			nil,
 			nil,
-			"active",
+			convStatus,
 			req.Silent,
 		)
 

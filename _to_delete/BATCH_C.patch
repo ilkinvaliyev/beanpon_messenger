@@ -1,0 +1,1066 @@
+--- a/cache/keys.go	2026-05-28 06:48:36.000000000 +0000
++++ b/cache/keys.go	2026-07-26 14:31:24.348554060 +0000
+@@ -45,3 +45,37 @@
+ func SharedSpamBan(userID uint) string {
+ 	return fmt.Sprintf("spam_ban:%d", userID)
+ }
++
++// ─── Lokal (messenger daxili) key suffix-ləri ───────────────────
++
++const (
++	// TTLWSPresence — Issue 4: paylaşılan WebSocket presence qeydinin ömrü.
++	// Heartbeat bunun YARISINDAN tez-tez yeniləyir, ona görə sağlam instansda
++	// qeyd heç vaxt bitmir. İnstans qəflətən ölsə (SIGKILL, OOM, node itkisi)
++	// qeyd bu müddətdən sonra öz-özünə yox olur — "zombi onlayn" qalmır.
++	TTLWSPresence = 90 * time.Second
++
++	// WSPresenceRefresh — heartbeat dövrü (TTL-in ~1/3-ü).
++	WSPresenceRefresh = 30 * time.Second
++)
++
++// WSFanout — Issue 4: instance-lar arası canlı yayım kanalı.
++//
++//	bp:msg:ws:fanout
++func WSFanout() string {
++	return "ws:fanout"
++}
++
++// WSPresence — istifadəçinin hansı instansda olduğu + açıq çat konteksti.
++//
++// Dəyər formatı (JSON):
++//
++//	{"i":"<instance-id>","dm":123,"grp":456,"at":1234567890}
++//
++//	dm  — hazırda açıq DM-in qarşı tərəf user id-si (0 = yoxdur)
++//	grp — hazırda açıq qrupun conversation id-si (0 = yoxdur)
++//
++//	bp:msg:ws:presence:{userId}
++func WSPresence(userID uint) string {
++	return fmt.Sprintf("ws:presence:%d", userID)
++}
+--- /dev/null	2026-07-26 13:30:38.463095057 +0000
++++ b/cache/pubsub.go	2026-07-26 14:31:06.968029954 +0000
+@@ -0,0 +1,160 @@
++package cache
++
++import (
++	"context"
++	"log"
++	"time"
++
++	"github.com/go-redis/redis/v8"
++)
++
++// ── Issue 4 — instance-lar arası pub/sub ────────────────────────────────────
++//
++// PROBLEM
++// `Hub.clients` YALNIZ bu prosesin yaddaşındakı map-dir. `SendToUser` sırf
++// həmin map-ə baxır. Tək replica ilə bu işləyir; İKİNCİ replica qalxdığı an:
++//   • A instansındakı göndərən → B instansındakı alıcı: canlı mesaj HEÇ VAXT
++//     çatmır (yalnız DB-dədir, alıcı ancaq yenidən açanda görür);
++//   • `IsUserOnline` yalan danışır → "offline" sayılıb push göndərilir,
++//     halbuki istifadəçi onlayn və çatda ola bilər (və ya əksi);
++//   • yazır…/oxundu/reaksiya/qrup event-lərinin hamısı eyni şəkildə itir.
++// Yəni horizontal scale ETMƏK MÜMKÜN DEYİL — sistem gizli şəkildə tək
++// replica-ya pinlənib.
++//
++// HƏLL — Redis pub/sub üzərindən yayım + paylaşılan presence.
++// Bu fayl nazik nəqliyyat qatıdır; məntiq `websocket/cluster.go`-dadır.
++
++// Publish — kanal üzərinə mesaj yayımlayır. Redis söndürülübsə no-op.
++func (c *Client) Publish(ctx context.Context, channel string, payload string) error {
++	if !c.guard() {
++		return nil
++	}
++	pubCtx, cancel := context.WithTimeout(ctx, c.writeTimeout)
++	defer cancel()
++	err := c.rdb.Publish(pubCtx, channel, payload).Err()
++	c.observe("PUBLISH", err)
++	return err
++}
++
++// SubscribeLoop — `channel`-ə abunə olur və hər mesajı `handle`-ə verir.
++// Bağlantı qopduqda avtomatik yenidən abunə olur (eksponensial gözləmə ilə).
++// `ctx` bağlananda təmiz çıxır. Bloklayandır — `go` ilə çağırılmalıdır.
++//
++// DİQQƏT: burada circuit breaker İSTİFADƏ OLUNMUR. Breaker qısa sorğular
++// üçündür; uzun-ömürlü abunəni onunla kəsmək yayımı səssizcə söndürərdi.
++func (c *Client) SubscribeLoop(ctx context.Context, channel string, handle func(payload string)) {
++	if !c.Enabled() || c.rdb == nil {
++		log.Printf("cache: Redis söndürülüb — %q kanalına abunə olunmadı", channel)
++		return
++	}
++
++	backoff := time.Second
++	const maxBackoff = 30 * time.Second
++
++	for {
++		if ctx.Err() != nil {
++			return
++		}
++
++		pubsub := c.rdb.Subscribe(ctx, channel)
++
++		// İlk təsdiq — abunənin həqiqətən qurulduğunu yoxla.
++		if _, err := pubsub.Receive(ctx); err != nil {
++			_ = pubsub.Close()
++			if ctx.Err() != nil {
++				return
++			}
++			log.Printf("cache: %q abunəsi qurulmadı: %v — %s sonra təkrar", channel, err, backoff)
++			select {
++			case <-ctx.Done():
++				return
++			case <-time.After(backoff):
++			}
++			if backoff < maxBackoff {
++				backoff *= 2
++			}
++			continue
++		}
++
++		log.Printf("cache: %q kanalına abunə olundu", channel)
++		backoff = time.Second // uğurlu bağlantı — gözləməni sıfırla
++
++		ch := pubsub.Channel()
++	receive:
++		for {
++			select {
++			case <-ctx.Done():
++				_ = pubsub.Close()
++				return
++			case msg, ok := <-ch:
++				if !ok {
++					break receive // kanal bağlandı → yenidən abunə
++				}
++				// Panic bir mesaj ucbatından bütün abunəni öldürməsin.
++				func() {
++					defer func() {
++						if r := recover(); r != nil {
++							log.Printf("cache: %q mesaj emalında panic: %v", channel, r)
++						}
++					}()
++					handle(msg.Payload)
++				}()
++			}
++		}
++
++		_ = pubsub.Close()
++		if ctx.Err() != nil {
++			return
++		}
++		log.Printf("cache: %q abunəsi qopdu — yenidən qoşulur", channel)
++		select {
++		case <-ctx.Done():
++			return
++		case <-time.After(backoff):
++		}
++		if backoff < maxBackoff {
++			backoff *= 2
++		}
++	}
++}
++
++// MGet — bir neçə açarı TƏK gedişdə oxuyur. Tapılmayanlar üçün nəticə map-ində
++// açar OLMUR. Böyük siyahılarda (məs. 5000 üzvlü qrupun presence yoxlaması)
++// açar-başına GET fəlakət olardı.
++func (c *Client) MGet(ctx context.Context, fullKeys ...string) map[string]string {
++	out := make(map[string]string, len(fullKeys))
++	if !c.guard() || len(fullKeys) == 0 {
++		return out
++	}
++
++	getCtx, cancel := context.WithTimeout(ctx, c.readTimeout)
++	defer cancel()
++
++	// Redis MGET-in arqument sayında praktik limiti var — partiyalara böl.
++	const chunk = 512
++	for start := 0; start < len(fullKeys); start += chunk {
++		end := start + chunk
++		if end > len(fullKeys) {
++			end = len(fullKeys)
++		}
++		batch := fullKeys[start:end]
++
++		vals, err := c.readRdb.MGet(getCtx, batch...).Result()
++		c.observe("MGET", err)
++		if err != nil {
++			if err == redis.Nil {
++				continue
++			}
++			return out // qismən nəticə — çağıran fail-open davranır
++		}
++		for i, v := range vals {
++			if v == nil {
++				continue
++			}
++			if s, ok := v.(string); ok {
++				out[batch[i]] = s
++			}
++		}
++	}
++	return out
++}
+--- /dev/null	2026-07-26 13:30:38.463095057 +0000
++++ b/websocket/cluster.go	2026-07-26 14:37:12.633140442 +0000
+@@ -0,0 +1,468 @@
++package websocket
++
++import (
++	"context"
++	"encoding/json"
++	"log"
++	"os"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	"github.com/google/uuid"
++
++	"beanpon_messenger/cache"
++	"beanpon_messenger/models"
++)
++
++// ── Issue 4 — instance-lar arası canlı çatdırma və paylaşılan presence ──────
++//
++// PROBLEM (audit-in P0 maddəsi)
++// `Hub.clients` yalnız BU prosesin yaddaşındakı map-dir və `SendToUser` sırf
++// ona baxır. `cache/redis.go`-da `Publish|Subscribe` ÜMUMİYYƏTLƏ yox idi.
++// Tək replica ilə hər şey işləyir — İKİNCİ replica qalxdığı an:
++//
++//   • A instansındakı göndərən → B instansındakı alıcı: canlı mesaj HEÇ VAXT
++//     çatmır. Mesaj DB-dədir, amma alıcı onu ancaq çatı YENİDƏN AÇANDA görür.
++//     İstifadəçi üçün bu "mesajlar gəlmir" deməkdir — audit-dəki #1 şikayət.
++//   • `IsUserOnline` YALAN danışır: B-dəki onlayn istifadəçi A-da "offline"
++//     görünür → ona push göndərilir (çatda oturduğu halda), və ya əksinə
++//     onlayn sayılıb push GÖNDƏRİLMİR.
++//   • `IsUserInChatWith` / `IsUserInGroupChat` eyni şəkildə yalan danışır →
++//     avto-oxundu və push susdurma qərarları səhv verilir.
++//   • yazır…, oxundu, reaksiya, qrup üzvlük event-ləri — hamısı itir.
++//
++// Yəni sistem GİZLİ ŞƏKİLDƏ tək replica-ya pinlənmişdi: ikinci replica
++// əlavə etmək xəta vermir, sadəcə mesajlaşmanı yarıdan bölür.
++//
++// HƏLL — iki hissə
++//
++//  1. YAYIM (fan-out). Hər instans `bp:msg:ws:fanout` kanalına abunə olur.
++//     `SendToUser` / `SendToMultipleUsers` mesajı ƏVVƏLCƏ öz lokal
++//     client-lərinə verir, SONRA kanala yayımlayır. Digər instanslar
++//     mesajı alır və YALNIZ özündə olan alıcılara ötürür. Öz yayımını
++//     `origin` sahəsindən tanıyıb ATIR (ikiqat çatdırma yoxdur).
++//
++//     Niyə tək ortaq kanal (per-user kanal deyil)? Per-user abunə hər
++//     bağlantı/kopma zamanı SUBSCRIBE/UNSUBSCRIBE tələb edir — daha az
++//     şəbəkə trafiki, amma daha çox hərəkət hissəsi və abunə sızması riski.
++//     Ortaq kanalın xərci: hər mesaj (replica sayı − 1) dəfə əlavə ötürülür.
++//     2–4 replica üçün bu tamamilə əhəmiyyətsizdir. Replica sayı çox artsa
++//     per-user kanala keçid asandır — interfeys dəyişmir.
++//
++//  2. PAYLAŞILAN PRESENCE. Hər bağlı istifadəçi üçün `ws:presence:{id}`
++//     açarı yazılır: hansı instansda olduğu + hazırda açıq DM/qrup.
++//     TTL 90 s, heartbeat 30 s-də bir yeniləyir. İnstans qəfil ölsə qeyd
++//     öz-özünə yox olur (zombi "onlayn" qalmır).
++//     `IsUserOnline` / `IsUserInChatWith` / `IsUserInGroupChat` əvvəlcə
++//     LOKAL map-ə baxır (sürətli yol, dəyişməyib), tapmasa Redis-ə düşür.
++//
++// FAIL-OPEN
++// Redis söndürülübsə (`REDIS_ENABLED=false`) və ya əlçatmazsa BÜTÜN bu qat
++// no-op olur və davranış BAYT-BAYT köhnə (tək instans) davranışa qayıdır.
++// `WS_CLUSTER_ENABLED=false` ilə də açıq şəkildə söndürülə bilər.
++
++// instanceID — bu prosesin unikal kimliyi. Öz yayımını tanımaq üçün.
++var instanceID = func() string {
++	if v := strings.TrimSpace(os.Getenv("INSTANCE_ID")); v != "" {
++		return v
++	}
++	host, _ := os.Hostname()
++	if host == "" {
++		host = "ws"
++	}
++	return host + "-" + uuid.NewString()[:8]
++}()
++
++// clusterEnabled — `WS_CLUSTER_ENABLED` (default: Redis aktivdirsə açıq).
++var clusterEnabled = func() bool {
++	switch strings.ToLower(strings.TrimSpace(os.Getenv("WS_CLUSTER_ENABLED"))) {
++	case "false", "0", "no":
++		return false
++	}
++	return true
++}()
++
++// clusterReady — abunə həqiqətən qurulub? Yalnız o zaman yayım etmək
++// mənalıdır (əks halda hər mesajda mənasız Redis gedişi olardı).
++var clusterReady atomic.Bool
++
++// clusterActive — yayım/presence qatı işləkdirmi?
++func clusterActive() bool {
++	if !clusterEnabled {
++		return false
++	}
++	c := cache.GetClient()
++	return c != nil && c.Enabled()
++}
++
++// clusterFrame — fanout kanalında gedən zərf.
++type clusterFrame struct {
++	Origin  string          `json:"o"`
++	UserIDs []uint          `json:"u"`
++	Type    string          `json:"t"`
++	Data    json.RawMessage `json:"d"`
++}
++
++// presenceRecord — `ws:presence:{id}` dəyəri.
++type presenceRecord struct {
++	Instance string `json:"i"`
++	DM       uint   `json:"dm,omitempty"`
++	Group    uint   `json:"grp,omitempty"`
++	At       int64  `json:"at"`
++}
++
++// ── Yayım tərəfi ────────────────────────────────────────────────────────────
++
++// ── Yayım növbəsi ───────────────────────────────────────────────────────────
++//
++// Yayım BLOKLAMAMALIDIR: Redis yavaşlasa mesaj göndərmə yolu dayanmamalıdır.
++// Amma hər mesaj üçün AYRI `go func` yaratmaq da yanlışdır — mesaj seli
++// altında minlərlə goroutine Redis-in `writeTimeout`-unu gözləyərək yığılır
++// (özü-özünə gücləndirən yaddaş/planlayıcı təzyiqi). Ona görə: sərhədli
++// növbə + sabit sayda yazıcı. Növbə dolarsa frame ATILIR və sayılır —
++// canlı yayım "best-effort"-dur, mesajın özü onsuz da DB-dədir və push var.
++const (
++	clusterPublishQueueSize = 4096
++	clusterPublishWorkers   = 4
++)
++
++var (
++	clusterPublishCh   = make(chan string, clusterPublishQueueSize)
++	clusterPublishOnce sync.Once
++	clusterDropped     atomic.Int64
++)
++
++func startClusterPublishers() {
++	clusterPublishOnce.Do(func() {
++		for i := 0; i < clusterPublishWorkers; i++ {
++			go func() {
++				for payload := range clusterPublishCh {
++					c := cache.GetClient()
++					if c == nil {
++						continue
++					}
++					ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++					_ = c.Publish(ctx, c.LocalKey(cache.WSFanout()), payload)
++					cancel()
++				}
++			}()
++		}
++		// Atılan frame-ləri görünən et.
++		go func() {
++			ticker := time.NewTicker(5 * time.Minute)
++			defer ticker.Stop()
++			var last int64
++			for range ticker.C {
++				if d := clusterDropped.Load(); d > last {
++					log.Printf("ws-cluster: yayım növbəsi dolu — %d frame atıldı (cəmi %d)", d-last, d)
++					last = d
++				}
++			}
++		}()
++	})
++}
++
++// publishCluster — mesajı digər instanslara ötürür. Lokal çatdırma ÇAĞIRAN
++// tərəfdə artıq edilib.
++func (h *Hub) publishCluster(userIDs []uint, messageType string, data interface{}) {
++	if !clusterReady.Load() || !clusterActive() || len(userIDs) == 0 {
++		return
++	}
++
++	raw, err := json.Marshal(data)
++	if err != nil {
++		return
++	}
++	frame := clusterFrame{
++		Origin:  instanceID,
++		UserIDs: userIDs,
++		Type:    messageType,
++		Data:    raw,
++	}
++	payload, err := json.Marshal(frame)
++	if err != nil {
++		return
++	}
++
++	select {
++	case clusterPublishCh <- string(payload):
++	default:
++		clusterDropped.Add(1)
++	}
++}
++
++// StartClusterSubscriber — fanout kanalını dinləyir. `go` ilə çağırılır.
++func (h *Hub) StartClusterSubscriber(ctx context.Context) {
++	if !clusterActive() {
++		log.Printf("ws-cluster: söndürülüb (Redis yoxdur və ya WS_CLUSTER_ENABLED=false) — tək instans rejimi")
++		return
++	}
++	c := cache.GetClient()
++	startClusterPublishers()
++	clusterReady.Store(true)
++	defer clusterReady.Store(false)
++
++	log.Printf("ws-cluster: instans kimliyi %s", instanceID)
++	c.SubscribeLoop(ctx, c.LocalKey(cache.WSFanout()), func(payload string) {
++		var frame clusterFrame
++		if err := json.Unmarshal([]byte(payload), &frame); err != nil {
++			return
++		}
++		// Öz yayımımız — lokal çatdırma artıq olub.
++		if frame.Origin == instanceID {
++			return
++		}
++		h.deliverLocalRaw(frame.UserIDs, frame.Type, frame.Data)
++	})
++}
++
++// deliverLocalRaw — uzaq instansdan gələn frame-i YALNIZ lokal client-lərə
++// ötürür. Yenidən yayım ETMİR (yoxsa sonsuz döngə olardı).
++func (h *Hub) deliverLocalRaw(userIDs []uint, messageType string, data json.RawMessage) {
++	if len(userIDs) == 0 {
++		return
++	}
++	// Wire formatı `messageToBytes` ilə eyni olmalıdır: {"type":..,"data":..}
++	payload, err := json.Marshal(struct {
++		Type string          `json:"type"`
++		Data json.RawMessage `json:"data"`
++	}{Type: messageType, Data: data})
++	if err != nil {
++		return
++	}
++
++	seen := make(map[uint]struct{}, len(userIDs))
++	targets := make([]*Client, 0, len(userIDs))
++	h.mutex.RLock()
++	for _, userID := range userIDs {
++		if _, dup := seen[userID]; dup {
++			continue
++		}
++		seen[userID] = struct{}{}
++		if client, ok := h.clients[userID]; ok {
++			targets = append(targets, client)
++		}
++	}
++	h.mutex.RUnlock()
++
++	delivered := false
++	for _, client := range targets {
++		select {
++		case client.Send <- payload:
++			delivered = true
++		default:
++			client.enqueueEvict(h)
++		}
++	}
++
++	// İki tick (delivered=true) yan effekti lokal `deliver` yolunda var;
++	// uzaqdan gələn `new_message` üçün onu BURADA təkrarlayırıq. Əks halda
++	// göndərən A instansında, alıcı B-də olduqda mesaj çatsa da ikinci tick
++	// yalnız istemçinin `mark_delivered` ack-i ilə (gec) gəlirdi.
++	if delivered && messageType == "new_message" {
++		h.markRemoteDelivered(data)
++	}
++}
++
++// markRemoteDelivered — uzaq instansdan gələn `new_message` frame-inin
++// JSON gövdəsindən id/sender/receiver çıxarıb `delivered=true` yazır.
++//
++// Ayrıca funksiyadır, çünki `maybeMarkLivePushDelivered` Go tərəfdə qurulmuş
++// `map[string]interface{}`-i gözləyir (dəyərlər `uint`); JSON turundan sonra
++// eyni sahələr `float64` olur və tip iddiaları səssizcə uğursuz olardı.
++func (h *Hub) markRemoteDelivered(data json.RawMessage) {
++	var payload struct {
++		ID         string `json:"id"`
++		SenderID   uint   `json:"sender_id"`
++		ReceiverID uint   `json:"receiver_id"`
++		IsHistory  bool   `json:"is_history"`
++	}
++	if err := json.Unmarshal(data, &payload); err != nil {
++		return
++	}
++	if payload.ID == "" || payload.SenderID == 0 || payload.ReceiverID == 0 || payload.IsHistory {
++		return
++	}
++	// Yalnız ALICININ nüsxəsi delivered sayılır — göndərənin echo-su yox.
++	// Bu instansda alıcı client-i varmı?
++	h.mutex.RLock()
++	_, hasReceiver := h.clients[payload.ReceiverID]
++	h.mutex.RUnlock()
++	if !hasReceiver {
++		return
++	}
++
++	go func() {
++		res := h.db.Model(&models.Message{}).
++			Where("id = ? AND delivered = false", payload.ID).
++			Update("delivered", true)
++		if res.Error != nil || res.RowsAffected == 0 {
++			return
++		}
++		h.SendToUser(payload.SenderID, "message_delivered", map[string]interface{}{
++			"other_user_id": payload.ReceiverID,
++			"message_ids":   []string{payload.ID},
++		})
++	}()
++}
++
++// ── Paylaşılan presence ─────────────────────────────────────────────────────
++
++// writePresence — istifadəçinin presence qeydini yazır/yeniləyir.
++func (h *Hub) writePresence(userID uint, dm, group uint) {
++	if !clusterActive() {
++		return
++	}
++	c := cache.GetClient()
++	rec := presenceRecord{Instance: instanceID, DM: dm, Group: group, At: time.Now().Unix()}
++	raw, err := json.Marshal(rec)
++	if err != nil {
++		return
++	}
++	go func() {
++		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++		defer cancel()
++		_ = c.Set(ctx, c.LocalKey(cache.WSPresence(userID)), string(raw), cache.TTLWSPresence)
++	}()
++}
++
++// clearPresence — bağlantı bağlananda qeydi silir.
++//
++// DİQQƏT: yalnız qeyd BİZƏ aiddirsə silinir. Reconnect zamanı istifadəçi
++// artıq BAŞQA instansa keçmiş ola bilər; köhnə instansın gec gələn
++// `unregister`-i onu offline göstərməməlidir.
++func (h *Hub) clearPresence(userID uint) {
++	if !clusterActive() {
++		return
++	}
++	c := cache.GetClient()
++	go func() {
++		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++		defer cancel()
++		key := c.LocalKey(cache.WSPresence(userID))
++		raw, found, err := c.Get(ctx, key)
++		if err != nil || !found {
++			return
++		}
++		var rec presenceRecord
++		if json.Unmarshal([]byte(raw), &rec) != nil {
++			return
++		}
++		if rec.Instance != instanceID {
++			return // istifadəçi başqa instansdadır — toxunma
++		}
++		_ = c.Del(ctx, key)
++	}()
++}
++
++// StartPresenceHeartbeat — lokal client-lərin presence qeydlərini TTL bitmədən
++// yeniləyir. `go` ilə çağırılır.
++func (h *Hub) StartPresenceHeartbeat(ctx context.Context) {
++	if !clusterActive() {
++		return
++	}
++	ticker := time.NewTicker(cache.WSPresenceRefresh)
++	defer ticker.Stop()
++
++	for {
++		select {
++		case <-ctx.Done():
++			return
++		case <-ticker.C:
++			h.refreshAllPresence()
++		}
++	}
++}
++
++func (h *Hub) refreshAllPresence() {
++	c := cache.GetClient()
++	if c == nil || !c.Enabled() {
++		return
++	}
++
++	type snap struct {
++		userID uint
++		dm     uint
++		group  uint
++	}
++	h.mutex.RLock()
++	snaps := make([]snap, 0, len(h.clients))
++	for userID, client := range h.clients {
++		s := snap{userID: userID}
++		if client.ActiveChatWith != nil {
++			s.dm = *client.ActiveChatWith
++		}
++		if client.ActiveGroupChat != nil {
++			s.group = *client.ActiveGroupChat
++		}
++		snaps = append(snaps, s)
++	}
++	h.mutex.RUnlock()
++
++	if len(snaps) == 0 {
++		return
++	}
++
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++	now := time.Now().Unix()
++	for _, s := range snaps {
++		raw, err := json.Marshal(presenceRecord{
++			Instance: instanceID, DM: s.dm, Group: s.group, At: now,
++		})
++		if err != nil {
++			continue
++		}
++		_ = c.Set(ctx, c.LocalKey(cache.WSPresence(s.userID)), string(raw), cache.TTLWSPresence)
++	}
++}
++
++// remotePresence — TƏK istifadəçi üçün uzaq presence qeydi (lokal deyilsə).
++func remotePresence(userID uint) (presenceRecord, bool) {
++	if !clusterActive() {
++		return presenceRecord{}, false
++	}
++	c := cache.GetClient()
++	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
++	defer cancel()
++	raw, found, err := c.Get(ctx, c.LocalKey(cache.WSPresence(userID)))
++	if err != nil || !found {
++		return presenceRecord{}, false
++	}
++	var rec presenceRecord
++	if json.Unmarshal([]byte(raw), &rec) != nil {
++		return presenceRecord{}, false
++	}
++	return rec, true
++}
++
++// remotePresenceMany — ÇOX istifadəçi üçün tək MGET gedişi.
++// 5000 üzvlü qrupda açar-başına GET fəlakət olardı.
++func remotePresenceMany(userIDs []uint) map[uint]presenceRecord {
++	out := make(map[uint]presenceRecord)
++	if !clusterActive() || len(userIDs) == 0 {
++		return out
++	}
++	c := cache.GetClient()
++
++	keys := make([]string, 0, len(userIDs))
++	byKey := make(map[string]uint, len(userIDs))
++	for _, uid := range userIDs {
++		k := c.LocalKey(cache.WSPresence(uid))
++		keys = append(keys, k)
++		byKey[k] = uid
++	}
++
++	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++	defer cancel()
++	for k, v := range c.MGet(ctx, keys...) {
++		var rec presenceRecord
++		if json.Unmarshal([]byte(v), &rec) != nil {
++			continue
++		}
++		out[byKey[k]] = rec
++	}
++	return out
++}
+--- a/websocket/hub.go	2026-07-26 14:38:55.629557691 +0000
++++ b/websocket/hub.go	2026-07-26 14:34:01.327646930 +0000
+@@ -227,6 +227,10 @@
+ 	//online oldugunu yazir
+ 	h.setUserOnline(client.UserID)
+ 
++	// Issue 4: paylaşılan presence — digər instanslar da bu istifadəçinin
++	// onlayn olduğunu görsün (`IsUserOnline` yalan danışmasın).
++	h.writePresence(client.UserID, 0, 0)
++
+ 	// XMPP: this user is on a legacy WS client → mark them OLD in the registry
+ 	// so the egress seam routes their incoming messages over legacy WS. No-op
+ 	// when XMPP is disabled.
+@@ -260,6 +264,9 @@
+ 
+ 		h.setUserOffline(client.UserID)
+ 
++		// Issue 4: paylaşılan presence qeydini götür (yalnız BİZƏ aiddirsə).
++		h.clearPresence(client.UserID)
++
+ 		client.closeSend()
+ 
+ 		_ = client.Conn.Close()
+@@ -345,6 +352,16 @@
+ 	}
+ }
+ 
++// deliverWithCluster — lokal çatdırma + Issue 4 üçün digər instanslara yayım.
++// Alıcı bu instansda TAPILSA DA yayım edilir: istifadəçi reconnect anında
++// başqa instansa keçmiş ola bilər və uzaq instansda ona çatmalıdır. Uzaq
++// tərəf onu tapmazsa frame sadəcə atılır (ucuz), tapsa istemçi id-yə görə
++// dublikatı özü süzür.
++func (h *Hub) deliverWithCluster(message *Message) {
++	h.deliver(message)
++	h.publishCluster([]uint{message.ReceiverID}, message.Type, message.Data)
++}
++
+ // maybeMarkLivePushDelivered — canlı `new_message` push-u bağlı alıcının Send
+ // kanalına uğurla yazıldıqda mesajı delivered=true işarələyir və göndərənə
+ // `message_delivered` event-i göndərir. Client ack-i (`mark_delivered` frame-i,
+@@ -412,7 +429,7 @@
+ 
+ // SendToUser belirli kullanıcıya mesaj gönder
+ func (h *Hub) SendToUser(userID uint, messageType string, data interface{}) {
+-	h.deliver(&Message{
++	h.deliverWithCluster(&Message{
+ 		Type:       messageType,
+ 		ReceiverID: userID,
+ 		Data:       data,
+@@ -433,14 +450,18 @@
+ 	// `new_message` (DM) çatdırma-işarələmə yan effekti daşıyır — onu
+ 	// `deliver` yolunda saxlayırıq ki, davranış dəyişməsin.
+ 	if messageType == "new_message" {
++		unique := make([]uint, 0, len(userIDs))
+ 		seen := make(map[uint]struct{}, len(userIDs))
+ 		for _, userID := range userIDs {
+ 			if _, dup := seen[userID]; dup {
+ 				continue
+ 			}
+ 			seen[userID] = struct{}{}
+-			h.SendToUser(userID, messageType, data)
++			unique = append(unique, userID)
++			h.deliver(&Message{Type: messageType, ReceiverID: userID, Data: data})
+ 		}
++		// Issue 4: bütün alıcılar üçün TƏK yayım (alıcı başına ayrıca deyil).
++		h.publishCluster(unique, messageType, data)
+ 		return
+ 	}
+ 
+@@ -472,6 +493,13 @@
+ 			client.enqueueEvict(h)
+ 		}
+ 	}
++
++	// Issue 4: lokal olmayan alıcılar üçün digər instanslara TƏK yayım.
++	unique := make([]uint, 0, len(seen))
++	for userID := range seen {
++		unique = append(unique, userID)
++	}
++	h.publishCluster(unique, messageType, data)
+ }
+ 
+ // FilterUsersInGroupChat — Issue 23: verilmiş id siyahısından hazırda BU qrup
+@@ -482,11 +510,26 @@
+ 		return nil
+ 	}
+ 	out := make([]uint, 0, len(userIDs))
++	missing := make([]uint, 0, len(userIDs))
++
+ 	h.mutex.RLock()
+-	defer h.mutex.RUnlock()
+ 	for _, userID := range userIDs {
+-		if client, ok := h.clients[userID]; ok {
+-			if client.ActiveGroupChat != nil && *client.ActiveGroupChat == conversationID {
++		client, ok := h.clients[userID]
++		if !ok {
++			missing = append(missing, userID)
++			continue
++		}
++		if client.ActiveGroupChat != nil && *client.ActiveGroupChat == conversationID {
++			out = append(out, userID)
++		}
++	}
++	h.mutex.RUnlock()
++
++	// Issue 4: lokal olmayan üzvlər üçün paylaşılan presence — TƏK MGET
++	// gedişi (üzv başına GET 5000-lik qrupda fəlakət olardı).
++	if len(missing) > 0 && conversationID != 0 {
++		for userID, rec := range remotePresenceMany(missing) {
++			if rec.Group == conversationID {
+ 				out = append(out, userID)
+ 			}
+ 		}
+@@ -681,12 +724,21 @@
+ 	log.Printf("Mesaj okundu WebSocket üzerinden yayınlandı: %s", messageID)
+ }
+ 
+-// IsUserOnline kullanıcının online olup olmadığını kontrol et
++// IsUserOnline kullanıcının online olup olmadığını kontrol et.
++//
++// Issue 4: əvvəl YALNIZ bu prosesin map-inə baxırdı. İki replica ilə
++// B instansındakı onlayn istifadəçi A-da "offline" görünürdü → çatda
++// oturduğu halda ona push gedirdi. İndi lokal map (sürətli yol) tapmasa
++// paylaşılan presence yoxlanılır.
+ func (h *Hub) IsUserOnline(userID uint) bool {
+ 	h.mutex.RLock()
+-	defer h.mutex.RUnlock()
+ 	_, exists := h.clients[userID]
+-	return exists
++	h.mutex.RUnlock()
++	if exists {
++		return true
++	}
++	_, remote := remotePresence(userID)
++	return remote
+ }
+ 
+ // GetConnectedUsersCount bağlı kullanıcı sayısı
+@@ -1343,11 +1395,19 @@
+ }
+ 
+ func (h *Hub) SetActiveChat(userID uint, chatWithUserID *uint) {
+-	h.mutex.Lock()
+-	defer h.mutex.Unlock()
++	var dm, group uint
++	found := false
+ 
++	h.mutex.Lock()
+ 	if client, exists := h.clients[userID]; exists {
+ 		client.ActiveChatWith = chatWithUserID
++		found = true
++		if chatWithUserID != nil {
++			dm = *chatWithUserID
++		}
++		if client.ActiveGroupChat != nil {
++			group = *client.ActiveGroupChat
++		}
+ 
+ 		if chatWithUserID != nil {
+ 			log.Printf("Kullanıcı %d aktif chat: %d", userID, *chatWithUserID)
+@@ -1355,27 +1415,49 @@
+ 			log.Printf("Kullanıcı %d chat'ten çıktı", userID)
+ 		}
+ 	}
++	h.mutex.Unlock()
++
++	// Issue 4: açıq çat konteksti paylaşılan presence-ə yazılır — başqa
++	// instansdakı göndərən `IsUserInChatWith` ilə doğru cavab alsın
++	// (əks halda çatda oturan istifadəçiyə push göndərilirdi).
++	if found {
++		h.writePresence(userID, dm, group)
++	}
+ }
+ 
+-// IsUserInChatWith kontrol fonksiyonu
++// IsUserInChatWith kontrol fonksiyonu.
++// Issue 4: lokal map tapmasa paylaşılan presence-ə düşür.
+ func (h *Hub) IsUserInChatWith(userID, otherUserID uint) bool {
+ 	h.mutex.RLock()
+-	defer h.mutex.RUnlock()
+-
+-	if client, exists := h.clients[userID]; exists {
+-		return client.ActiveChatWith != nil && *client.ActiveChatWith == otherUserID
++	client, exists := h.clients[userID]
++	var local bool
++	if exists {
++		local = client.ActiveChatWith != nil && *client.ActiveChatWith == otherUserID
++	}
++	h.mutex.RUnlock()
++	if exists {
++		return local
+ 	}
+-	return false
++	rec, ok := remotePresence(userID)
++	return ok && rec.DM == otherUserID && otherUserID != 0
+ }
+ 
+ // SetActiveGroupChat — istifadəçinin hazırda açıq olan qrup çatını qeyd edir
+ // (nil = qrup səhifəsindən çıxdı). SetActiveChat-in qrup ekvivalenti.
+ func (h *Hub) SetActiveGroupChat(userID uint, conversationID *uint) {
+-	h.mutex.Lock()
+-	defer h.mutex.Unlock()
++	var dm, group uint
++	found := false
+ 
++	h.mutex.Lock()
+ 	if client, exists := h.clients[userID]; exists {
+ 		client.ActiveGroupChat = conversationID
++		found = true
++		if conversationID != nil {
++			group = *conversationID
++		}
++		if client.ActiveChatWith != nil {
++			dm = *client.ActiveChatWith
++		}
+ 
+ 		if conversationID != nil {
+ 			log.Printf("Kullanıcı %d aktif grup chat: %d", userID, *conversationID)
+@@ -1383,18 +1465,30 @@
+ 			log.Printf("Kullanıcı %d grup chat'ten çıktı", userID)
+ 		}
+ 	}
++	h.mutex.Unlock()
++
++	// Issue 4: bax SetActiveChat.
++	if found {
++		h.writePresence(userID, dm, group)
++	}
+ }
+ 
+ // IsUserInGroupChat — istifadəçi hazırda BU qrupun səhifəsindədirmi?
+ // True isə qrup mesajı push-u GÖNDƏRİLMİR (DM IsUserInChatWith məntiqi).
++// Issue 4: lokal map tapmasa paylaşılan presence-ə düşür.
+ func (h *Hub) IsUserInGroupChat(userID, conversationID uint) bool {
+ 	h.mutex.RLock()
+-	defer h.mutex.RUnlock()
+-
+-	if client, exists := h.clients[userID]; exists {
+-		return client.ActiveGroupChat != nil && *client.ActiveGroupChat == conversationID
++	client, exists := h.clients[userID]
++	var local bool
++	if exists {
++		local = client.ActiveGroupChat != nil && *client.ActiveGroupChat == conversationID
++	}
++	h.mutex.RUnlock()
++	if exists {
++		return local
+ 	}
+-	return false
++	rec, ok := remotePresence(userID)
++	return ok && rec.Group == conversationID && conversationID != 0
+ }
+ 
+ // emitTypingSignal — Issue 16: "yazır…"/"səs yazır" siqnalını qarşı tərəfə
+--- a/cmd/main/main.go	2026-07-26 14:38:55.625270303 +0000
++++ b/cmd/main/main.go	2026-07-26 14:34:21.274866837 +0000
+@@ -143,6 +143,12 @@
+ 	database.DB.Exec("UPDATE user_presences SET is_online = false, last_seen_at = NOW() WHERE is_online = true")
+ 	go wsHub.Run()
+ 
++	// Issue 4: instance-lar arası canlı yayım + paylaşılan presence.
++	// Redis söndürülübsə hər ikisi no-op-dur (davranış tək instansdakı kimi
++	// qalır). Bax websocket/cluster.go.
++	go wsHub.StartClusterSubscriber(context.Background())
++	go wsHub.StartPresenceHeartbeat(context.Background())
++
+ 	// 1b. XMPP BRIDGE (transport migration for chat_page / group_chat_page).
+ 	// No-op unless XMPP_ENABLED=true. The Hub implements both xmpp.LegacyDelivery
+ 	// and xmpp.IngressSink (see websocket/hub_xmpp.go). When enabled, the Hub's
+--- /dev/null	2026-07-26 13:30:38.463095057 +0000
++++ b/DEPLOY_ws_cluster.md	2026-07-26 14:38:48.140016002 +0000
+@@ -0,0 +1,120 @@
++# DEPLOY — çoxlu replica (horizontal scale) üçün WS klaster qatı (Issue 4)
++
++## Nə düzəldildi
++
++`Hub.clients` yalnız **bir prosesin yaddaşındakı** map idi və `SendToUser`
++sırf ona baxırdı. `cache/redis.go`-da `Publish` / `Subscribe` **ümumiyyətlə
++yox idi**. Tək replica ilə hər şey işləyir; **ikinci replica qalxdığı an**:
++
++| Sındıran şey | Nəticə |
++|---|---|
++| A-dakı göndərən → B-dəki alıcı | Canlı mesaj **heç vaxt** çatmır (yalnız DB-də; alıcı çatı yenidən açanda görür) |
++| `IsUserOnline` | B-dəki onlayn istifadəçi A-da "offline" görünür → çatda oturduğu halda push gedir |
++| `IsUserInChatWith` / `IsUserInGroupChat` | Avto-oxundu və push susdurma qərarları səhv |
++| yazır…, oxundu, reaksiya, qrup üzvlük event-ləri | Hamısı itir |
++
++Yəni sistem **gizli şəkildə tək replica-ya pinlənmişdi**: ikinci replica əlavə
++etmək heç bir xəta vermir, sadəcə mesajlaşmanı yarıdan bölür.
++
++## Necə işləyir
++
++**1. Yayım (fan-out).** Hər instans `bp:msg:ws:fanout` kanalına abunə olur.
++`SendToUser` / `SendToMultipleUsers` əvvəlcə **öz lokal** client-lərinə çatdırır,
++sonra kanala yayımlayır. Digər instanslar frame-i alıb yalnız **özündə olan**
++alıcılara ötürür. Öz yayımını `origin` sahəsindən tanıyıb atır — ikiqat
++çatdırma yoxdur.
++
++**2. Paylaşılan presence.** Hər bağlı istifadəçi üçün `bp:msg:ws:presence:{id}`
++yazılır: hansı instansda olduğu + hazırda açıq DM/qrup. TTL **90 s**, heartbeat
++**30 s**-də bir yeniləyir. İnstans qəfil ölsə (SIGKILL/OOM/node itkisi) qeyd
++öz-özünə yox olur — "zombi onlayn" qalmır.
++Oxuma yolları əvvəlcə lokal map-ə baxır (sürətli yol dəyişməyib), tapmasa
++Redis-ə düşür. Qrup üçün `FilterUsersInGroupChat` **tək MGET** işlədir
++(5000 üzvlü qrupda üzv-başına GET fəlakət olardı).
++
++## Konfiqurasiya
++
++| Env | Default | Mənası |
++|---|---|---|
++| `REDIS_ENABLED` | mövcud dəyər | `false` olduqda bütün klaster qatı **no-op**-dur |
++| `WS_CLUSTER_ENABLED` | `true` | `false` ilə açıq şəkildə söndürülür (Redis açıq olsa belə) |
++| `INSTANCE_ID` | `<hostname>-<rand8>` | İnstans kimliyi. Kubernetes-də `metadata.name` verin |
++
++**Tək replica ilə heç nə etməyə ehtiyac yoxdur** — qat işləyir, sadəcə hər
++frame üçün bir əlavə Redis `PUBLISH` olur (öz yayımı gələndə atılır).
++İstəsəniz `WS_CLUSTER_ENABLED=false` ilə tamamilə söndürə bilərsiniz.
++
++## Redis tələbləri
++
++* **Eyni Redis instansı** bütün replica-lar tərəfindən görünməlidir.
++  `docker-compose.yml`-də `redis` servisi onsuz da paylaşılır.
++* Pub/sub **master**-ə gedir (`REDIS_HOST`). `REDIS_READ_HOST` (replica) yalnız
++  `GET`/`MGET` üçün işlənir — abunə oradan qurulmur.
++* **Redis Cluster (sharded) işlədirsinizsə** diqqət: `PUBLISH` shard-lar arası
++  yayılır, amma `SPUBLISH`/shard pub-sub istifadə edilmir. Tək master + replica
++  (hazırkı quraşdırma) tam dəstəklənir.
++* Yaddaş: presence açarı istifadəçi başına ~80 bayt. 100 000 eyni anda onlayn
++  istifadəçi ≈ 8 MB.
++
++## Load balancer
++
++Sticky session **TƏLƏB OLUNMUR** — bu düzəlişin əsas məqsədi məhz odur.
++Amma yenə də tövsiyə olunur (`ip_hash` və ya cookie affinity): eyni istifadəçi
++eyni instansda qalırsa Redis üzərindən keçən trafik azalır.
++
++WebSocket üçün nginx-də adi tələblər dəyişməyib:
++
++```nginx
++proxy_http_version 1.1;
++proxy_set_header Upgrade $http_upgrade;
++proxy_set_header Connection "upgrade";
++proxy_read_timeout 3600s;
++```
++
++## Yoxlama
++
++**1. Abunə quruldumu?** Hər replica-nın log-unda:
++
++```
++ws-cluster: instans kimliyi <id>
++cache: "bp:msg:ws:fanout" kanalına abunə olundu
++```
++
++`ws-cluster: söndürülüb ...` görünürsə Redis bağlı deyil və ya
++`WS_CLUSTER_ENABLED=false`.
++
++**2. Canlı yayım işləyirmi?**
++
++```bash
++redis-cli SUBSCRIBE bp:msg:ws:fanout
++# başqa terminalda bir mesaj göndər — frame görünməlidir:
++# {"o":"<instance>","u":[7],"t":"new_message","d":{...}}
++```
++
++**3. Presence yazılırmı?**
++
++```bash
++redis-cli --scan --pattern 'bp:msg:ws:presence:*' | head
++redis-cli GET bp:msg:ws:presence:7
++redis-cli TTL bp:msg:ws:presence:7     # 60–90 arası olmalıdır
++```
++
++**4. Əsl ssenari testi (2 replica).**
++İki fərqli replica-ya bağlanan iki cihazdan yazışın: mesaj **dərhal**
++görünməlidir (səhifəni yeniləmədən). Əvvəl bu işləmirdi.
++
++## Geri qaytarma
++
++`WS_CLUSTER_ENABLED=false` → dərhal köhnə (tək instans) davranışa qayıdır.
++Kod dəyişikliyini geri almağa ehtiyac yoxdur.
++
++## Bilinən məhdudiyyətlər
++
++* **Ortaq kanal** işlədilir (per-user kanal deyil): hər frame bütün
++  instanslara gedir. 2–4 replica üçün əhəmiyyətsizdir. Replica sayı çox
++  artarsa per-user kanala keçid asandır — funksiya imzaları dəyişmir.
++* Yayım növbəsi sərhədlidir (4096 frame, 4 yazıcı). Dolarsa frame atılır və
++  5 dəqiqədən bir loglanır (`ws-cluster: yayım növbəsi dolu — N frame atıldı`).
++  Bu, **canlı** çatdırmadır: mesaj onsuz da DB-dədir və push gedir.
++* Presence TTL 90 s-dir: instans qəfil ölsə istifadəçi ən çox 90 saniyə
++  "onlayn" görünə bilər.

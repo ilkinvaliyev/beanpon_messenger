@@ -1,0 +1,3023 @@
+--- a/cmd/main/main.go	2026-07-26 06:52:50.000000000 +0000
++++ b/cmd/main/main.go	2026-07-26 14:04:36.425125170 +0000
+@@ -10,6 +10,8 @@
+ 	"beanpon_messenger/utils"
+ 	"beanpon_messenger/websocket"
+ 	"beanpon_messenger/xmpp"
++	"context"
++	"crypto/subtle"
+ 	"github.com/Depado/ginprom"
+ 	"github.com/gin-gonic/gin"
+ 	"log"
+@@ -199,6 +201,13 @@
+ 	s3Uploader := services.NewS3Uploader(cfg.S3.Bucket, cfg.S3.Region, cfg.S3.Endpoint, cfg.S3.Key, cfg.S3.Secret, cfg.S3.PathStyle)
+ 	uploadHandler := handlers.NewUploadHandler(s3Uploader)
+ 
++	// Issue 56: sahibsiz (heç bir mesaja bağlanmayan) S3 media obyektlərinin
++	// izlənməsi + dövri təmizlənməsi. Cədvəl yoxdursa özünü söndürür — heç bir
++	// yükləmə axını pozulmur. Bax MIGRATION_chat_media_objects.md.
++	mediaTracker := services.NewMediaTracker(database.GetDB(), s3Uploader)
++	services.SetMediaTracker(mediaTracker)
++	go mediaTracker.StartReaper(context.Background())
++
+ 	// Gin router'ını oluştur
+ 	router := gin.Default()
+ 
+@@ -395,7 +404,10 @@
+ 	internal := router.Group("/internal")
+ 	internal.Use(func(c *gin.Context) {
+ 		secret := c.GetHeader("X-Internal-Secret")
+-		if secret != cfg.InternalSecret {
++		// Issue 63: sabit-zamanlı müqayisə. Adi `!=` ilk fərqli baytda qısa
++		// qapanır və nəzəri olaraq sirri bayt-bayt bərpa etməyə imkan verir.
++		// Bir sətirlik dəyişiklik — praktik risk aşağı olsa da səbəb yoxdur.
++		if subtle.ConstantTimeCompare([]byte(secret), []byte(cfg.InternalSecret)) != 1 {
+ 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+ 			c.Abort()
+ 			return
+@@ -422,6 +434,12 @@
+ 		// XMPP client auth callback (ejabberd → Go, validates the JWT). Used in
+ 		// PHASE 2 when native XMPP clients connect; harmless when XMPP disabled.
+ 		internal.POST("/xmpp/auth", xmppBridge.AuthHandler(cfg.JWTSecret))
++
++		// Issue 62: spam-ban keşini məcburi təmizləmək/yeniləmək.
++		// Laravel banUser/unbanUser-dən sonra çağırır; keş yazısı uğursuz
++		// olsa belə messenger tərəf dərhal düzgün dəyəri görür.
++		// Bax handlers/internal_spam_ban.go.
++		internal.POST("/users/:user_id/spam-ban/invalidate", handlers.InvalidateSpamBanCache)
+ 	}
+ 
+ 	// Public routes
+--- a/handlers/conversation_handler.go	2026-07-26 11:13:48.000000000 +0000
++++ b/handlers/conversation_handler.go	2026-07-26 13:54:09.839956811 +0000
+@@ -336,8 +336,9 @@
+ 
+ // UpdateConversationOnMessage mesaj gönderildikten sonra conversation güncelle
+ func (h *ConversationHandler) UpdateConversationOnMessage(senderID, receiverID uint) error {
+-	return h.UpdateConversationOnMessageTx(database.DB, senderID, receiverID,
++	_, err := h.UpdateConversationOnMessageTx(database.DB, senderID, receiverID,
+ 		h.ShouldSkipConversationCreate(senderID, receiverID))
++	return err
+ }
+ 
+ // ShouldSkipConversationCreate — Issue 40: mesaj banı yoxlaması REDİS I/O edir
+@@ -365,21 +366,39 @@
+ //
+ // `skipCreate` — `ShouldSkipConversationCreate`-in transaction-dan ƏVVƏL
+ // hesablanmış nəticəsi (Redis I/O transaction içində olmasın deyə).
+-func (h *ConversationHandler) UpdateConversationOnMessageTx(db *gorm.DB, senderID, receiverID uint, skipCreate bool) error {
++//
++// ── Issue 10: push qapısı üçün GERÇƏK status qaytarılır ──────────────────────
++// Əvvəl bu funksiya yalnız `error` qaytarırdı və REST `SendMessage` push
++// qapısına SABİT `"active"` ötürürdü. WS yolu isə `conversation.Status`-un
++// həqiqi dəyərini ötürür. Nəticə: EYNİ mesaj REST ilə göndərildikdə push
++// GEDİR, WS ilə göndərildikdə (status `pending`/`restricted` olanda) push
++// GETMİR — yəni bildiriş davranışı NƏQLİYYATDAN asılı olurdu. iOS mətn
++// mesajlarını əsasən WS, media mesajlarını REST ilə göndərdiyi üçün
++// istifadəçi "bəzi mesajlarda bildiriş gəlir, bəzilərində yox" görürdü.
++// Üstəlik mesajlaşma istəyini (pending) hələ qəbul etməmiş adama və
++// məhdudlaşdırılmış (restricted) söhbətdə REST üzərindən push GEDİRDİ —
++// spam qapısının birbaşa deşiyi.
++//
++// İndi hər iki yol eyni mənbədən (`conversation.Status`) qidalanır.
++func (h *ConversationHandler) UpdateConversationOnMessageTx(db *gorm.DB, senderID, receiverID uint, skipCreate bool) (string, error) {
+ 	// 🚫 SPAM KORUMASI: mesaj banlı kullanıcı YENİ conversation başlatamaz.
+ 	// Conversation yoksa ve gönderenin mesaj banı varsa sessizce çık
+ 	// (conversation oluşturulmaz, hata da dönülmez). Conversation zaten
+ 	// varsa dokunma — bu kontrol yalnızca ilk conversation create için.
+ 	if skipCreate {
+-		return nil
++		// Söhbət yaradılmadı → aktiv söhbət yoxdur → push da getmir.
++		return "", nil
+ 	}
+ 
+ 	conversation, err := h.getOrCreateConversationTx(db, senderID, receiverID)
+ 	if err != nil {
+-		return err
++		return "", err
+ 	}
+ 
+-	return applyConversationMessageUpdate(db, conversation, senderID)
++	if err := applyConversationMessageUpdate(db, conversation, senderID); err != nil {
++		return "", err
++	}
++	return conversation.Status, nil
+ }
+ 
+ // applyConversationMessageUpdate — Issue 14: sayğac artımı ATOMİK SQL ilə.
+--- a/handlers/group_handler.go	2026-07-26 11:13:48.000000000 +0000
++++ b/handlers/group_handler.go	2026-07-26 14:27:50.834122512 +0000
+@@ -13,6 +13,7 @@
+ 	"net/http"
+ 	"os"
+ 	"strconv"
++	"strings"
+ 	"time"
+ 
+ 	"github.com/gin-gonic/gin"
+@@ -23,6 +24,13 @@
+ // errGroupFull — atomik limit yoxlamasında "qrup dolu" sentinel xətası.
+ var errGroupFull = errors.New("group full")
+ 
++// Issue 58: LeaveGroup transaction-ından qaytarılan sentinel xətalar —
++// HTTP statusunu ayırd etmək üçün (404 vs 500).
++var (
++	errGroupNotFound  = errors.New("group not found")
++	errNotGroupMember = errors.New("not a group member")
++)
++
+ type GroupHandler struct {
+ 	wsHub interface {
+ 		IsUserOnline(userID uint) bool
+@@ -55,13 +63,58 @@
+ 	return hex.EncodeToString(bytes), nil
+ }
+ 
++// ── Issue 18 — dəvət linklərinin ÖMÜRLÜK olması ─────────────────────────────
++//
++// PROBLEM
++// `conversations.invite_token_expires_at` sütunu MÖVCUD idi və qoşulma
++// yollarında (`PreviewByToken`, `JoinByToken`) yoxlanılırdı — amma HEÇ BİR
++// yerdə TƏYİN EDİLMİRDİ. Nə qrup yaradılanda, nə də `RefreshInviteToken`-də.
++// Yəni yoxlama həmişə `nil` görüb keçirdi və hər dəvət linki ƏBƏDİ idi:
++//   - bir dəfə paylaşılan link (skrinşot, forward, arxivlənmiş söhbət, indeks-
++//     lənmiş veb səhifə) aylar sonra da qrupa giriş verirdi;
++//   - `RefreshInviteToken` yalnız tokeni dəyişirdi — köhnə linki "ləğv etmək"
++//     kimi görünürdü, amma müddət anlayışı olmadığı üçün admin "bu link nə
++//     vaxta qədər etibarlıdır" sualına cavab verə bilmirdi.
++//
++// HƏLL
++// Yeni yaradılan və yenilənən tokenlərə TTL yazılır. Müddət `INVITE_TOKEN_TTL_HOURS`
++// mühit dəyişəni ilə tənzimlənir (default 168 saat = 7 gün). `0` → müddətsiz
++// (köhnə davranış, açıq şəkildə seçilməli).
++//
++// GERİYƏ UYĞUNLUQ: mövcud qrupların `invite_token_expires_at` dəyəri NULL
++// qalır → onların linkləri işləməyə davam edir. Yalnız yeni yaradılan/yenilənən
++// tokenlər müddətli olur. Miqrasiya tələb OLUNMUR.
++const defaultInviteTokenTTLHours = 168 // 7 gün
++
++// inviteTokenExpiry — yeni token üçün bitmə vaxtı. nil = müddətsiz.
++func inviteTokenExpiry(now time.Time) *time.Time {
++	hours := defaultInviteTokenTTLHours
++	if raw := strings.TrimSpace(os.Getenv("INVITE_TOKEN_TTL_HOURS")); raw != "" {
++		if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 0 {
++			hours = parsed
++		}
++	}
++	if hours == 0 {
++		return nil // açıq şəkildə müddətsiz
++	}
++	exp := now.Add(time.Duration(hours) * time.Hour)
++	return &exp
++}
++
+ // getGroupParticipantIDs group'taki aktif üyelerin ID listesini döndür.
+ // DİQQƏT: bura `invite_status='pending'` (dəvət olunmuş amma qəbul etməmiş)
+ // üzvləri də daxildir — üzvlük/dəvət olayları (join/leave/invite/accept) üçün
+ // bu doğrudur. Mesaj MƏZMUNU yaymaq üçün getActiveGroupMemberIDs istifadə et.
+ func getGroupParticipantIDs(conversationID uint) []uint {
++	return getGroupParticipantIDsTx(database.DB, conversationID)
++}
++
++// getGroupParticipantIDsTx — eyni sorğu, amma verilmiş `db`/transaction
++// üzərində (Issue 58: LeaveGroup siyahını öz transaction-ından oxumalıdır,
++// əks halda transaction-da edilən dəyişikliyi görmür).
++func getGroupParticipantIDsTx(db *gorm.DB, conversationID uint) []uint {
+ 	var ids []uint
+-	database.DB.Model(&models.ConversationParticipant{}).
++	db.Model(&models.ConversationParticipant{}).
+ 		Where("conversation_id = ? AND left_at IS NULL AND deleted_at IS NULL", conversationID).
+ 		Pluck("user_id", &ids)
+ 	return ids
+@@ -429,6 +482,10 @@
+ 		"created_at":   now,
+ 		"updated_at":   now,
+ 	}
++	// Issue 18: dəvət linkinə TTL. nil olduqda sütun yazılmır (müddətsiz).
++	if exp := inviteTokenExpiry(now); exp != nil {
++		conv["invite_token_expires_at"] = *exp
++	}
+ 
+ 	result := database.DB.Table("conversations").Create(&conv)
+ 	if result.Error != nil {
+@@ -708,56 +765,135 @@
+ 	}
+ 	conversationID := uint(convID)
+ 
+-	var participant models.ConversationParticipant
+-	err = database.DB.Where("conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL",
+-		conversationID, userID).First(&participant).Error
+-	if err != nil {
+-		c.JSON(http.StatusNotFound, gin.H{"error": "Bu grubun üyesi değilsiniz"})
+-		return
+-	}
++	// ── Issue 58 — LeaveGroup ATOMİK DEYİLDİ ────────────────────────────────
++	//
++	// Əvvəlki axın 3–4 ayrı yazı əməliyyatı idi, transaction YOX, kilid YOX:
++	//
++	//  1. YARIMÇIQ QALAN VƏZİYYƏT. Son admin çıxanda əvvəl onun `left_at`-ı
++	//     yazılır, SONRA qrup soft-delete edilirdi. İkinci yazı uğursuz olsa
++	//     (bağlantı qopması, hovuz timeout-u, deploy) admin qrupdan çıxmış,
++	//     qrup isə İDARƏÇİSİZ AÇIQ qalırdı — heç kim üzv əlavə edə, ayarları
++	//     dəyişə və ya qrupu bağlaya bilmirdi. Geri dönüşü yalnız DB-dən
++	//     əl ilə düzəltmək idi.
++	//
++	//  2. TOCTOU YARIŞI (əsas problem). İki admin EYNİ VAXTDA çıxanda hər
++	//     ikisi "başqa admin varmı?" sorğusunu qarşı tərəf HƏLƏ çıxmamış
++	//     icra edir → hər ikisi `adminCount == 1` görür → HEÇ BİRİ qrupu
++	//     bağlamır. Nəticə: qrup sıfır adminlə sağ qalır — düzəltmək
++	//     istədiyimiz vəziyyətin məhz özü.
++	//
++	//  3. WS bildirişi iki yazının ARASINDA göndərilirdi: istifadəçilər
++	//     `group_deleted` alır, sonra silmə uğursuz olursa qrup serverdə
++	//     qalır — istemçi ilə server ayrılır.
++	//
++	// HƏLL: hamısı TEK transaction; `conversations` sətri `FOR UPDATE` ilə
++	// kilidlənir (paralel çıxışlar ardıcıllaşır); WS yayımı yalnız KOMİTDƏN
++	// SONRA. Bildiriş siyahısı transaction daxilində götürülür.
++	var (
++		now            = time.Now()
++		groupDeleted   bool
++		memberIDs      []uint
++		leaverUsername string
++	)
++
++	txErr := database.DB.Transaction(func(tx *gorm.DB) error {
++		// Sətir kilidi — bu qrup üzərindəki paralel LeaveGroup-ları seriallaşdırır.
++		var conv models.Conversation
++		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
++			Where("id = ? AND chat_type = 'group' AND deleted_at IS NULL", conversationID).
++			First(&conv).Error; err != nil {
++			// Yalnız "sətir yoxdur" 404-dür. Şəbəkə/kilid/hovuz xətası 500
++			// olmalıdır — əks halda istemçi "üzv deyilsiniz" görüb qrupu
++			// siyahıdan silərdi (məlumat itkisi kimi görünən UI xətası).
++			if errors.Is(err, gorm.ErrRecordNotFound) {
++				return errGroupNotFound
++			}
++			return err
++		}
+ 
+-	// Admin/owner çıxır və BAŞQA admin/owner YOXDURSA → qrup SİLİNİR
+-	// (istifadəçi tələbi: idarəçisiz qrup qalmasın). Üzvlərə group_deleted
+-	// göndərilir — Flutter siyahıdan çıxarır və çatı bağlayır.
+-	if participant.Role == "owner" || participant.Role == "admin" {
+-		var adminCount int64
+-		database.DB.Model(&models.ConversationParticipant{}).
+-			Where("conversation_id = ? AND role IN ('owner','admin') AND user_id != ? AND left_at IS NULL AND deleted_at IS NULL",
+-				conversationID, userID).Count(&adminCount)
+-
+-		if adminCount == 0 {
+-			now := time.Now()
+-			// Çıxan adminin participant qeydini bağla.
+-			database.DB.Model(&participant).Update("left_at", now)
+-
+-			// Qalan üzvlərə xəbər ver (siyahı silinmədən ƏVVƏL götürülür).
+-			memberIDs := getGroupParticipantIDs(conversationID)
+-
+-			// Qrupu soft-delete et.
+-			database.DB.Model(&models.Conversation{}).
+-				Where("id = ?", conversationID).
+-				Update("deleted_at", now)
+-
+-			h.wsHub.SendToMultipleUsers(memberIDs, "group_deleted", gin.H{
+-				"conversation_id": conversationID,
+-				"reason":          "admin_left",
+-			})
++		var participant models.ConversationParticipant
++		if err := tx.Where("conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL",
++			conversationID, userID).First(&participant).Error; err != nil {
++			if errors.Is(err, gorm.ErrRecordNotFound) {
++				return errNotGroupMember
++			}
++			return err
++		}
++
++		// Bildiriş siyahısı — çıxış YAZILMADAN ƏVVƏL (çıxan da xəbər alsın
++		// deyil, sadəcə qalan üzvlər siyahısı bu nöqtədə dəqiqdir).
++		memberIDs = getGroupParticipantIDsTx(tx, conversationID)
+ 
++		if err := tx.Model(&models.ConversationParticipant{}).
++			Where("id = ?", participant.ID).
++			Update("left_at", now).Error; err != nil {
++			return err
++		}
++
++		// Admin/owner çıxır və BAŞQA admin/owner YOXDURSA → qrup SİLİNİR
++		// (istifadəçi tələbi: idarəçisiz qrup qalmasın). Üzvlərə group_deleted
++		// göndərilir — Flutter siyahıdan çıxarır və çatı bağlayır.
++		// DİQQƏT: sayım artıq ÇIXIŞ YAZILDIQDAN SONRA edilir — beləliklə
++		// paralel çıxan ikinci admin özündən əvvəlkinin getdiyini GÖRÜR.
++		if participant.Role == "owner" || participant.Role == "admin" {
++			var adminCount int64
++			if err := tx.Model(&models.ConversationParticipant{}).
++				Where("conversation_id = ? AND role IN ('owner','admin') AND left_at IS NULL AND deleted_at IS NULL",
++					conversationID).Count(&adminCount).Error; err != nil {
++				return err
++			}
++			if adminCount == 0 {
++				if err := tx.Model(&models.Conversation{}).
++					Where("id = ?", conversationID).
++					Update("deleted_at", now).Error; err != nil {
++					return err
++				}
++				groupDeleted = true
++				return nil
++			}
++		}
++
++		// Çıxanın adı — Flutter çatda "X qrupu tərk etdi" sistem sətri göstərsin.
++		tx.Raw(`SELECT username FROM users WHERE id = ?`, userID).Scan(&leaverUsername)
++		return nil
++	})
++
++	if txErr != nil {
++		switch {
++		case errors.Is(txErr, errGroupNotFound):
++			// Qrup artıq silinib — istemçinin "fantom üzvlüyü" qalmasın deyə
++			// UĞURLU cavab: onsuz da çıxmış sayılır.
+ 			c.JSON(http.StatusOK, gin.H{"message": "Grup kapatıldı", "group_deleted": true})
+-			return
++		case errors.Is(txErr, errNotGroupMember):
++			c.JSON(http.StatusNotFound, gin.H{"error": "Bu grubun üyesi değilsiniz"})
++		default:
++			log.Printf("LeaveGroup transaction xətası (conv=%d, user=%d): %v", conversationID, userID, txErr)
++			c.JSON(http.StatusInternalServerError, gin.H{"error": "Gruptan ayrılınamadı"})
+ 		}
++		return
+ 	}
+ 
+-	now := time.Now()
+-	database.DB.Model(&participant).Update("left_at", now)
++	// ── KOMİTDƏN SONRA: yayım ────────────────────────────────────────────────
++	// Çıxanı siyahıdan çıxarırıq (o, HTTP cavabı ilə onsuz da xəbərdardır;
++	// `group_deleted` üçün isə qalanlara getməlidir).
++	notify := make([]uint, 0, len(memberIDs))
++	for _, mid := range memberIDs {
++		if mid == userID {
++			continue
++		}
++		notify = append(notify, mid)
++	}
+ 
+-	// Çıxanın adı — Flutter çatda "X qrupu tərk etdi" sistem sətri göstərsin.
+-	var leaverUsername string
+-	database.DB.Raw(`SELECT username FROM users WHERE id = ?`, userID).Scan(&leaverUsername)
++	if groupDeleted {
++		h.wsHub.SendToMultipleUsers(notify, "group_deleted", gin.H{
++			"conversation_id": conversationID,
++			"reason":          "admin_left",
++		})
++		c.JSON(http.StatusOK, gin.H{"message": "Grup kapatıldı", "group_deleted": true})
++		return
++	}
+ 
+-	// Diğer üyelere bildir
+-	memberIDs := getGroupParticipantIDs(conversationID)
+-	h.wsHub.SendToMultipleUsers(memberIDs, "group_member_left", gin.H{
++	h.wsHub.SendToMultipleUsers(notify, "group_member_left", gin.H{
+ 		"conversation_id": conversationID,
+ 		"user_id":         userID,
+ 		"username":        leaverUsername,
+@@ -1328,11 +1464,27 @@
+ 		return
+ 	}
+ 
+-	database.DB.Table("conversations").
++	// Issue 18: yenilənən tokenə də TTL yazılır. Əvvəl yalnız `invite_token`
++	// dəyişirdi və `invite_token_expires_at` KÖHNƏ dəyərində (adətən NULL)
++	// qalırdı — yəni "linki yenilə" düyməsi müddətsiz link yaradırdı.
++	updates := map[string]interface{}{"invite_token": token}
++	exp := inviteTokenExpiry(time.Now())
++	// nil olduqda da YAZILIR (NULL) — TTL sonradan söndürülübsə köhnə
++	// bitmə tarixi qalıb yeni linki dərhal etibarsız etməsin.
++	updates["invite_token_expires_at"] = exp
++
++	if err := database.DB.Table("conversations").
+ 		Where("id = ?", conversationID).
+-		Update("invite_token", token)
++		Updates(updates).Error; err != nil {
++		c.JSON(http.StatusInternalServerError, gin.H{"error": "Token güncellenemedi"})
++		return
++	}
+ 
+-	c.JSON(http.StatusOK, gin.H{"invite_token": token})
++	resp := gin.H{"invite_token": token}
++	if exp != nil {
++		resp["invite_token_expires_at"] = exp.UTC().Format(time.RFC3339)
++	}
++	c.JSON(http.StatusOK, resp)
+ }
+ 
+ // GET /api/v1/groups/:conversation_id
+--- a/handlers/group_message_handler.go	2026-07-26 11:13:48.000000000 +0000
++++ b/handlers/group_message_handler.go	2026-07-26 14:28:11.800578937 +0000
+@@ -3,6 +3,7 @@
+ import (
+ 	"beanpon_messenger/database"
+ 	"beanpon_messenger/models"
++	"beanpon_messenger/services"
+ 	"beanpon_messenger/utils"
+ 	"bytes"
+ 	"encoding/json"
+@@ -29,6 +30,8 @@
+ 	wsHub interface {
+ 		IsUserOnline(userID uint) bool
+ 		IsUserInGroupChat(userID, conversationID uint) bool
++		// Issue 23: üzv başına kilid əvəzinə tək kilidli toplu süzgəc.
++		FilterUsersInGroupChat(userIDs []uint, conversationID uint) []uint
+ 		SendToUser(userID uint, messageType string, data interface{})
+ 		SendToMultipleUsers(userIDs []uint, messageType string, data interface{})
+ 		SendGroupPushNotification(conversationID, senderID uint, groupName, message string, memberIDs []uint)
+@@ -45,6 +48,8 @@
+ 	wsHub interface {
+ 		IsUserOnline(userID uint) bool
+ 		IsUserInGroupChat(userID, conversationID uint) bool
++		// Issue 23: üzv başına kilid əvəzinə tək kilidli toplu süzgəc.
++		FilterUsersInGroupChat(userIDs []uint, conversationID uint) []uint
+ 		SendToUser(userID uint, messageType string, data interface{})
+ 		SendToMultipleUsers(userIDs []uint, messageType string, data interface{})
+ 		SendGroupPushNotification(conversationID, senderID uint, groupName, message string, memberIDs []uint)
+@@ -112,12 +117,22 @@
+ 	var req struct {
+ 		Text             string  `json:"text" binding:"required"`
+ 		ReplyToMessageID *string `json:"reply_to_message_id"`
++		// Issue 9: istemçi tərəfli idempotentlik açarı (UUID).
++		// Bax handlers/idempotency.go. Opsional.
++		ClientMessageID *string `json:"client_message_id,omitempty"`
+ 	}
+ 	if err := c.ShouldBindJSON(&req); err != nil {
+ 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+ 		return
+ 	}
+ 
++	// Issue 9: mesaj ID-si — istemçi verdisə onu işlət.
++	newMessageID, _, err := resolveMessageID(req.ClientMessageID)
++	if err != nil {
++		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
++		return
++	}
++
+ 	// Grup üyesi ve kısıtlı değil mi? PENDING dəvət (hələ qəbul etməyib)
+ 	// mesaj YAZA BİLMƏZ.
+ 	var participant models.ConversationParticipant
+@@ -215,7 +230,11 @@
+ 		return
+ 	}
+ 
+-	messageID := uuid.New().String()
++	// Issue 56: mətn hələ açıqdır — S3 media açarlarını "istifadə olunub"
++	// işarələ ki, sahibsiz media təmizləyicisi onlara toxunmasın.
++	services.MarkMediaReferenced(req.Text)
++
++	messageID := newMessageID
+ 	now := time.Now()
+ 
+ 	message := models.Message{
+@@ -228,10 +247,48 @@
+ 		UpdatedAt:        now,
+ 	}
+ 
+-	if err := database.DB.Create(&message).Error; err != nil {
++	// Issue 9: `ON CONFLICT (id) DO NOTHING` — eyni `client_message_id` ilə
++	// təkrar göndərmə YENİ sətir yaratmır. PK-nin unikal indeksi həmişə var,
++	// ona görə hədəfli forma burada təhlükəsizdir.
++	createRes := database.DB.Clauses(clause.OnConflict{
++		Columns:   []clause.Column{{Name: "id"}},
++		DoNothing: true,
++	}).Create(&message)
++	if createRes.Error != nil {
+ 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Mesaj kaydedilemedi"})
+ 		return
+ 	}
++	if createRes.RowsAffected == 0 {
++		// Təkrar cəhd — sayğac, avto-oxundu, WS fan-out və push TƏKRARLANMIR.
++		var existing models.Message
++		if err := database.DB.Unscoped().Where("id = ?", messageID).First(&existing).Error; err != nil {
++			c.JSON(http.StatusInternalServerError, gin.H{"error": "Mesaj kaydedilemedi"})
++			return
++		}
++		if existing.SenderID != senderID ||
++			existing.ConversationID == nil || *existing.ConversationID != conversationID {
++			c.JSON(http.StatusConflict, gin.H{"error": "client_message_id artıq istifadə olunub"})
++			return
++		}
++		c.JSON(http.StatusOK, gin.H{
++			"message":   "Mesaj gönderildi",
++			"duplicate": true,
++			"data": gin.H{
++				"id":                  existing.ID,
++				"conversation_id":     conversationID,
++				"chat_type":           "group",
++				"sender_id":           existing.SenderID,
++				"text":                req.Text,
++				"reply_to_message_id": existing.ReplyToMessageID,
++				"reply_to_message":    nil,
++				"is_edited":           existing.IsEdited,
++				"is_starred_by_me":    false,
++				"reactions":           []gin.H{},
++				"created_at":          existing.CreatedAt.UTC().Format(time.RFC3339),
++			},
++		})
++		return
++	}
+ 
+ 	// Gönderen otomatik read
+ 	messageRead := models.MessageRead{
+@@ -353,33 +410,59 @@
+ 	// görür → dərhal okundu işarələnir. Bunsuz səhifə açıqkən gələn mesajlar
+ 	// yalnız NÖVBƏTİ GetGroupMessages-də işarələnirdi — istifadəçi qrupdan
+ 	// çıxıb siyahıya dönəndə "oxunmamış" sayılırdı.
++	//
++	// Issue 23 — TOPLU (batched) yazım. Əvvəl bu döngü üzv başına
++	//   1 × `IsUserInGroupChat` (hub RWMutex al-burax)
++	// + 1 × `INSERT message_reads`
++	// + 1 × `UPDATE conversation_participants`
++	// edirdi → 500 üzvlü qrupda mesaj başına 500 kilid + 1000 DB gedişi.
++	// Hər gediş hovuzdan bağlantı tutur (25 limitli) → burst zamanı bütün
++	// digər sorğular hovuz gözləməsinə düşürdü. İndi: 1 kilid + 2 sorğu.
+ 	go func() {
+ 		readNow := time.Now()
+-		for _, mid := range memberIDs {
++
++		// Tək kilid altında "səhifəsi açıq" üzvləri süz.
++		activeViewers := h.wsHub.FilterUsersInGroupChat(memberIDs, conversationID)
++		targets := make([]uint, 0, len(activeViewers))
++		for _, mid := range activeViewers {
+ 			if mid == senderID {
+ 				continue
+ 			}
+-			if !h.wsHub.IsUserInGroupChat(mid, conversationID) {
+-				continue // səhifə açıq deyil — normal unread qalır
+-			}
+-			read := models.MessageRead{
++			targets = append(targets, mid)
++		}
++		if len(targets) == 0 {
++			return
++		}
++
++		reads := make([]models.MessageRead, 0, len(targets))
++		for _, mid := range targets {
++			reads = append(reads, models.MessageRead{
+ 				MessageID:      messageID,
+ 				UserID:         mid,
+ 				ConversationID: conversationID,
+ 				ReadAt:         readNow,
+ 				CreatedAt:      readNow,
+-			}
+-			// Issue 15: idempotent — eyni cüt paralel yollardan yazıla bilir.
+-			// Hədəfsiz forma — indekssiz də təhlükəsiz (yuxarıdakı şərhə bax).
+-			database.DB.Clauses(clause.OnConflict{DoNothing: true}).Create(&read)
+-			// last_read yenilə (unread count sorğusu message_reads-ə baxır,
+-			// amma participant last_read-i də tutarlı saxla).
+-			database.DB.Model(&models.ConversationParticipant{}).
+-				Where("conversation_id = ? AND user_id = ?", conversationID, mid).
+-				Updates(map[string]interface{}{
+-					"last_read_at":         readNow,
+-					"last_read_message_id": messageID,
+-				})
++			})
++		}
++		// Issue 15: idempotent — eyni cüt paralel yollardan yazıla bilir.
++		// Hədəfsiz forma — indekssiz də təhlükəsiz (yuxarıdakı şərhə bax).
++		// CreateInBatches: çox böyük qruplarda tək INSERT-in parametr
++		// limitini (PG: 65535 bind dəyəri) aşmasının qarşısını alır.
++		if err := database.DB.
++			Clauses(clause.OnConflict{DoNothing: true}).
++			CreateInBatches(&reads, 500).Error; err != nil {
++			log.Printf("qrup avto-oxundu toplu insert xətası (conv=%d): %v", conversationID, err)
++		}
++
++		// last_read yenilə (unread count sorğusu message_reads-ə baxır,
++		// amma participant last_read-i də tutarlı saxla). Tək UPDATE.
++		if err := database.DB.Model(&models.ConversationParticipant{}).
++			Where("conversation_id = ? AND user_id IN ?", conversationID, targets).
++			Updates(map[string]interface{}{
++				"last_read_at":         readNow,
++				"last_read_message_id": messageID,
++			}).Error; err != nil {
++			log.Printf("qrup avto-oxundu last_read yeniləmə xətası (conv=%d): %v", conversationID, err)
+ 		}
+ 	}()
+ 
+@@ -465,9 +548,14 @@
+ 	// 1) MENTION push — dərhal (gecikməsiz), xüsusi mətn.
+ 	//    Yalnız hazırda qrup səhifəsində OLMAYANLARA (onsuz da görür).
+ 	if len(mentionTargets) > 0 {
++		// Issue 23: üzv başına ayrıca kilid əvəzinə tək kilidli toplu süzgəc.
++		inChat := make(map[uint]struct{})
++		for _, uid := range h.wsHub.FilterUsersInGroupChat(mentionTargets, conversationID) {
++			inChat[uid] = struct{}{}
++		}
+ 		immediate := make([]uint, 0, len(mentionTargets))
+ 		for _, uid := range mentionTargets {
+-			if !h.wsHub.IsUserInGroupChat(uid, conversationID) {
++			if _, open := inChat[uid]; !open {
+ 				immediate = append(immediate, uid)
+ 			}
+ 		}
+@@ -909,6 +997,28 @@
+ 	// "oxundu" da yazılmamalıdır. Əvvəl yazılırdı: qrupa yeni qoşulan üzv
+ 	// bütün köhnə tarixçəyə `message_reads` sətri əlavə edir, bu da BAŞQA
+ 	// üzvlərin "N nəfər gördü" sayğacını şişirdirdi.
++	//
++	// ── Issue 57: NƏTİCƏ ÇOXLUĞU SƏRHƏDSİZ İDİ ──────────────────────────────
++	// Əvvəl bu sorğu `LIMIT`-siz idi və nəticə TAM olaraq Go yaddaşına
++	// yığılırdı. Uzun müddət açılmamış məşğul qrupda (5000 üzv limitli qrup,
++	// gündə minlərlə mesaj) bu, YÜZ MİNLƏRLƏ UUID demək idi:
++	//   1. yüz minlərlə sətir + struct → tək sorğuda onlarla MB yaddaş;
++	//   2. `CreateInBatches(reads, 100)` → 100-lük partiyalarla MİNLƏRLƏ
++	//      INSERT gedişi, hər biri hovuzdan bağlantı tutur → digər bütün
++	//      sorğular hovuz gözləməsinə düşür, istək timeout olur;
++	//   3. sonda `message_ids` massivi WS ilə BÜTÜN aktiv üzvlərə yayılırdı →
++	//      çox meqabaytlıq frame → hər alıcının 256-lıq `Send` buferi dolur →
++	//      yavaş istehlakçı sayılıb BAĞLANTIDAN ATILIR (bax Issue 22).
++	// Yəni bir nəfərin köhnə qrupu açması bütün qrupu offline edə bilirdi.
++	//
++	// İndi iki hissəyə bölünür:
++	//   (a) WS yayımı üçün YALNIZ ƏN SON `readBroadcastCap` id çəkilir —
++	//       istemçi onsuz da yalnız ekrandakı baloncuqların tikini yeniləyir;
++	//   (b) işarələmənin ÖZÜ tək `INSERT … SELECT` ifadəsi ilə DB tərəfində
++	//       aparılır — nə yaddaşa yığılır, nə də gediş sayı sətir sayı ilə
++	//       artır (1 gediş, sətir sayından asılı olmayaraq).
++	const readBroadcastCap = 500
++
+ 	var unreadIDs []string
+ 	database.DB.Raw(`
+ 		SELECT m.id FROM messages m
+@@ -921,40 +1031,49 @@
+ 		  AND m.deleted_at IS NULL
+ 		  AND m.created_at >= COALESCE(cp.joined_at, '1970-01-01'::timestamptz)
+ 		  AND m.created_at > COALESCE(cp.cleared_at, '1970-01-01'::timestamptz)
+-	`, userID, userID, conversationID, userID).Pluck("id", &unreadIDs)
++		ORDER BY m.created_at DESC, m.id DESC
++		LIMIT ?
++	`, userID, userID, conversationID, userID, readBroadcastCap).Pluck("id", &unreadIDs)
+ 
+ 	if len(unreadIDs) == 0 {
+ 		return
+ 	}
+ 
+ 	now := time.Now()
+-	var reads []models.MessageRead
+-	for _, msgID := range unreadIDs {
+-		reads = append(reads, models.MessageRead{
+-			MessageID:      msgID,
+-			UserID:         userID,
+-			ConversationID: conversationID,
+-			ReadAt:         now,
+-			CreatedAt:      now,
+-		})
+-	}
+ 
+-	// Issue 15: `Clauses()` ARQÜMANSIZ çağırılırdı → "çakışmada skip" yorumu
+-	// tətbiq OLUNMURDU. Eyni (message_id, user_id) cütü paralel yollardan
+-	// (göndərim anındakı avto-oxundu goroutine-i, çox-cihaz açılış,
+-	// MarkGroupConversationRead) təkrar yazıla bilirdi; `read_count` =
+-	// COUNT(*) olduğu üçün "N nəfər gördü" gerçək oxuyucu sayını AŞIRDI.
++	// (b) TAM işarələmə — set-based, tək gediş, yaddaşsız.
++	//
++	// Issue 15: hədəf sütunlar YAZILMIR. `ON CONFLICT (a,b)` forması uyğun
++	// UNIQUE indeks YOXDURSA Postgres-də DƏRHAL XƏTA verir ("there is no
++	// unique or exclusion constraint matching...") — yəni kod migration-dan
++	// əvvəl deploy olunsa oxundu-işarələmə tamamilə qırılardı. Hədəfsiz
++	// `ON CONFLICT DO NOTHING` isə indekssiz də işləyir (adi INSERT kimi
++	// davranır), indeks yaradıldıqdan sonra isə dublikatları susdurur.
+ 	// UNIQUE indeks üçün: MIGRATION_message_reads_unique.md
+-	// DEPLOY TƏHLÜKƏSİZLİYİ: hədəf sütunlar YAZILMIR. `ON CONFLICT (a,b)`
+-	// forması uyğun UNIQUE indeks YOXDURSA Postgres-də DƏRHAL XƏTA verir
+-	// ("there is no unique or exclusion constraint matching...") — yəni kod
+-	// migration-dan əvvəl deploy olunsa oxundu-işarələmə tamamilə qırılardı.
+-	// Hədəfsiz `ON CONFLICT DO NOTHING` isə indekssiz də işləyir (adi INSERT
+-	// kimi davranır), indeks yaradıldıqdan sonra isə dublikatları susdurur.
+-	database.DB.Clauses(clause.OnConflict{DoNothing: true}).CreateInBatches(reads, 100)
++	if err := database.DB.Exec(`
++		INSERT INTO message_reads (message_id, user_id, conversation_id, read_at, created_at)
++		SELECT m.id, ?, ?, ?, ?
++		FROM messages m
++		JOIN conversation_participants cp
++		  ON cp.conversation_id = m.conversation_id AND cp.user_id = ?
++		LEFT JOIN message_reads mr ON mr.message_id = m.id AND mr.user_id = ?
++		WHERE m.conversation_id = ?
++		  AND m.sender_id != ?
++		  AND mr.id IS NULL
++		  AND m.deleted_at IS NULL
++		  AND m.created_at >= COALESCE(cp.joined_at, '1970-01-01'::timestamptz)
++		  AND m.created_at > COALESCE(cp.cleared_at, '1970-01-01'::timestamptz)
++		ON CONFLICT DO NOTHING
++	`, userID, conversationID, now, now, userID, userID, conversationID, userID).Error; err != nil {
++		log.Printf("qrup oxundu işarələmə xətası (conv=%d, user=%d): %v", conversationID, userID, err)
++		return
++	}
+ 
+-	// participant last_read güncelle
+-	lastID := unreadIDs[len(unreadIDs)-1]
++	// participant last_read güncelle.
++	// Issue 57 əlavəsi: əvvəl `unreadIDs[len-1]` götürülürdü, HALBUKİ sorğuda
++	// HEÇ BİR `ORDER BY` yox idi → `last_read_message_id` TƏSADÜFİ bir sətir
++	// olurdu. İndi sıralama açıqdır və ilk element ƏN YENİ mesajdır.
++	lastID := unreadIDs[0]
+ 	database.DB.Model(&models.ConversationParticipant{}).
+ 		Where("conversation_id = ? AND user_id = ?", conversationID, userID).
+ 		Updates(map[string]interface{}{
+@@ -967,14 +1086,24 @@
+ 	// new-group-message payload-u ilə eyni: "group_{id}".
+ 	h.wsHub.SendDismissThreadPush(userID, fmt.Sprintf("group_%d", conversationID))
+ 
+-	// Gönderenlere WebSocket ile bildir
+-	memberIDs := getActiveGroupMemberIDs(conversationID)
+-	h.wsHub.SendToMultipleUsers(memberIDs, "group_message_read", map[string]interface{}{
++	// Gönderenlere WebSocket ile bildir.
++	//
++	// Issue 57: `message_ids` artıq TAM siyahı DEYİL — ən son `readBroadcastCap`
++	// mesajla məhdudlaşır (səbəb üçün yuxarıdakı şərhə bax). Ona görə əlavə
++	// olaraq `read_up_to` göndərilir: istemçi bu tarixdən ƏVVƏLKİ bütün öz
++	// mesajlarını da "oxundu" işarələyə bilər. `truncated` bayrağı köhnə
++	// istemçilər üçün additivdir (tanımayan istemçi əvvəlki kimi davranır).
++	truncated := len(unreadIDs) >= readBroadcastCap
++	readPayload := map[string]interface{}{
+ 		"conversation_id": conversationID,
+ 		"reader_id":       userID,
+ 		"message_ids":     unreadIDs,
+ 		"read_at":         now,
+-	})
++		"read_up_to":      now.UTC().Format(time.RFC3339),
++		"truncated":       truncated,
++	}
++	memberIDs := getActiveGroupMemberIDs(conversationID)
++	h.wsHub.SendToMultipleUsers(memberIDs, "group_message_read", readPayload)
+ }
+ 
+ // POST /api/v1/groups/:conversation_id/mark-read
+--- /dev/null	2026-07-26 13:30:38.463095057 +0000
++++ b/handlers/idempotency.go	2026-07-26 13:46:27.300111020 +0000
+@@ -0,0 +1,58 @@
++package handlers
++
++import (
++	"errors"
++	"strings"
++
++	"github.com/google/uuid"
++)
++
++// ── Issue 9 — Göndərmə idempotentliyi (client_message_id) ────────────────────
++//
++// PROBLEM
++// Hər göndərmə yolu (REST `SendMessage`, REST qrup `SendGroupMessage`, WS
++// `send_message`, WS qrup) server tərəfdə `uuid.New()` çağırırdı. Yəni mesajın
++// kimliyini SERVER təyin edirdi. Nəticə: istemçi cavabı ala bilmədikdə
++// (şəbəkə qopdu, timeout, tətbiq öldürüldü, WS reconnect) təkrar göndərməkdən
++// başqa çarəsi yox idi və HƏR TƏKRAR YENİ SƏTİR yaradırdı → söhbətdə eyni
++// mesaj 2–3 dəfə görünürdü. Bu, "zəif şəbəkədə mesaj təkrarlanır" şikayətinin
++// birbaşa səbəbidir.
++//
++// HƏLL (WhatsApp/Signal modeli — sxem miqrasiyası TƏLƏB ETMİR)
++// Mesajın UUID-ni İSTEMÇİ yaradır və `client_message_id` sahəsində göndərir.
++// Server onu birbaşa `messages.id` (PRIMARY KEY) kimi istifadə edir və
++// `ON CONFLICT (id) DO NOTHING` ilə yazır:
++//   - ilk cəhd → sətir yaranır, normal axın (WS yayımı, push, sayğaclar);
++//   - təkrar cəhd → `RowsAffected == 0`, mövcud sətir oxunur və EYNİ cavab
++//     qaytarılır; yayım/push/sayğac TƏKRARLANMIR.
++// PRIMARY KEY-in unikal indeksi HƏMİŞƏ mövcuddur, ona görə hədəfli
++// `ON CONFLICT (id)` burada təhlükəsizdir (bax MIGRATION_* sənədlərindəki
++// hədəfsiz forma müzakirəsi — o, indeksi OLMAYAN sütunlara aiddir).
++//
++// GERİYƏ UYĞUNLUQ
++// Sahə opsionaldır. Göndərilməyəndə server əvvəlki kimi `uuid.New()` işlədir —
++// köhnə istemçilər heç nə hiss etmir.
++
++// errInvalidClientMessageID — `client_message_id` göndərilib, amma UUID deyil.
++var errInvalidClientMessageID = errors.New("client_message_id UUID formatında olmalıdır")
++
++// resolveMessageID — istemçinin verdiyi `client_message_id`-ni mesaj ID-sinə
++// çevirir. Boş/verilməyibsə yeni server UUID-i qaytarır.
++//
++// Qaytarır: (messageID, istemçiTərəfindənVerildi, xəta).
++func resolveMessageID(clientMessageID *string) (string, bool, error) {
++	if clientMessageID == nil {
++		return uuid.New().String(), false, nil
++	}
++	raw := strings.TrimSpace(*clientMessageID)
++	if raw == "" {
++		return uuid.New().String(), false, nil
++	}
++	parsed, err := uuid.Parse(raw)
++	if err != nil {
++		return "", false, errInvalidClientMessageID
++	}
++	// Normallaşdırılmış (kiçik hərf, defisli) forma — istemçi böyük hərf və ya
++	// mötərizəli forma göndərsə belə eyni sətrə düşsün.
++	return parsed.String(), true, nil
++}
+--- /dev/null	2026-07-26 13:30:38.463095057 +0000
++++ b/handlers/internal_spam_ban.go	2026-07-26 13:57:59.792090070 +0000
+@@ -0,0 +1,87 @@
++package handlers
++
++import (
++	"net/http"
++	"strconv"
++
++	"github.com/gin-gonic/gin"
++
++	"beanpon_messenger/cache"
++)
++
++// ── Issue 62 — spam-ban keşini kənardan təmizləmək mümkün deyildi ────────────
++//
++// PROBLEM
++// `IsMessagingBanned` / `IsMessagingBannedByActions` əvvəlcə paylaşılan Redis
++// keşinə baxır və MISS olduqda DB-dən oxuyub nəticəni TTL ilə geri yazır
++// (`writeSpamBanCache`). `cache.InvalidateSpamBan` funksiyası MÖVCUD idi,
++// amma repo-da HEÇ BİR çağırış yeri yox idi və onu tetikləyəcək endpoint də
++// yox idi. Yəni messenger tərəfdə keşi məcburi təmizləməyin YOLU YOX İDİ.
++//
++// Nəticə iki istiqamətdə də zərərli:
++//   • BAN QALDIRILANDA — Laravel keşi yeniləyə bilməsə (Redis anlıq əlçatmaz,
++//     circuit breaker açıq, deploy anı) istifadəçi TTL boyu YANLIŞ ŞƏKİLDƏ
++//     susdurulmuş qalırdı; dəstək komandasının əlində heç bir alət yox idi.
++//   • BAN QOYULANDA — eyni səbəbdən spam göndərən istifadəçi TTL boyu yazmağa
++//     DAVAM edirdi. Üstəlik messenger özü `Banned:false` dəyərini keşə yazdığı
++//     üçün ban məhz spam burst-ünün ortasında gecikirdi.
++//
++// HƏLL
++// İki internal endpoint (Laravel `X-Internal-Secret` ilə çağırır):
++//
++//	POST /internal/users/:user_id/spam-ban/invalidate
++//	  Body YOXDURSA  → key silinir; növbəti oxuma DB-dən gəlir (təhlükəsiz
++//	                   default — mənbə həqiqəti DB-dir).
++//	  Body VARSA     → {"banned":true,"actions":["message"]} dəyəri BİRBAŞA
++//	                   keşə yazılır (DB gedişi olmadan dərhal effekt).
++//
++// Endpoint idempotentdir və Redis söndürülübsə səssizcə uğur qaytarır
++// (`cache.InvalidateSpamBan` / `SetSpamBan` bu halda no-op-dur).
++
++// InvalidateSpamBanCache — POST /internal/users/:user_id/spam-ban/invalidate
++func InvalidateSpamBanCache(c *gin.Context) {
++	raw := c.Param("user_id")
++	parsed, err := strconv.ParseUint(raw, 10, 32)
++	if err != nil || parsed == 0 {
++		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz user_id"})
++		return
++	}
++	userID := uint(parsed)
++
++	// Body opsionaldır. Verilirsə dəyər birbaşa yazılır; verilmirsə key silinir.
++	var body struct {
++		Banned  *bool     `json:"banned"`
++		Actions *[]string `json:"actions"`
++	}
++	// ShouldBindJSON boş gövdədə xəta qaytarır — bu, "body yoxdur" deməkdir,
++	// xəta sayılmır.
++	hasBody := c.ShouldBindJSON(&body) == nil && body.Banned != nil
++
++	if hasBody {
++		payload := cache.SpamBanPayload{
++			Banned:  *body.Banned,
++			Actions: body.Actions,
++		}
++		if err := cache.SetSpamBan(c.Request.Context(), userID, payload); err != nil {
++			c.JSON(http.StatusInternalServerError, gin.H{"error": "cache yazılamadı"})
++			return
++		}
++		c.JSON(http.StatusOK, gin.H{
++			"message": "spam ban cache güncellendi",
++			"user_id": userID,
++			"mode":    "set",
++			"banned":  payload.Banned,
++		})
++		return
++	}
++
++	if err := cache.InvalidateSpamBan(c.Request.Context(), userID); err != nil {
++		c.JSON(http.StatusInternalServerError, gin.H{"error": "cache temizlenemedi"})
++		return
++	}
++	c.JSON(http.StatusOK, gin.H{
++		"message": "spam ban cache temizlendi",
++		"user_id": userID,
++		"mode":    "invalidate",
++	})
++}
+--- a/handlers/message_handler.go	2026-07-26 11:13:48.000000000 +0000
++++ b/handlers/message_handler.go	2026-07-26 14:26:12.000038877 +0000
+@@ -16,6 +16,7 @@
+ 	"github.com/gin-gonic/gin"
+ 	"github.com/google/uuid"
+ 	"gorm.io/gorm"
++	"gorm.io/gorm/clause"
+ )
+ 
+ // moderationEnqueuer — şübhəli mesaj analizi üçün queue-ya iş qoymaq üçün
+@@ -88,6 +89,9 @@
+ 		// (mesaj normal çatır, WS yayılır). Opsional — köhnə client-lər
+ 		// göndərməsə false olur (adi davranış).
+ 		Silent bool `json:"silent,omitempty"`
++		// Issue 9: istemçi tərəfli idempotentlik açarı (UUID). Bax
++		// handlers/idempotency.go. Opsional — verilməzsə server UUID yaradır.
++		ClientMessageID *string `json:"client_message_id,omitempty"`
+ 	}
+ 
+ 	if err := c.ShouldBindJSON(&req); err != nil {
+@@ -95,6 +99,14 @@
+ 		return
+ 	}
+ 
++	// Issue 9: mesaj ID-si — istemçi verdisə onu işlət (təkrar göndərmə
++	// dublikat yaratmasın), yoxsa server UUID-i.
++	messageID, _, err := resolveMessageID(req.ClientMessageID)
++	if err != nil {
++		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
++		return
++	}
++
+ 	// Kendi kendine mesaj göndermesini engelle
+ 	//if senderID.(uint) == req.ReceiverID {
+ 	//	c.JSON(http.StatusBadRequest, gin.H{"error": "Kendi kendinize mesaj gönderemezsiniz"})
+@@ -214,9 +226,16 @@
+ 		}
+ 	}
+ 
++	// Issue 56: bütün icazə qapılarından (blok, spam-ban, CanSendMessage,
++	// story yoxlaması) SONRA — mətn hələ ŞİFRƏLƏNMƏYİB, S3 media açarlarını
++	// məhz burada çıxarıb "istifadə olunub" işarələyirik. Şifrələmədən sonra
++	// bu mümkün deyil. Rədd edilən göndərmələrdə işarələməmək vacibdir: əks
++	// halda heç vaxt istifadə olunmayan media əbədi qalardı.
++	services.MarkMediaReferenced(req.Text)
++
+ 	// Veritabanına kaydet
+ 	message := models.Message{
+-		ID:               uuid.New().String(),
++		ID:               messageID,
+ 		SenderID:         senderID.(uint),
+ 		ReceiverID:       &req.ReceiverID,
+ 		EncryptedText:    encryptedText,
+@@ -235,17 +254,90 @@
+ 	// Redis I/O (mesaj banı yoxlaması) transaction-dan KƏNARDA — açıq bir
+ 	// transaction-ı şəbəkə gözləməsi ilə saxlamaq hovuzu kilidləyir.
+ 	skipConvCreate := conversationHandler.ShouldSkipConversationCreate(senderID.(uint), req.ReceiverID)
++
++	// Issue 9: `duplicate` — istemçi eyni `client_message_id` ilə TƏKRAR
++	// göndərdi. Sətir onsuz da var; sayğac/yayım/push TƏKRARLANMAMALIDIR.
++	var duplicate *models.Message
++	// Issue 10: push qapısı üçün GERÇƏK söhbət statusu. Aşağıda
++	// `HandleNewMessage`-ə əvvəl SABİT `"active"` ötürülürdü — WS yolu isə
++	// həqiqi statusu ötürür. Bu uyğunsuzluq eyni mesajın nəqliyyatdan asılı
++	// olaraq push doğurub-doğurmamasına səbəb olurdu.
++	conversationStatus := ""
+ 	if err := database.DB.Transaction(func(tx *gorm.DB) error {
+-		if err := tx.Create(&message).Error; err != nil {
+-			return err
++		res := tx.Clauses(clause.OnConflict{
++			Columns:   []clause.Column{{Name: "id"}},
++			DoNothing: true,
++		}).Create(&message)
++		if res.Error != nil {
++			return res.Error
++		}
++		if res.RowsAffected == 0 {
++			// Yumşaq silinmiş sətir də tapılmalıdır — əks halda silinmiş
++			// mesajın ID-si ilə INSERT sonsuz "tapılmadı" döngüsünə düşərdi.
++			var existing models.Message
++			if err := tx.Unscoped().Where("id = ?", message.ID).First(&existing).Error; err != nil {
++				return err
++			}
++			duplicate = &existing
++			return nil
+ 		}
+-		return conversationHandler.UpdateConversationOnMessageTx(tx, senderID.(uint), req.ReceiverID, skipConvCreate)
++		status, uErr := conversationHandler.UpdateConversationOnMessageTx(tx, senderID.(uint), req.ReceiverID, skipConvCreate)
++		if uErr != nil {
++			return uErr
++		}
++		conversationStatus = status
++		return nil
+ 	}); err != nil {
+ 		log.Printf("Mesaj/conversation transaction xətası: %v", err)
+ 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Mesaj kaydedilemedi"})
+ 		return
+ 	}
+ 
++	if duplicate != nil {
++		// ── Təkrar cəhdin ƏSL təkrar olduğunu TAM YOXLA ────────────────────
++		// Yalnız `sender_id`-ni yoxlamaq KİFAYƏT DEYİL: eyni istifadəçi eyni
++		// `client_message_id`-ni FƏRQLİ bir söhbətdə (qrupda, ya da BAŞQA
++		// alıcıya DM-də) işlətsə — istemçi səhvi, offline növbədə id təkrar
++		// istifadəsi və s. — server 200 `duplicate:true` qaytarardı və YENİ
++		// mesaj HEÇ VAXT yaradılmazdı. Yəni istifadəçi "göndərildi" görür,
++		// mesaj isə heç yerə çatmır (SƏSSİZ İTKİ). Ona görə alıcı VƏ söhbət
++		// növü də uyğun gəlməlidir; gəlmirsə 409.
++		sameSender := duplicate.SenderID == senderID.(uint)
++		sameReceiver := duplicate.ReceiverID != nil && *duplicate.ReceiverID == req.ReceiverID
++		isDM := duplicate.ConversationID == nil
++		if !sameSender || !sameReceiver || !isDM {
++			c.JSON(http.StatusConflict, gin.H{
++				"error": "client_message_id artıq başqa mesaj üçün istifadə olunub",
++				"code":  "CLIENT_MESSAGE_ID_TAKEN",
++			})
++			return
++		}
++
++		// Eyni göndərənin eyni alıcıya təkrar cəhdi → EYNİ nəticə, yan effekt YOX.
++		// Mətn DB-dəki SAXLANMIŞ nüsxədən qaytarılır (istemçinin bu dəfə
++		// göndərdiyi mətndən DEYİL) — əks halda cavab serverdə olmayan bir
++		// məzmunu təsdiqləmiş olardı.
++		dupText, decErr := h.encryptionService.DecryptMessage(duplicate.EncryptedText)
++		if decErr != nil {
++			dupText = req.Text
++		}
++		c.JSON(http.StatusOK, gin.H{
++			"message":   "Mesaj başarıyla gönderildi",
++			"duplicate": true,
++			"data": gin.H{
++				"id":                  duplicate.ID,
++				"sender_id":           duplicate.SenderID,
++				"receiver_id":         duplicate.ReceiverID,
++				"reply_to_message_id": duplicate.ReplyToMessageID,
++				"text":                dupText,
++				"read":                duplicate.Read,
++				"created_at":          duplicate.CreatedAt,
++				"is_online":           h.wsHub.IsUserOnline(req.ReceiverID),
++			},
++		})
++		return
++	}
++
+ 	// WebSocket üzerinden real-time yayınla (hem gönderen hem alıcıya)
+ 	h.wsHub.HandleNewMessage(
+ 		message.SenderID,
+@@ -256,8 +348,8 @@
+ 		message.CreatedAt,
+ 		req.ReplyToMessageID, // YENİ parametre
+ 		req.StoryID,
+-		"active",
+-		req.Silent, // səssiz göndərmə → push getməsin
++		conversationStatus, // Issue 10: sabit "active" DEYİL, gerçək status
++		req.Silent,         // səssiz göndərmə → push getməsin
+ 	)
+ 
+ 	// 🔍 MODERASIYA — mesaj şifrələnib göndərildi, indi arxa planda analizə
+@@ -353,6 +445,8 @@
+ 		if encErr != nil {
+ 			continue
+ 		}
++		// Issue 56: media istinadını işarələ (şifrələmədən əvvəlki mətndən).
++		services.MarkMediaReferenced(req.Text)
+ 
+ 		rid := receiverID
+ 		message := models.Message{
+@@ -368,8 +462,17 @@
+ 			continue
+ 		}
+ 
+-		if err := conversationHandler.UpdateConversationOnMessage(senderID, receiverID); err != nil {
+-			log.Printf("Broadcast conversation güncellemesi başarısız (rcv=%d): %v", receiverID, err)
++		// Issue 10: push qapısı GERÇƏK statusdan qidalansın (sabit "active"
++		// deyil) — REST/WS arasında bildiriş davranışı fərqlənməsin.
++		convStatus, cuErr := conversationHandler.UpdateConversationOnMessageTx(
++			database.DB, senderID, receiverID,
++			conversationHandler.ShouldSkipConversationCreate(senderID, receiverID),
++		)
++		if cuErr != nil {
++			// Statusu oxuya bilmədik — köhnə davranışa (push GET) qayıt ki,
++			// keçici bir DB xətası bildirişi səssizcə udmasın.
++			log.Printf("Broadcast conversation güncellemesi başarısız (rcv=%d): %v", receiverID, cuErr)
++			convStatus = "active"
+ 		}
+ 
+ 		h.wsHub.HandleNewMessage(
+@@ -381,7 +484,7 @@
+ 			message.CreatedAt,
+ 			nil,
+ 			nil,
+-			"active",
++			convStatus,
+ 			req.Silent,
+ 		)
+ 
+--- a/handlers/upload_handler.go	2026-07-26 06:52:50.000000000 +0000
++++ b/handlers/upload_handler.go	2026-07-26 14:04:01.680008144 +0000
+@@ -66,6 +66,45 @@
+ // tooLargeMB — istifadəçiyə göstərilən limit (MB).
+ func tooLargeMB(maxBytes int64) int64 { return maxBytes >> 20 }
+ 
++// ── Issue 55: MƏZMUN TİPİ FAYL ADINDAN GÜVƏNİLMİR ──────────────────────────
++//
++// Əvvəl həm QƏBUL/RƏDD qərarı, həm S3-ə yazılan `Content-Type` YALNIZ fayl
++// adının uzantısından gəlirdi. `voiceExtWhitelist` isə tərif olunub HEÇ
++// istifadə edilmirdi (ölü kod) — yəni `upload-voice` istənilən baytı
++// istənilən uzantı ilə qəbul edirdi (pulsuz fayl hostinqi).
++//
++// İndi ilk 512 bayt `http.DetectContentType` ilə "iyləndirilir" və uzantı ilə
++// AİLƏ səviyyəsində (image/video/audio) uyğunluğu yoxlanır. Sniff nəticəsi
++// qeyri-müəyyəndirsə (`application/octet-stream`) uzantıya güvənilir —
++// bəzi konteynerlər (m4a/3gp/webm) sabit imza vermir, yoxsa legitim
++// yükləmələri rədd edərdik.
++func sniffFamily(data []byte) string {
++	if len(data) == 0 {
++		return ""
++	}
++	head := data
++	if len(head) > 512 {
++		head = head[:512]
++	}
++	ct := http.DetectContentType(head)
++	switch {
++	case strings.HasPrefix(ct, "image/"):
++		return "image"
++	case strings.HasPrefix(ct, "video/"):
++		return "video"
++	case strings.HasPrefix(ct, "audio/"):
++		return "audio"
++	case ct == "application/ogg":
++		return "audio"
++	case strings.HasPrefix(ct, "text/html"), strings.HasPrefix(ct, "image/svg"):
++		// Aşkar TƏHLÜKƏLİ: etibarlı S3 yolu altında inline servis edilsə
++		// saxlanmış-XSS potensialı. Heç vaxt media/səs kimi qəbul etmə.
++		return "unsafe"
++	default:
++		return "" // qeyri-müəyyən → uzantıya güvən
++	}
++}
++
+ // UploadHandler — voice/media S3 upload + waveform.
+ type UploadHandler struct {
+ 	s3 *services.S3Uploader
+@@ -134,6 +173,11 @@
+ 	if ext == "" {
+ 		ext = "bin"
+ 	}
++	// Issue 55: `voiceExtWhitelist` NƏHAYƏT tətbiq olunur (əvvəl ölü kod idi).
++	if !voiceExtWhitelist[ext] {
++		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "Desteklenmeyen ses formatı"})
++		return
++	}
+ 	filename := uuid.NewString() + "." + ext
+ 
+ 	// Faylın bütün baytlarını oxu.
+@@ -143,6 +187,13 @@
+ 		return
+ 	}
+ 
++	// Issue 55: baytları iylə — uzantı yalan danışa bilər.
++	switch sniffFamily(data) {
++	case "unsafe", "image", "video":
++		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "Desteklenmeyen ses formatı"})
++		return
++	}
++
+ 	// --- S3-ə orijinal səsi qoy (kritik addım; alınmasa 500).
+ 	s3Key := fmt.Sprintf("voices/user_%d/%s", userID, filename)
+ 	if err := h.s3.Put(s3Key, data, mimeForExt(ext)); err != nil {
+@@ -150,10 +201,15 @@
+ 		return
+ 	}
+ 	if !h.s3.Exists(s3Key) {
++		// Issue 56: yarımçıq yazılmış obyekt qalmasın.
++		_ = h.s3.Delete(s3Key)
+ 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ses dosyası kaydedilemedi"})
+ 		return
+ 	}
+ 
++	// Issue 56: obyekti izləməyə al (mesaj göndərilməzsə 24 saat sonra silinir).
++	services.TrackMediaUpload(userID, s3Key)
++
+ 	// --- pixels-per-second: qısa səslərdə daha çox bar (Laravel ilə eyni).
+ 	pps := 10
+ 	switch {
+@@ -244,6 +300,27 @@
+ 		return
+ 	}
+ 
++	// Issue 55: iylənmiş ailə elan olunan uzantı ilə uyğun gəlməlidir.
++	// (`.jpg` adı ilə göndərilən HTML/SVG burada tutulur.)
++	switch fam := sniffFamily(data); fam {
++	case "unsafe":
++		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "Desteklenmeyen dosya formatı"})
++		return
++	case "image":
++		if !isImage {
++			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "Dosya içeriği uzantıyla uyuşmuyor"})
++			return
++		}
++	case "video":
++		if !isVideo {
++			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "Dosya içeriği uzantıyla uyuşmuyor"})
++			return
++		}
++	case "audio":
++		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "Dosya içeriği uzantıyla uyuşmuyor"})
++		return
++	}
++
+ 	folder := "videos"
+ 	mediaType := "video"
+ 	if isImage {
+@@ -257,6 +334,19 @@
+ 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Medya dosyası kaydedilemedi"})
+ 		return
+ 	}
++	// Issue 43: obyektin HƏQİQƏTƏN yazıldığını təsdiqlə (UploadVoice onsuz da
++	// belə edir). Bu yoxlama olmadan istemçi mövcud olmayan bir obyekt üçün
++	// düzgün görünən URL alırdı → "medya sonsuza qədər yüklənir", səssiz.
++	if !h.s3.Exists(s3Key) {
++		// Issue 56: yarımçıq yazılmış obyekt qalmasın.
++		_ = h.s3.Delete(s3Key)
++		c.JSON(http.StatusInternalServerError, gin.H{"error": "Medya dosyası kaydedilemedi"})
++		return
++	}
++
++	// Issue 56: obyekti izləməyə al. Mesaj göndərilməzsə 24 saat sonra
++	// sahibsiz sayılıb S3-dən silinəcək (bax services/media_gc.go).
++	services.TrackMediaUpload(userID, s3Key)
+ 
+ 	c.JSON(http.StatusOK, gin.H{
+ 		"url":           utils.FilePathS3(s3Key),
+--- a/middleware/bandwidth_middleware.go	2026-06-17 14:14:41.000000000 +0000
++++ b/middleware/bandwidth_middleware.go	2026-07-26 14:27:50.833001687 +0000
+@@ -1,8 +1,12 @@
+ package middleware
+ 
+ import (
++	"errors"
++	"fmt"
++	"log"
+ 	"strconv"
+ 	"strings"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/gin-gonic/gin"
+@@ -24,6 +28,27 @@
+ // QEYD: WebSocket route-ları (/ws*) ölçülmür — uzun-ömürlü bağlantılarda
+ // c.Writer.Size() mənalı deyil.
+ // ============================================================
++//
++// ── Issue 61 — SƏSSİZ UĞURSUZLUQ ────────────────────────────────────────────
++//
++// Əvvəlki yazıcı hər qeyd üçün iki `sess.Exec(...)` çağırırdı və HƏR İKİSİNİN
++// qaytardığı xətanı TAMAMİLƏ ATIRDI (`Exec`-in nəticəsi heç yerə yazılmırdı).
++// Praktik nəticələri:
++//
++//   • `bandwidth_logs` / `bandwidth_daily` cədvəli yoxdursa, sütun adı
++//     dəyişibsə, və ya `ON CONFLICT (user_id, day, category, source)` üçün
++//     UNİKAL İNDEKS yoxdursa (hədəfli ON CONFLICT indekssiz Postgres-də
++//     DƏRHAL xəta verir) — bütün yazılar SONSUZA QƏDƏR uğursuz olur və heç
++//     bir log, heç bir metrik, heç bir əlamət qalmır. Trafik hesabatı ölür,
++//     amma "işləyir" görünür. Bu problem yalnız kimsə "niyə rəqəmlər 0?"
++//     deyə soruşanda — aylar sonra — aşkarlanırdı.
++//
++//   • Kanal dolduqda (`default:` budağı) qeydlər səssizcə ATILIRDI. Yük
++//     altında hesabat nə qədər əskik saydığını heç kim bilmirdi.
++//
++// İndi: xətalar (throttle ilə, log seli olmadan) loglanır, atılan qeyd sayı
++// sayılır və dövri olaraq bildirilir; üstəlik yazılar TOPLU (multi-row) hala
++// gətirilib — 200 qeyd üçün 400 gediş əvəzinə 2 gediş.
+ 
+ const mediaSampleMsg = 5 // messenger-də media yoxdur, amma simvolik saxlanır
+ 
+@@ -42,6 +67,42 @@
+ 
+ var bandwidthChan = make(chan BandwidthRecord, 4096)
+ 
++// bandwidthDropped — kanal dolu olduğu üçün atılan qeydlərin sayı (Issue 61).
++var bandwidthDropped atomic.Int64
++
++// bandwidthAnonSkipped — `user_id` NULL olduğu üçün bandwidth_daily-ə
++// yazılmayan sorğuların sayı (bandwidth_logs-da tam qalır). Görünsün deyə
++// dövri hesabata daxil edilir.
++var bandwidthAnonSkipped atomic.Int64
++
++// bandwidthLogThrottle — eyni xətanın log-u basmaması üçün minimal interval.
++const bandwidthLogThrottle = 60 * time.Second
++
++var (
++	lastBandwidthErrLog atomic.Int64 // unix nano
++	bandwidthErrCount   atomic.Int64
++)
++
++// logBandwidthErr — xətanı throttle ilə loglayır. Aralıqda baş verən xətalar
++// sayılır və növbəti log sətrində "N xəta" kimi göstərilir; beləliklə problem
++// GÖRÜNÜR, amma log seli yaranmır.
++func logBandwidthErr(op string, err error) {
++	if err == nil {
++		return
++	}
++	total := bandwidthErrCount.Add(1)
++
++	now := time.Now().UnixNano()
++	last := lastBandwidthErrLog.Load()
++	if last != 0 && now-last < int64(bandwidthLogThrottle) {
++		return
++	}
++	if !lastBandwidthErrLog.CompareAndSwap(last, now) {
++		return // başqa goroutine loglayır
++	}
++	log.Printf("bandwidth: %s yazma xətası (indiyə qədər %d xəta): %v", op, total, err)
++}
++
+ // StartBandwidthWriter — main.go-da bir dəfə go ilə çağrılır.
+ func StartBandwidthWriter(db *gorm.DB) {
+ 	const batchSize = 200
+@@ -51,6 +112,11 @@
+ 	ticker := time.NewTicker(flushEvery)
+ 	defer ticker.Stop()
+ 
++	// Atılan qeydlər üçün ayrı, daha seyrək hesabat.
++	dropTicker := time.NewTicker(5 * time.Minute)
++	defer dropTicker.Stop()
++	var lastReportedDrops int64
++
+ 	flush := func() {
+ 		if len(batch) == 0 {
+ 			return
+@@ -68,32 +134,131 @@
+ 			}
+ 		case <-ticker.C:
+ 			flush()
++		case <-dropTicker.C:
++			// Issue 61: səssiz itki artıq görünür.
++			if d := bandwidthDropped.Load(); d > lastReportedDrops {
++				log.Printf("bandwidth: kanal dolu olduğu üçün %d qeyd atıldı (cəmi %d, anonim gündəlik atlanan %d) — yazıcı yükə çatmır",
++					d-lastReportedDrops, d, bandwidthAnonSkipped.Load())
++				lastReportedDrops = d
++			}
+ 		}
+ 	}
+ }
+ 
++// dailyKey — bandwidth_daily unikal açarı (yaddaşda toplama üçün).
++type dailyKey struct {
++	userID   int64
++	day      string
++	category string
++	source   string
++}
++
+ func writeBandwidthBatch(db *gorm.DB, batch []BandwidthRecord) {
++	if len(batch) == 0 {
++		return
++	}
+ 	sess := db.Session(&gorm.Session{SkipDefaultTransaction: true})
+ 
++	// ── 1) bandwidth_logs — TƏK multi-row INSERT ────────────────────────────
++	// Əvvəl qeyd başına ayrıca `Exec` idi (200 qeyd = 200 gediş, hər biri
++	// hovuzdan bağlantı tutur). 200 × 10 = 2000 bind parametri — Postgres-in
++	// 65535 limitindən çox aşağıdadır.
++	placeholders := make([]string, 0, len(batch))
++	args := make([]interface{}, 0, len(batch)*10)
+ 	for _, r := range batch {
+-		sess.Exec(`INSERT INTO bandwidth_logs
+-			(user_id, method, path, category, source, status_code, bytes_sent, bytes_recv, is_range, created_at)
+-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
++		placeholders = append(placeholders, "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
++		args = append(args,
+ 			r.UserID, r.Method, r.Path, r.Category, r.Source,
+ 			r.StatusCode, r.BytesSent, r.BytesRecv, r.IsRange, r.CreatedAt,
+ 		)
++	}
++	const logsCols = `INSERT INTO bandwidth_logs
++		(user_id, method, path, category, source, status_code, bytes_sent, bytes_recv, is_range, created_at)
++		VALUES `
++	if err := sess.Exec(logsCols+strings.Join(placeholders, ","), args...).Error; err != nil {
++		logBandwidthErr("bandwidth_logs (toplu)", err)
++		// Toplu INSERT bir pozuq sətir ucbatından BÜTÜN partiyanı itirir
++		// (köhnə sətir-bə-sətir yazıcı yalnız pozuq sətri itirirdi). Ona görə
++		// uğursuzluqda BİR DƏFƏ sətir-bə-sətir təkrar cəhd edirik: yalnız
++		// həqiqətən problemli qeyd(lər) düşür.
++		var perRowFailures int
++		for _, r := range batch {
++			if e := sess.Exec(logsCols+"(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
++				r.UserID, r.Method, r.Path, r.Category, r.Source,
++				r.StatusCode, r.BytesSent, r.BytesRecv, r.IsRange, r.CreatedAt,
++			).Error; e != nil {
++				perRowFailures++
++			}
++		}
++		if perRowFailures > 0 {
++			logBandwidthErr(fmt.Sprintf("bandwidth_logs (sətir-bə-sətir, %d/%d düşdü)", perRowFailures, len(batch)),
++				errors.New("toplu yazı uğursuz oldu, təkrar cəhd qismən keçdi"))
++		}
++	}
+ 
+-		day := r.CreatedAt.Format("2006-01-02")
+-		sess.Exec(`INSERT INTO bandwidth_daily
+-			(user_id, day, category, source, bytes_sent, bytes_recv, req_count)
+-			VALUES (?, ?, ?, ?, ?, ?, 1)
+-			ON CONFLICT (user_id, day, category, source)
+-			DO UPDATE SET
+-				bytes_sent = bandwidth_daily.bytes_sent + EXCLUDED.bytes_sent,
+-				bytes_recv = bandwidth_daily.bytes_recv + EXCLUDED.bytes_recv,
+-				req_count  = bandwidth_daily.req_count  + 1`,
+-			r.UserID, day, r.Category, r.Source, r.BytesSent, r.BytesRecv,
+-		)
++	// ── 2) bandwidth_daily — əvvəlcə YADDAŞDA topla, sonra tək upsert ───────
++	// Eyni (user, gün, kateqoriya, mənbə) açarı bir partiyada onlarla dəfə
++	// təkrarlanır; yaddaşda toplamaq həm gediş sayını, həm də eyni sətir
++	// üzərindəki kilid rəqabətini kəskin azaldır.
++	type dailyAgg struct {
++		bytesSent int64
++		bytesRecv int64
++		count     int64
++	}
++	agg := make(map[dailyKey]*dailyAgg, len(batch))
++	order := make([]dailyKey, 0, len(batch))
++
++	for _, r := range batch {
++		// user_id NULL olan sətirlər üçün upsert etmirik: Postgres-də NULL
++		// dəyərlər unikal indeksdə BİR-BİRİNDƏN FƏRQLİ sayılır, ona görə
++		// hər anonim sorğu bandwidth_daily-də YENİ sətir yaradardı —
++		// cədvəl sonsuz böyüyür və gündəlik hesabat mənasızlaşır.
++		// Anonim trafik bandwidth_logs-da tam olaraq qalır.
++		if r.UserID == nil {
++			bandwidthAnonSkipped.Add(1)
++			continue
++		}
++		k := dailyKey{
++			userID:   *r.UserID,
++			day:      r.CreatedAt.Format("2006-01-02"),
++			category: r.Category,
++			source:   r.Source,
++		}
++		cur, ok := agg[k]
++		if !ok {
++			cur = &dailyAgg{}
++			agg[k] = cur
++			order = append(order, k)
++		}
++		cur.bytesSent += r.BytesSent
++		cur.bytesRecv += r.BytesRecv
++		cur.count++
++	}
++
++	if len(order) == 0 {
++		return
++	}
++
++	dPlaceholders := make([]string, 0, len(order))
++	dArgs := make([]interface{}, 0, len(order)*7)
++	for _, k := range order {
++		v := agg[k]
++		dPlaceholders = append(dPlaceholders, "(?, ?, ?, ?, ?, ?, ?)")
++		dArgs = append(dArgs, k.userID, k.day, k.category, k.source, v.bytesSent, v.bytesRecv, v.count)
++	}
++	dailySQL := `INSERT INTO bandwidth_daily
++		(user_id, day, category, source, bytes_sent, bytes_recv, req_count)
++		VALUES ` + strings.Join(dPlaceholders, ",") + `
++		ON CONFLICT (user_id, day, category, source)
++		DO UPDATE SET
++			bytes_sent = bandwidth_daily.bytes_sent + EXCLUDED.bytes_sent,
++			bytes_recv = bandwidth_daily.bytes_recv + EXCLUDED.bytes_recv,
++			req_count  = bandwidth_daily.req_count  + EXCLUDED.req_count`
++	if err := sess.Exec(dailySQL, dArgs...).Error; err != nil {
++		// DİQQƏT: hədəfli `ON CONFLICT (...)` uyğun UNİKAL İNDEKS olmadan
++		// Postgres-də dərhal xəta verir. Əvvəl bu xəta udulurdu və
++		// bandwidth_daily HEÇ VAXT dolmurdu.
++		logBandwidthErr(fmt.Sprintf("bandwidth_daily (%d sətir)", len(order)), err)
+ 	}
+ }
+ 
+@@ -162,6 +327,9 @@
+ 		select {
+ 		case bandwidthChan <- rec:
+ 		default:
++			// Issue 61: səssiz atma yerinə sayğac — StartBandwidthWriter
++			// dövri olaraq bunu loglayır.
++			bandwidthDropped.Add(1)
+ 		}
+ 	}
+ }
+--- a/middleware/jwt_middleware.go	2026-07-13 17:23:27.000000000 +0000
++++ b/middleware/jwt_middleware.go	2026-07-26 13:35:40.814742207 +0000
+@@ -1,7 +1,10 @@
+ package middleware
+ 
+ import (
++	"errors"
++	"log"
+ 	"net/http"
++	"os"
+ 	"strconv"
+ 	"strings"
+ 
+@@ -38,9 +41,10 @@
+ 				return nil, jwt.ErrSignatureInvalid
+ 			}
+ 			return []byte(jwtSecret), nil
+-		})
++		}, jwtParseOptions()...)
+ 
+ 		if err != nil || !token.Valid {
++			jwtRejectionHint(err)
+ 			c.JSON(http.StatusUnauthorized, gin.H{
+ 				"error": "Geçersiz token",
+ 			})
+@@ -102,11 +106,83 @@
+ 	}
+ }
+ 
+-// JWTMiddlewareForWebSocket WebSocket için JWT kontrolü (query parameter'dan)
++// jwtParseOptions — Issue 17: hər iki middleware üçün eyni sərt yoxlamalar.
++//
++// golang-jwt v5 `exp` YOXDURSA token-i etibarlı sayır. Yəni müddəti olmayan
++// (yəni ƏBƏDİ) bir token qəbul edilirdi — belə kimlik məlumatı köhnəldilə
++// bilməz. `iss`/`aud` yalnız konfiqurasiya edilibsə tətbiq olunur ki, mövcud
++// Laravel token-ləri qırılmasın.
++func jwtParseOptions() []jwt.ParserOption {
++	opts := []jwt.ParserOption{
++		jwt.WithValidMethods([]string{"HS256", "HS384", "HS512"}),
++	}
++	// GERİ ALMA DÜYMƏSİ: `JWT_REQUIRE_EXP=false` bu yoxlamanı söndürür.
++	// Verici (Laravel) hər hansı səbəbdən `exp` qoymursa, bu bayraq olmadan
++	// BÜTÜN kimlik doğrulama bir anda qırılardı. Rədd baş verərsə aşağıdakı
++	// `jwtRejectionHint` fərqli bir log sətri yazır → diaqnoz dərhal.
++	if strings.ToLower(strings.TrimSpace(os.Getenv("JWT_REQUIRE_EXP"))) != "false" {
++		opts = append(opts, jwt.WithExpirationRequired())
++	}
++	if v := strings.TrimSpace(os.Getenv("JWT_ISSUER")); v != "" {
++		opts = append(opts, jwt.WithIssuer(v))
++	}
++	if v := strings.TrimSpace(os.Getenv("JWT_AUDIENCE")); v != "" {
++		opts = append(opts, jwt.WithAudience(v))
++	}
++	return opts
++}
++
++// jwtRejectionHint — token `exp` OLMADIĞI üçün rədd olunduqda fərqli bir log
++// sətri yazır. Yeni sərtləşdirmə canlıda hər şeyi qırarsa səbəb dərhal görünsün
++// (əks halda sadəcə "Geçersiz token" seli olardı).
++func jwtRejectionHint(err error) {
++	if errors.Is(err, jwt.ErrTokenRequiredClaimMissing) {
++		log.Printf("[JWT] token `exp` claim-i OLMADIĞI üçün rədd edildi — verici exp qoymursa "+
++			"müvəqqəti həll: JWT_REQUIRE_EXP=false (səbəb: %v)", err)
++	}
++}
++
++// wsTokenFromHeaders — WS upgrade istəyindən token-i BAŞLIQDAN oxuyur.
++//
++// Brauzer `WebSocket` API-si ixtiyari başlıq göndərə bilmir; yeganə kanal
++// alt-protokol siyahısıdır. Ona görə `Sec-WebSocket-Protocol: bearer, <JWT>`
++// formasını da qəbul edirik (native istemçilər `Authorization` işlədə bilər).
++func wsTokenFromHeaders(c *gin.Context) string {
++	if auth := c.GetHeader("Authorization"); auth != "" {
++		if t := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer ")); t != "" && t != auth {
++			return t
++		}
++	}
++	proto := c.GetHeader("Sec-WebSocket-Protocol")
++	if proto == "" {
++		return ""
++	}
++	parts := strings.Split(proto, ",")
++	for i, p := range parts {
++		if strings.EqualFold(strings.TrimSpace(p), "bearer") && i+1 < len(parts) {
++			return strings.TrimSpace(parts[i+1])
++		}
++	}
++	return ""
++}
++
++// JWTMiddlewareForWebSocket WebSocket için JWT kontrolü (header, fallback: query)
+ func JWTMiddlewareForWebSocket(jwtSecret string) gin.HandlerFunc {
+ 	return func(c *gin.Context) {
+-		// URL query parameter'dan token al
+-		tokenString := c.Query("token")
++		// Issue 17: token ARTIQ header-dən də qəbul olunur.
++		//
++		// `?token=<JWT>` sorğu sətri proxy / gateway / LB access log-larına
++		// OLDUĞU KİMİ düşür (və çox vaxt xəta izlərinə). Uzun ömürlü sessiya
++		// JWT-si log-lardan toplanıb hesab ələ keçirilməsinə çevrilə bilər.
++		// Sıra: `Sec-WebSocket-Protocol` (brauzer WS API-si yalnız bunu
++		// göndərə bilir) → `Authorization: Bearer` → köhnə `?token=`.
++		//
++		// Query yolu GERİYƏ UYĞUNLUQ üçün saxlanılır: canlıdakı istemçilər
++		// yenilənənə qədər işləməlidir. İstemçilər keçdikdən sonra silinməlidir.
++		tokenString := wsTokenFromHeaders(c)
++		if tokenString == "" {
++			tokenString = c.Query("token")
++		}
+ 		if tokenString == "" {
+ 			c.JSON(http.StatusUnauthorized, gin.H{
+ 				"error": "Token parametresi gerekli",
+@@ -121,9 +197,10 @@
+ 				return nil, jwt.ErrSignatureInvalid
+ 			}
+ 			return []byte(jwtSecret), nil
+-		})
++		}, jwtParseOptions()...)
+ 
+ 		if err != nil || !token.Valid {
++			jwtRejectionHint(err)
+ 			c.JSON(http.StatusUnauthorized, gin.H{
+ 				"error": "Geçersiz token",
+ 			})
+--- /dev/null	2026-07-26 13:30:38.463095057 +0000
++++ b/services/media_gc.go	2026-07-26 14:27:50.834388095 +0000
+@@ -0,0 +1,266 @@
++package services
++
++import (
++	"context"
++	"log"
++	"regexp"
++	"strings"
++	"sync/atomic"
++	"time"
++
++	"gorm.io/gorm"
++)
++
++// ── Issue 56 — S3-də sahibsiz (orphaned) obyektlər ──────────────────────────
++//
++// PROBLEM
++// `POST /messenger/upload-media` və `/upload-voice` faylı S3-ə yazıb URL
++// qaytarır. Mesajın GÖNDƏRİLMƏSİ isə AYRI bir sorğudur. Aralarında hər şey
++// baş verə bilər: istifadəçi fikrini dəyişir, şəkli composer-dən silir,
++// tətbiq öldürülür, şəbəkə qopur, göndərmə icazə xətası ilə rədd olunur.
++// Bu hallarda obyekt S3-də ƏBƏDİ qalırdı:
++//   • heç bir mesaj ona istinad etmir → heç kim onu görmür;
++//   • heç bir yerdə qeydi yoxdur → tapmaq da mümkün deyil;
++//   • silmək üçün API belə yox idi (`S3Uploader`-də `Delete` metodu yox idi).
++// Nəticə: bucket ölçüsü (və hesab) yalnız artır. Böyük 4K videolarda bu
++// istifadəçi başına yüz MB-larla ölü data deməkdir.
++//
++// NİYƏ SADƏ "lifecycle rule" KİFAYƏT ETMİR
++// Bucket səviyyəsində "N gündən köhnə obyektləri sil" qaydası İSTİNAD OLUNAN
++// media ilə sahibsizi AYIRD EDƏ BİLMİR — hər ikisi eyni prefiksdədir
++// (`images/user_7/...`). Belə bir qayda istifadəçinin illər əvvəlki real
++// şəkillərini də silərdi.
++//
++// NİYƏ "mesaj silinəndə obyekti də sil" KİFAYƏT ETMİR
++// Mesaj mətni ŞİFRƏLƏNMİŞ saxlanılır (`encrypted_text`), ona görə server
++// tərəfdə "bu S3 açarına neçə mesaj istinad edir?" sualını SQL ilə cavablamaq
++// mümkün deyil. Üstəlik `BroadcastMessage` EYNİ media URL-i 20 alıcıya ayrı
++// mesaj sətri kimi yazır — birini silmək qalan 19-u sındırardı.
++//
++// HƏLL — İSTİNAD İZLƏMƏSİ
++// Yüklənən hər obyekt üçün `chat_media_objects` cədvəlinə sətir yazılır.
++// Mesaj göndərilərkən (mətn HƏLƏ AÇIQ olduğu an, şifrələmədən ƏVVƏL) mətndəki
++// S3 açarları çıxarılır və həmin sətirlər `referenced_at` ilə işarələnir.
++// Arxa-plan təmizləyicisi YALNIZ `referenced_at IS NULL` VƏ yaşı `orphanTTL`-dən
++// böyük sətirləri silir. Yəni:
++//   • istinad olunan media HEÇ VAXT silinmir (broadcast da təhlükəsizdir);
++//   • sahibsiz obyekt 24 saat sonra həm S3-dən, həm cədvəldən gedir.
++//
++// FAIL-OPEN
++// Cədvəl yoxdursa (miqrasiya işlədilməyib) izləmə özünü SÖNDÜRÜR və yükləmə
++// axını heç bir şəkildə pozulmur. Bax MIGRATION_chat_media_objects.md.
++
++// mediaKeyPattern — mesaj mətnindəki S3 media istinadları.
++// Həm tam URL (`.../api/s3-storage/images/user_7/abc.jpg`), həm də çılpaq
++// açar (`images/user_7/abc.jpg`) formasını tutur.
++var mediaKeyPattern = regexp.MustCompile(`(?:images|videos|voices)/user_\d+/[A-Za-z0-9][A-Za-z0-9._\-]{0,120}`)
++
++// ChatMediaObject — `chat_media_objects` cədvəli (messenger-ə məxsusdur).
++type ChatMediaObject struct {
++	ID           uint64     `gorm:"primaryKey"`
++	UserID       uint       `gorm:"column:user_id;index"`
++	S3Key        string     `gorm:"column:s3_key;uniqueIndex;size:512"`
++	ReferencedAt *time.Time `gorm:"column:referenced_at;index"`
++	CreatedAt    time.Time  `gorm:"column:created_at;index"`
++}
++
++func (ChatMediaObject) TableName() string { return "chat_media_objects" }
++
++// MediaTracker — yüklənən obyektlərin istinad vəziyyətini izləyir və
++// sahibsizləri təmizləyir.
++type MediaTracker struct {
++	db *gorm.DB
++	s3 *S3Uploader
++
++	// disabled — cədvəl yoxdursa (və ya davamlı xəta varsa) izləmə söndürülür.
++	// Bir dəfə söndükdə prosesin ömrü boyunca sönülü qalır: hər sorğuda
++	// mövcud olmayan cədvələ vurmaq mənasız yükdür.
++	disabled atomic.Bool
++
++	// orphanTTL — obyekt bu müddətdən artıq istinadsız qalırsa sahibsiz sayılır.
++	orphanTTL time.Duration
++	// sweepEvery — təmizləmə dövrü.
++	sweepEvery time.Duration
++	// batchSize — bir dövrdə silinən maksimum obyekt sayı.
++	batchSize int
++}
++
++// mediaTracker — proses üzrə tək nüsxə. main.go-da qurulur; qurulmayıbsa
++// bütün paket funksiyaları no-op-dur (test/CLI yolları üçün).
++var mediaTracker atomic.Pointer[MediaTracker]
++
++// NewMediaTracker — izləyicini qurur.
++func NewMediaTracker(db *gorm.DB, s3 *S3Uploader) *MediaTracker {
++	return &MediaTracker{
++		db:         db,
++		s3:         s3,
++		orphanTTL:  24 * time.Hour,
++		sweepEvery: 30 * time.Minute,
++		batchSize:  500,
++	}
++}
++
++// SetMediaTracker — qlobal nüsxəni təyin edir.
++func SetMediaTracker(t *MediaTracker) { mediaTracker.Store(t) }
++
++// TrackMediaUpload — yeni yüklənmiş obyekti qeydə alır. Qeyri-kritikdir:
++// xəta olduqda yalnız loglanır, yükləmə uğurlu sayılır.
++func TrackMediaUpload(userID uint, s3Key string) {
++	if t := mediaTracker.Load(); t != nil {
++		t.Track(userID, s3Key)
++	}
++}
++
++// MarkMediaReferenced — mesaj mətnindəki (HƏLƏ ŞİFRƏLƏNMƏMİŞ) S3 açarlarını
++// "istifadə olunub" kimi işarələyir. Göndərmə yollarının hamısından çağırılır.
++func MarkMediaReferenced(plainText string) {
++	if t := mediaTracker.Load(); t != nil {
++		t.MarkReferenced(plainText)
++	}
++}
++
++// Track — bax TrackMediaUpload.
++func (t *MediaTracker) Track(userID uint, s3Key string) {
++	if t == nil || t.disabled.Load() || s3Key == "" {
++		return
++	}
++	row := ChatMediaObject{
++		UserID:    userID,
++		S3Key:     s3Key,
++		CreatedAt: time.Now().UTC(),
++	}
++	// Eyni açar iki dəfə yazıla bilməz (uniqueIndex) — təkrar cəhd sükutla
++	// atılır. `OnConflict` əvəzinə sadə xəta udma: açar UUID-dir, toqquşma
++	// praktikada yoxdur.
++	if err := t.db.Create(&row).Error; err != nil {
++		t.noteFailure("chat_media_objects insert", err)
++	}
++}
++
++// ExtractMediaKeys — mətndən S3 media açarlarını çıxarır (təkrarsız).
++// İxrac olunub ki, test və digər paketlər eyni məntiqi işlədə bilsin.
++func ExtractMediaKeys(text string) []string {
++	if text == "" || !strings.Contains(text, "/user_") {
++		return nil
++	}
++	// Tavan qəsdən yüksəkdir: 32-lik limit çoxşəkilli albomların QUYRUĞUNU
++	// işarəsiz qoyurdu → həmin şəkillər 24 saat sonra sahibsiz sayılıb
++	// silinərdi, halbuki mesaj onlara işarə edir.
++	matches := mediaKeyPattern.FindAllString(text, 256)
++	if len(matches) == 0 {
++		return nil
++	}
++	seen := make(map[string]struct{}, len(matches))
++	out := make([]string, 0, len(matches))
++	for _, m := range matches {
++		if _, dup := seen[m]; dup {
++			continue
++		}
++		seen[m] = struct{}{}
++		out = append(out, m)
++	}
++	return out
++}
++
++// MarkReferenced — bax MarkMediaReferenced.
++func (t *MediaTracker) MarkReferenced(plainText string) {
++	if t == nil || t.disabled.Load() {
++		return
++	}
++	keys := ExtractMediaKeys(plainText)
++	if len(keys) == 0 {
++		return
++	}
++	now := time.Now().UTC()
++	if err := t.db.Model(&ChatMediaObject{}).
++		Where("s3_key IN ? AND referenced_at IS NULL", keys).
++		Update("referenced_at", now).Error; err != nil {
++		t.noteFailure("chat_media_objects mark referenced", err)
++	}
++}
++
++// noteFailure — cədvəl yoxdursa izləməni tamamilə söndür; digər xətaları logla.
++func (t *MediaTracker) noteFailure(op string, err error) {
++	if err == nil {
++		return
++	}
++	msg := strings.ToLower(err.Error())
++	if strings.Contains(msg, "does not exist") ||
++		strings.Contains(msg, "undefined table") ||
++		strings.Contains(msg, "no such table") ||
++		strings.Contains(msg, "42p01") {
++		if t.disabled.CompareAndSwap(false, true) {
++			log.Printf("media-gc: `chat_media_objects` cədvəli yoxdur — media izləmə SÖNDÜRÜLDÜ "+
++				"(miqrasiya üçün bax MIGRATION_chat_media_objects.md). Detal: %v", err)
++		}
++		return
++	}
++	log.Printf("media-gc: %s xətası: %v", op, err)
++}
++
++// StartReaper — sahibsiz obyektləri dövri olaraq təmizləyir.
++// `go tracker.StartReaper(ctx)` şəklində çağırılır.
++func (t *MediaTracker) StartReaper(ctx context.Context) {
++	if t == nil {
++		return
++	}
++	if t.s3 == nil || !t.s3.Enabled() {
++		log.Printf("media-gc: S3 konfiqurasiya olunmayıb — təmizləyici başladılmadı")
++		return
++	}
++
++	ticker := time.NewTicker(t.sweepEvery)
++	defer ticker.Stop()
++
++	for {
++		select {
++		case <-ctx.Done():
++			return
++		case <-ticker.C:
++			if t.disabled.Load() {
++				return
++			}
++			t.sweepOnce()
++		}
++	}
++}
++
++// sweepOnce — bir təmizləmə dövrü.
++func (t *MediaTracker) sweepOnce() {
++	cutoff := time.Now().UTC().Add(-t.orphanTTL)
++
++	var rows []ChatMediaObject
++	if err := t.db.
++		Where("referenced_at IS NULL AND created_at < ?", cutoff).
++		Order("id ASC").
++		Limit(t.batchSize).
++		Find(&rows).Error; err != nil {
++		t.noteFailure("chat_media_objects sweep select", err)
++		return
++	}
++	if len(rows) == 0 {
++		return
++	}
++
++	deletedIDs := make([]uint64, 0, len(rows))
++	var s3Failures int
++	for _, r := range rows {
++		if err := t.s3.Delete(r.S3Key); err != nil {
++			// S3 silinməsi uğursuz oldu — sətri SAXLA ki, növbəti dövrdə
++			// yenidən cəhd olunsun. (Sətri silsək obyekt əbədi sahibsiz qalar.)
++			s3Failures++
++			continue
++		}
++		deletedIDs = append(deletedIDs, r.ID)
++	}
++
++	if len(deletedIDs) > 0 {
++		if err := t.db.Where("id IN ?", deletedIDs).Delete(&ChatMediaObject{}).Error; err != nil {
++			t.noteFailure("chat_media_objects sweep delete", err)
++			return
++		}
++	}
++
++	log.Printf("media-gc: %d sahibsiz obyekt silindi (%d S3 xətası, cəmi namizəd %d)",
++		len(deletedIDs), s3Failures, len(rows))
++}
+--- a/services/s3.go	2026-07-03 15:21:52.000000000 +0000
++++ b/services/s3.go	2026-07-26 14:03:27.485590599 +0000
+@@ -3,6 +3,7 @@
+ import (
+ 	"bytes"
+ 	"context"
++	"errors"
+ 	"time"
+ 
+ 	"github.com/aws/aws-sdk-go-v2/aws"
+@@ -48,7 +49,12 @@
+ // qoyur (ContentType ilə).
+ func (u *S3Uploader) Put(key string, body []byte, contentType string) error {
+ 	if u.client == nil {
+-		return nil
++		// Issue 43: əvvəl `nil` (yəni UĞUR) qaytarırdı. S3 konfiqurasiya
++		// olunmayıbsa (bucket boş, ya da `LoadDefaultConfig` xəta verib)
++		// yükləmə SƏSSİZCƏ heç nə etmir, amma handler istifadəçiyə etibarlı
++		// görünən bir URL qaytarırdı → şəkil/video "sonsuza qədər yüklənir",
++		// heç bir xəta görünmür. İndi səhv AÇIQ şəkildə qayıdır.
++		return errors.New("s3: uploader konfiqurasiya olunmayıb (bucket/credentials yoxdur)")
+ 	}
+ 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+ 	defer cancel()
+@@ -65,6 +71,26 @@
+ 	return err
+ }
+ 
++// Delete — Issue 56: verilmiş açarı bucket-dan silir. Sahibsiz media
++// təmizləyicisi (services/media_gc.go) və uğursuz yükləmə yolları işlədir.
++// Əvvəl `S3Uploader`-də silmə metodu ÜMUMİYYƏTLƏ yox idi — yəni bir dəfə
++// yazılan obyekti proqramla silmək mümkün deyildi.
++func (u *S3Uploader) Delete(key string) error {
++	if u.client == nil {
++		return errors.New("s3: uploader konfiqurasiya olunmayıb (bucket/credentials yoxdur)")
++	}
++	if key == "" {
++		return errors.New("s3: boş açar")
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
++	defer cancel()
++	_, err := u.client.DeleteObject(ctx, &s3.DeleteObjectInput{
++		Bucket: aws.String(u.bucket),
++		Key:    aws.String(key),
++	})
++	return err
++}
++
+ // Exists — Laravel Storage::disk('s3')->exists($key). uploadVoice put-dan sonra
+ // obyektin həqiqətən yazıldığını təsdiqləmək üçün (fail loudly).
+ func (u *S3Uploader) Exists(key string) bool {
+--- a/websocket/hub.go	2026-07-26 11:13:48.000000000 +0000
++++ b/websocket/hub.go	2026-07-26 14:26:59.507642290 +0000
+@@ -3,16 +3,21 @@
+ import (
+ 	"beanpon_messenger/config"
+ 	"beanpon_messenger/models"
++	"beanpon_messenger/services"
+ 	"beanpon_messenger/utils"
+ 	"beanpon_messenger/xmpp"
+ 	"bytes"
+ 	"encoding/json"
+-	"github.com/google/uuid"
++	"errors"
+ 	"log"
+ 	"net/http"
++	"strings"
+ 	"sync"
++	"sync/atomic"
+ 	"time"
+ 
++	"github.com/google/uuid"
++
+ 	"github.com/gin-gonic/gin"
+ 	"github.com/gorilla/websocket"
+ 	"gorm.io/gorm"
+@@ -25,6 +30,13 @@
+ 	CheckOrigin: func(r *http.Request) bool {
+ 		return true
+ 	},
++	// Issue 17: token artıq `Sec-WebSocket-Protocol: bearer, <JWT>` ilə də
++	// gələ bilir (brauzer WS API-si ixtiyari başlıq göndərə bilmir, yeganə
++	// kanal budur). Protokol danışığında server SEÇİLƏN alt-protokolu geri
++	// əks etdirməlidir, yoxsa brauzer əl sıxmanı RƏDD edir. Burada həmişə
++	// "bearer" seçirik — istemçi onu göndərməyibsə gorilla boş qaytarır və
++	// davranış dəyişmir (köhnə `?token=` istemçiləri təsirlənmir).
++	Subprotocols: []string{"bearer"},
+ }
+ 
+ // Client WebSocket bağlantısını temsil eder
+@@ -52,6 +64,29 @@
+ 	// heç vaxt bağlı kanala yazmır → send-on-closed-channel panic (bütün
+ 	// prosesi çökdürən) tamamilə aradan qalxır. writePump `done` ilə dayanır.
+ 	done chan struct{}
++
++	// typing — Issue 16: "yazır…" siqnalları üçün blok yoxlaması + sürət
++	// limiti (bax websocket/typing_gate.go). Client ömürlüdür.
++	typing *typingGate
++
++	// evicting — Issue 22: `Send` buferi dolduqda client "yavaş istehlakçı"
++	// sayılır və unregister-ə göndərilir. Bu, hər uğursuz yazımda AYRI bir
++	// goroutine yaradırdı: 500 üzvlü qrupda tıxanmış bir client üçün yüzlərlə
++	// goroutine eyni unregister kanalında növbəyə düşürdü. Atomik bayraq
++	// çıxarılmanı yalnız BİR dəfə növbəyə qoyur.
++	evicting atomic.Bool
++}
++
++// enqueueEvict — Issue 22: yavaş client-i BİR dəfə unregister növbəsinə qoyur.
++// Bloklamır (unregister kanalı Run döngüsündədir və Run bu anda çağıranı
++// gözləyir ola bilər) — ona görə ayrıca goroutine-də yazılır.
++func (c *Client) enqueueEvict(h *Hub) {
++	if c.evicting.Swap(true) {
++		return // artıq növbədədir
++	}
++	go func() {
++		h.unregister <- c
++	}()
+ }
+ 
+ // closeSend client-i təhlükəsiz (idempotent) bağlayır: `Send`-i DEYİL, `done`-u
+@@ -63,6 +98,11 @@
+ 	})
+ }
+ 
++// errClientMessageIDTaken — Issue 9: göndərilən `client_message_id` BAŞQA
++// istifadəçinin mesajına aiddir. Transaction-dan bu sentinel qaytarılır ki,
++// çağıran tərəf onu ümumi "persist failed" xətasından ayıra bilsin.
++var errClientMessageIDTaken = errors.New("client_message_id artıq istifadə olunub")
++
+ // Hub tüm client'ları yönetir
+ type Hub struct {
+ 	clients           map[uint]*Client
+@@ -136,10 +176,13 @@
+ 	DecryptMessage(encryptedText string) (string, error)
+ }, config *config.Config) *Hub { // ← config parametri əlavə
+ 	return &Hub{
+-		clients:           make(map[uint]*Client),
+-		register:          make(chan *Client),
+-		unregister:        make(chan *Client),
+-		broadcast:         make(chan *Message),
++		clients:    make(map[uint]*Client),
++		register:   make(chan *Client),
++		unregister: make(chan *Client),
++		// Issue 22: bu kanalın artıq daxili yazıcısı yoxdur (`SendToUser`
++		// birbaşa çatdırır). Geriyə uyğunluq üçün saxlanılır və buferlənir ki,
++		// gələcək bir yazıcı `Run` ilə rendezvous-a məcbur qalmasın.
++		broadcast:         make(chan *Message, 256),
+ 		db:                db,
+ 		encryptionService: encryptionService,
+ 		httpClient:        &http.Client{Timeout: 10 * time.Second}, // ← YENI
+@@ -242,37 +285,63 @@
+ 		},
+ 	}
+ 
+-	// Tüm bağlı kullanıcılara gönder
++	// Tüm bağlı kullanıcılara gönder.
++	// Issue 22: payload BİR dəfə marshal olunur (əvvəl hər alıcı üçün ayrıca
++	// JSON marshal edilirdi — N bağlı client = N marshal).
++	payload := h.messageToBytes(statusMessage)
++	if payload == nil {
++		return
++	}
+ 	for _, client := range h.clients {
+ 		if client.UserID != userID { // Kendisi hariç
+ 			select {
+-			case client.Send <- h.messageToBytes(statusMessage):
++			case client.Send <- payload:
+ 			default:
+-				go func(c *Client) {
+-					h.unregister <- c
+-				}(client)
++				client.enqueueEvict(h)
+ 			}
+ 		}
+ 	}
+ }
+ 
+-// broadcastMessage mesajı yayınla
++// broadcastMessage — köhnə `h.broadcast` kanalı üçün saxlanılan nazik örtük.
+ func (h *Hub) broadcastMessage(message *Message) {
++	h.deliver(message)
++}
++
++// deliver — mesajı alıcının `Send` buferinə non-blocking yazır.
++//
++// Issue 22: əvvəllər HƏR göndərmə BUFERSİZ `h.broadcast` kanalından keçib TƏK
++// `Run` goroutine-i tərəfindən növbə ilə emal olunurdu. Nəticələr:
++//   - head-of-line blocking: `SendToMultipleUsers` 500 üzvlü qrupda 500 dəfə
++//     `Run` ilə rendezvous edirdi; bu müddətdə `register`/`unregister` də
++//     dayanırdı → yeni bağlantılar və təmizləmə gecikirdi;
++//   - bir yavaş/tıxanmış client bütün prosesin throughput tavanını təyin edirdi;
++//   - hər uğursuz yazım AYRI goroutine yaradıb `unregister`-də növbəyə düşürdü.
++//
++// İndi çatdırma çağıranın öz goroutine-ində, yalnız qısa `RLock` altında baş
++// verir. Per-client sıra POZULMUR — hər client-in öz `Send` kanalı və tək
++// `writePump`-ı var, sıralamanı o təmin edir.
++func (h *Hub) deliver(message *Message) {
+ 	h.mutex.RLock()
+-	defer h.mutex.RUnlock()
++	client, exists := h.clients[message.ReceiverID]
++	h.mutex.RUnlock()
++	if !exists {
++		return
++	}
+ 
+-	if client, exists := h.clients[message.ReceiverID]; exists {
+-		select {
+-		case client.Send <- h.messageToBytes(message):
+-			// Canlı new_message push-u BAĞLI alıcıya çatdısa (kanala yazıla
+-			// bildi) → server tərəfdə dərhal delivered=true (WhatsApp davranışı,
+-			// ani iki tick). Uğursuz göndərmə (default branch) bura düşmür.
+-			h.maybeMarkLivePushDelivered(message)
+-		default:
+-			go func() {
+-				h.unregister <- client
+-			}()
+-		}
++	payload := h.messageToBytes(message)
++	if payload == nil {
++		return
++	}
++
++	select {
++	case client.Send <- payload:
++		// Canlı new_message push-u BAĞLI alıcıya çatdısa (kanala yazıla
++		// bildi) → server tərəfdə dərhal delivered=true (WhatsApp davranışı,
++		// ani iki tick). Uğursuz göndərmə (default branch) bura düşmür.
++		h.maybeMarkLivePushDelivered(message)
++	default:
++		client.enqueueEvict(h)
+ 	}
+ }
+ 
+@@ -343,19 +412,86 @@
+ 
+ // SendToUser belirli kullanıcıya mesaj gönder
+ func (h *Hub) SendToUser(userID uint, messageType string, data interface{}) {
+-	message := &Message{
++	h.deliver(&Message{
+ 		Type:       messageType,
+ 		ReceiverID: userID,
+ 		Data:       data,
+-	}
+-	h.broadcast <- message
++	})
+ }
+ 
+-// SendToMultipleUsers birden fazla kullanıcıya mesaj gönder
++// SendToMultipleUsers birden fazla kullanıcıya mesaj gönder.
++//
++// Issue 22: qrup fan-out-u üçün isti yol. Əvvəl hər alıcı üçün ayrıca
++// marshal + ayrıca kilid + `Run` döngüsü ilə ayrıca rendezvous vardı
++// (N alıcı = 3N sinxronizasiya nöqtəsi). İndi: tək marshal, tək RLock
++// snapshot-u, sonra kilidsiz non-blocking yazımlar.
+ func (h *Hub) SendToMultipleUsers(userIDs []uint, messageType string, data interface{}) {
++	if len(userIDs) == 0 {
++		return
++	}
++
++	// `new_message` (DM) çatdırma-işarələmə yan effekti daşıyır — onu
++	// `deliver` yolunda saxlayırıq ki, davranış dəyişməsin.
++	if messageType == "new_message" {
++		seen := make(map[uint]struct{}, len(userIDs))
++		for _, userID := range userIDs {
++			if _, dup := seen[userID]; dup {
++				continue
++			}
++			seen[userID] = struct{}{}
++			h.SendToUser(userID, messageType, data)
++		}
++		return
++	}
++
++	payload := h.messageToBytes(&Message{Type: messageType, Data: data})
++	if payload == nil {
++		return
++	}
++
++	// Alıcı snapshot-u TƏK RLock altında. Təkrarlanan id-lər süzülür —
++	// əks halda eyni client eyni frame-i iki dəfə alırdı.
++	seen := make(map[uint]struct{}, len(userIDs))
++	targets := make([]*Client, 0, len(userIDs))
++	h.mutex.RLock()
++	for _, userID := range userIDs {
++		if _, dup := seen[userID]; dup {
++			continue
++		}
++		seen[userID] = struct{}{}
++		if client, ok := h.clients[userID]; ok {
++			targets = append(targets, client)
++		}
++	}
++	h.mutex.RUnlock()
++
++	for _, client := range targets {
++		select {
++		case client.Send <- payload:
++		default:
++			client.enqueueEvict(h)
++		}
++	}
++}
++
++// FilterUsersInGroupChat — Issue 23: verilmiş id siyahısından hazırda BU qrup
++// səhifəsi AÇIQ olanları qaytarır. Əvvəl çağıran tərəf hər üzv üçün ayrıca
++// `IsUserInGroupChat` çağırırdı → N dəfə RLock alıb-buraxma. İndi tək kilid.
++func (h *Hub) FilterUsersInGroupChat(userIDs []uint, conversationID uint) []uint {
++	if len(userIDs) == 0 {
++		return nil
++	}
++	out := make([]uint, 0, len(userIDs))
++	h.mutex.RLock()
++	defer h.mutex.RUnlock()
+ 	for _, userID := range userIDs {
+-		h.SendToUser(userID, messageType, data)
++		if client, ok := h.clients[userID]; ok {
++			if client.ActiveGroupChat != nil && *client.ActiveGroupChat == conversationID {
++				out = append(out, userID)
++			}
++		}
+ 	}
++	return out
+ }
+ 
+ // HandleNewMessage yeni mesajı handle et ve WebSocket üzerinden yayınla
+@@ -474,8 +610,25 @@
+ 		return
+ 	}
+ 
+-	// 🎯 Sadece active conversation'larda notification gönder
+-	if conversationStatus == "active" {
++	// ── Issue 10: push qapısı ────────────────────────────────────────────────
++	//
++	// Əvvəl yalnız `"active"` buraxılırdı, LAKİN REST yolu bura HƏMİŞƏ sabit
++	// `"active"` ötürürdü — yəni praktikada REST hər statusda push göndərirdi,
++	// WS isə yalnız `active`-də. Eyni mesaj nəqliyyatdan asılı olaraq bildiriş
++	// doğurur və ya doğurmurdu.
++	//
++	// İndi hər iki yol GERÇƏK statusu ötürür və qapı BURADA, bir yerdə qərar
++	// verir:
++	//   • "active"   → normal söhbət, push var (dəyişmədi);
++	//   • "pending"  → MESAJ İSTƏYİ. Push VAR — istifadəçi tanımadığı adamdan
++	//                  gələn ilk mesajı görməlidir (REST-də onsuz da gedirdi,
++	//                  yalnız WS-də yox idi). Spam qapısı `CanSendMessage`-in
++	//                  `max_pending_messages` limiti + shadow-ban ilə qorunur;
++	//   • "restricted" → tək tərəfli mesaj limiti aşılıb, söhbət kilidli →
++	//                  push YOXDUR (əvvəl REST üzərindən GEDİRDİ — spam deşiyi);
++	//   • ""         → söhbət ümumiyyətlə yaradılmayıb (mesaj banı) → push yox.
++	switch conversationStatus {
++	case "active", "pending":
+ 		if !h.IsUserOnline(receiverID) {
+ 			go h.sendPushNotification(senderID, receiverID, content, msgType)
+ 		} else if !h.IsUserInChatWith(receiverID, senderID) {
+@@ -747,6 +900,7 @@
+ 		Send:   make(chan []byte, 256),
+ 		Hub:    h,
+ 		done:   make(chan struct{}),
++		typing: newTypingGate(), // Issue 16
+ 	}
+ 
+ 	h.register <- client
+@@ -812,54 +966,33 @@
+ 		}
+ 		c.sendMessage(response)
+ 
++	// Issue 16: bütün "yazır…" siqnalları eyni qapıdan keçir — blok yoxlaması
++	// (30 sn keşli) + başlanğıc siqnalları üçün sürət limiti. Bax
++	// websocket/typing_gate.go.
+ 	case "typing":
+ 		// Yazıyor durumunu karşı tarafa bildir (action: text yazma)
+-		if msg.ReceiverID > 0 {
+-			c.Hub.SendToUser(msg.ReceiverID, "user_typing", map[string]interface{}{
+-				"user_id": c.UserID,
+-				"typing":  true,
+-				"action":  "typing",
+-			})
+-		}
++		c.emitTypingSignal(msg.ReceiverID, "typing", true)
+ 
+ 	case "typing_stop":
+ 		// Yazmayı bıraktı durumunu karşı tarafa bildir
+-		if msg.ReceiverID > 0 {
+-			c.Hub.SendToUser(msg.ReceiverID, "user_typing", map[string]interface{}{
+-				"user_id": c.UserID,
+-				"typing":  false,
+-				"action":  "typing",
+-			})
+-		}
++		c.emitTypingSignal(msg.ReceiverID, "typing", false)
+ 
+ 	case "recording":
+ 		// Səs mesajı yazır (mic basılı tutub) — qarşı tərəfə bildir.
+ 		// Eyni user_typing event-i, amma action: recording.
+-		if msg.ReceiverID > 0 {
+-			c.Hub.SendToUser(msg.ReceiverID, "user_typing", map[string]interface{}{
+-				"user_id": c.UserID,
+-				"typing":  true,
+-				"action":  "recording",
+-			})
+-		}
++		c.emitTypingSignal(msg.ReceiverID, "recording", true)
+ 
+ 	case "recording_stop":
+ 		// Səs yazmağı dayandırdı (buraxdı/ləğv etdi).
+-		if msg.ReceiverID > 0 {
+-			c.Hub.SendToUser(msg.ReceiverID, "user_typing", map[string]interface{}{
+-				"user_id": c.UserID,
+-				"typing":  false,
+-				"action":  "recording",
+-			})
+-		}
++		c.emitTypingSignal(msg.ReceiverID, "recording", false)
+ 
+ 	case "group_typing":
+ 		// Qrupda yazma — həmin qrupun digər üzvlərinə bildir.
+-		c.Hub.handleGroupTyping(c.UserID, msg.Data, true)
++		c.Hub.handleGroupTyping(c.UserID, msg.Data, true, c.typing)
+ 
+ 	case "group_typing_stop":
+ 		// Qrupda yazmağı dayandırdı.
+-		c.Hub.handleGroupTyping(c.UserID, msg.Data, false)
++		c.Hub.handleGroupTyping(c.UserID, msg.Data, false, c.typing)
+ 
+ 	case "get_online_users":
+ 		// Online kullanıcı listesini gönder
+@@ -975,7 +1108,28 @@
+ 			return
+ 		}
+ 
+-		messageID := uuid.New().String()
++		// Issue 9: idempotentlik — istemçi mesajın UUID-ni özü verə bilir
++		// (`client_message_id`). WS bağlantısı qopub yenidən qurulanda istemçi
++		// çatmamış mesajı TƏKRAR göndərir; server UUID-i ilə bu HƏR DƏFƏ yeni
++		// sətir yaradırdı → söhbətdə dublikat. İndi eyni açar → eyni sətir.
++		messageID := ""
++		if cmid, exists := dataMap["client_message_id"].(string); exists {
++			if parsed, perr := uuid.Parse(strings.TrimSpace(cmid)); perr == nil {
++				messageID = parsed.String()
++			} else if strings.TrimSpace(cmid) != "" {
++				c.sendMessage(&OutgoingMessage{
++					Type: "message_error",
++					Data: map[string]interface{}{
++						"error": "client_message_id UUID formatında olmalıdır",
++						"code":  "INVALID_CLIENT_MESSAGE_ID",
++					},
++				})
++				return
++			}
++		}
++		if messageID == "" {
++			messageID = uuid.New().String()
++		}
+ 		// Issue 30: REST yolu ilə eyni — UTC saxla ki, `ORDER BY created_at`
+ 		// iki yol arasında düzgün sıralansın (server TZ ≠ UTC olsa belə).
+ 		createdAt := time.Now().UTC()
+@@ -986,6 +1140,10 @@
+ 		// açanda YOX olurdu. İndi REST yolu ilə eyni: şifrələ → yaz → (uğurlusa)
+ 		// conversation-u güncəllə → yay. Yazma xətası → göndərənə message_error,
+ 		// yayım yoxdur. Wire dəyişmir (köhnə istemçilər eyni davranır).
++		// Issue 56: `content` hələ AÇIQ mətndir — S3 media açarlarını burada
++		// "istifadə olunub" işarələ (şifrələmədən sonra mümkün deyil).
++		services.MarkMediaReferenced(content)
++
+ 		encryptedText, encErr := c.Hub.encryptionService.EncryptMessage(content)
+ 		if encErr != nil {
+ 			log.Printf("Mesaj şifreleme hatası (WS): %v", encErr)
+@@ -1012,15 +1170,51 @@
+ 		// yeniləməsi (sayğac/status/last_message_at) TEK TRANSACTION.
+ 		// Issue 8 WS yoluna yeniləməni gətirmişdi, amma REST-dəki eyni
+ 		// atomiklik boşluğu ilə: xəta udulurdu → mesaj var, siyahı köhnə.
++		//
++		// Issue 9: `ON CONFLICT (id) DO NOTHING` — təkrar göndərilən eyni
++		// `client_message_id` yeni sətir yaratmır və sayğaclar İKİNCİ DƏFƏ
++		// artmır. `duplicate` olduqda yayım/moderasiya da təkrarlanmır;
++		// göndərənə `message_duplicate` gedir ki, öz outbox-unu təmizləsin.
++		duplicate := false
+ 		if err := c.Hub.db.Transaction(func(tx *gorm.DB) error {
+-			if err := tx.Create(&message).Error; err != nil {
+-				return err
++			res := tx.Clauses(clause.OnConflict{
++				Columns:   []clause.Column{{Name: "id"}},
++				DoNothing: true,
++			}).Create(&message)
++			if res.Error != nil {
++				return res.Error
++			}
++			if res.RowsAffected == 0 {
++				var existing models.Message
++				if err := tx.Unscoped().Where("id = ?", message.ID).First(&existing).Error; err != nil {
++					return err
++				}
++				// Yalnız `sender_id` yoxlamaq KİFAYƏT DEYİL — eyni istifadəçi
++				// eyni açarı BAŞQA alıcıya (və ya qrupa) işlətsə mesaj səssizcə
++				// yaradılmazdı və istemçi uğur sayardı. Alıcı və söhbət növü də
++				// uyğun gəlməlidir.
++				sameReceiver := existing.ReceiverID != nil && *existing.ReceiverID == receiverID
++				if existing.SenderID != c.UserID || !sameReceiver || existing.ConversationID != nil {
++					return errClientMessageIDTaken
++				}
++				duplicate = true
++				return nil
+ 			}
+ 			if conversation != nil {
+ 				return applyConversationMessageUpdateDB(tx, conversation, c.UserID)
+ 			}
+ 			return nil
+ 		}); err != nil {
++			if errors.Is(err, errClientMessageIDTaken) {
++				c.sendMessage(&OutgoingMessage{
++					Type: "message_error",
++					Data: map[string]interface{}{
++						"error": "client_message_id artıq istifadə olunub",
++						"code":  "CLIENT_MESSAGE_ID_TAKEN",
++					},
++				})
++				return
++			}
+ 			log.Printf("Mesaj DB'ye yazılamadı (WS): %v", err)
+ 			c.sendMessage(&OutgoingMessage{
+ 				Type: "message_error",
+@@ -1029,6 +1223,17 @@
+ 			return
+ 		}
+ 
++		if duplicate {
++			c.sendMessage(&OutgoingMessage{
++				Type: "message_duplicate",
++				Data: map[string]interface{}{
++					"id":          messageID,
++					"receiver_id": receiverID,
++				},
++			})
++			return
++		}
++
+ 		// Yenilənmiş status-u götür (pending→active keçmiş ola bilər) —
+ 		// HandleNewMessage push qapısı bunu istifadə edir.
+ 		conversationStatus := "new"
+@@ -1192,6 +1397,22 @@
+ 	return false
+ }
+ 
++// emitTypingSignal — Issue 16: "yazır…"/"səs yazır" siqnalını qarşı tərəfə
++// ötürür, ancaq qapıdan keçirsə (blok yoxdur + sürət limiti pozulmayıb).
++func (c *Client) emitTypingSignal(receiverID uint, action string, isStart bool) {
++	if receiverID == 0 {
++		return
++	}
++	if c.typing == nil || !c.typing.allow(c.Hub, c.UserID, receiverID, isStart) {
++		return
++	}
++	c.Hub.SendToUser(receiverID, "user_typing", map[string]interface{}{
++		"user_id": c.UserID,
++		"typing":  isStart,
++		"action":  action,
++	})
++}
++
+ // sendMessage client'a mesaj gönder
+ func (c *Client) sendMessage(msg *OutgoingMessage) {
+ 	data, err := json.Marshal(msg)
+@@ -1287,6 +1508,13 @@
+ 			}
+ 		}
+ 
++		// Issue 23: üzv başına `IsUserInGroupChat` (hər biri ayrıca RWMutex
++		// al-burax) → 5000-lik qrupda 5000 kilid əməliyyatı. İndi tək kilid.
++		inChat := make(map[uint]struct{})
++		for _, uid := range h.FilterUsersInGroupChat(memberIDs, conversationID) {
++			inChat[uid] = struct{}{}
++		}
++
+ 		remaining := make([]uint, 0, len(memberIDs))
+ 		for _, uid := range memberIDs {
+ 			if uid == senderID {
+@@ -1297,7 +1525,7 @@
+ 				continue
+ 			}
+ 			// Hazırda qrup səhifəsindədir — mesajı canlı görür.
+-			if h.IsUserInGroupChat(uid, conversationID) {
++			if _, open := inChat[uid]; open {
+ 				continue
+ 			}
+ 			remaining = append(remaining, uid)
+@@ -1563,7 +1791,7 @@
+ // aktiv üzvlərinə yayır. data içindən conversation_id çıxarılır (JSON number
+ // → float64). DM "typing" ilə simmetrikdir, amma tək receiver yerine qrup
+ // üzvlərinə (göndərən istisna) göndərilir.
+-func (h *Hub) handleGroupTyping(userID uint, data interface{}, isTyping bool) {
++func (h *Hub) handleGroupTyping(userID uint, data interface{}, isTyping bool, gate *typingGate) {
+ 	dataMap, ok := data.(map[string]interface{})
+ 	if !ok {
+ 		return
+@@ -1574,6 +1802,30 @@
+ 	}
+ 	conversationID := uint(convFloat)
+ 
++	// ── Issue 16: SÜRƏT LİMİTİ (yalnız başlanğıc siqnalları) ────────────────
++	// Qrup yolunda gücləndirmə əmsalı DM-dən böyükdür: bir frame N üzvə
++	// yayılır, üstəlik AŞAĞIDA 2 DB sorğusu var. Limitsiz halda bir soket
++	// saniyədə minlərlə frame göndərib bütün qrupu boğa bilərdi.
++	if gate != nil && !gate.allowGroupTyping(conversationID, isTyping) {
++		return
++	}
++
++	// ── Issue 16: GÖNDƏRƏNİN ÜZVLÜYÜ ─────────────────────────────────────────
++	// Əvvəl HEÇ BİR yoxlama yox idi: istənilən istifadəçi ixtiyari
++	// `conversation_id` göndərib öz adı və avatarı ilə HƏR QRUPDA
++	// "X yazır…" göstərə bilirdi — üzv olmadığı, hətta mövcud olmayan
++	// qrupda belə. Həm kimlik spoofinq-i, həm də üzv siyahısının sızması
++	// (fan-out cavabından qrupun mövcudluğu bilinirdi).
++	// Dəvəti qəbul etməmiş (pending) üzv də yaza bilmədiyi üçün siqnal
++	// göndərə bilməməlidir — `invite_status='active'` şərti də var.
++	var isMember int64
++	if err := h.db.Model(&models.ConversationParticipant{}).
++		Where("conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL AND COALESCE(invite_status,'active') = 'active'",
++			conversationID, userID).
++		Count(&isMember).Error; err != nil || isMember == 0 {
++		return
++	}
++
+ 	// Action: "typing" (default) və ya "recording" (səs yazır). Flutter
+ 	// data-da göndərə bilər; göndərməsə typing sayılır.
+ 	action := "typing"
+@@ -1602,20 +1854,28 @@
+ 		Where("conversation_id = ? AND left_at IS NULL AND deleted_at IS NULL AND COALESCE(invite_status,'active') = 'active'", conversationID).
+ 		Pluck("user_id", &memberIDs)
+ 
++	// Issue 22: göndərəni çıxarıb TƏK toplu fan-out (əvvəl üzv başına ayrıca
++	// marshal + kilid + Run döngüsü ilə rendezvous vardı).
++	targets := make([]uint, 0, len(memberIDs))
+ 	for _, mid := range memberIDs {
+ 		if mid == userID {
+ 			continue // göndərənə qaytarma
+ 		}
+-		h.SendToUser(mid, "group_typing", map[string]interface{}{
+-			"conversation_id": conversationID,
+-			"user_id":         userID,
+-			"typing":          isTyping,
+-			"action":          action,
+-			"sender_name":     sender.Name,
+-			"sender_username": sender.Username,
+-			"sender_avatar":   utils.PrependBaseURL(sender.ProfileImage),
+-		})
++		targets = append(targets, mid)
++	}
++	if len(targets) == 0 {
++		return
+ 	}
++
++	h.SendToMultipleUsers(targets, "group_typing", map[string]interface{}{
++		"conversation_id": conversationID,
++		"user_id":         userID,
++		"typing":          isTyping,
++		"action":          action,
++		"sender_name":     sender.Name,
++		"sender_username": sender.Username,
++		"sender_avatar":   utils.PrependBaseURL(sender.ProfileImage),
++	})
+ }
+ 
+ // handleAddReaction mesaja reaction ekle
+--- a/websocket/hub_xmpp.go	2026-07-26 11:13:48.000000000 +0000
++++ b/websocket/hub_xmpp.go	2026-07-26 14:27:04.514414200 +0000
+@@ -17,6 +17,7 @@
+ 	"time"
+ 
+ 	"beanpon_messenger/models"
++	"beanpon_messenger/services"
+ 	"beanpon_messenger/xmpp"
+ 
+ 	"github.com/google/uuid"
+@@ -90,6 +91,12 @@
+ 	//
+ 	// İndi WS yolu ilə birebir: şifrələ → (insert + conversation yeniləməsi
+ 	// TEK transaction) → yalnız uğurda yay.
++	// Issue 56: `text` hələ AÇIQ mətndir — S3 media açarlarını burada
++	// "istifadə olunub" işarələ. Bu sətir olmasa XMPP istemçisindən gələn
++	// media 24 saat sonra sahibsiz sayılıb S3-dən silinərdi, halbuki mesaj
++	// hələ ona işarə edir (XMPP açılan gün "şəkil yüklənmir" kimi görünərdi).
++	services.MarkMediaReferenced(text)
++
+ 	encryptedText, encErr := h.encryptionService.EncryptMessage(text)
+ 	if encErr != nil {
+ 		log.Printf("XMPP IngestDM encrypt failed: %v", encErr)
+--- /dev/null	2026-07-26 13:30:38.463095057 +0000
++++ b/websocket/typing_gate.go	2026-07-26 14:25:24.378645933 +0000
+@@ -0,0 +1,225 @@
++package websocket
++
++import (
++	"sync"
++	"time"
++
++	"beanpon_messenger/models"
++)
++
++// ── Issue 16 — "yazır…" siqnallarında blok yoxlaması + sürət limiti ──────────
++//
++// PROBLEM
++// `typing` / `typing_stop` / `recording` / `recording_stop` frame-ləri HEÇ BİR
++// yoxlamadan birbaşa `SendToUser(msg.ReceiverID, ...)`-a ötürülürdü. İki ayrı
++// zəiflik:
++//
++//  1. BLOK KEÇİLİR. `receiver_id` tamamilə istemçinin nəzarətindədir. Sizi
++//     bloklamış (və ya sizin bloklamış olduğunuz) istifadəçi hər saniyə
++//     "X yazır…" göndərə bilirdi. Mesaj göndərə bilməyən adam beləliklə
++//     hədəfin ekranında görünməyə davam edirdi — blokun mənası itir.
++//     Bütün digər yollarda (`SendMessage`, WS `send_message`) blok yoxlanılır;
++//     yalnız burada yoxlanmırdı.
++//
++//  2. SÜRƏT LİMİTİ YOXDUR. Bir soket saniyədə minlərlə frame göndərib
++//     İSTƏNİLƏN user id-yə yönləndirə bilirdi. Hər frame hədəfin `Send`
++//     buferinə yazılır → bufer dolur → hədəf "yavaş istehlakçı" sayılıb
++//     BAĞLANTIDAN ATILIR (bax `enqueueEvict`). Yəni bir istifadəçi digərini
++//     WebSocket-dən qopara bilirdi.
++//
++// HƏLL — ASİMMETRİK QAPI
++// Start və stop siqnalları FƏRQLİ qaydalarla süzülür, çünki onların istemçi
++// semantikası fərqlidir:
++//
++//   • START (`typing` / `recording`) — istemçi bunu KEEPALIVE kimi təkrar
++//     göndərir (qarşı tərəfin göstəricisi bir neçə saniyədən sonra özü sönür).
++//     Ona görə təkrarlar UDULMUR, sadəcə minimal intervalla (800 ms)
++//     seyrəldilir: istifadəçi hər tuş vuruşunda frame göndərsə də şəbəkəyə
++//     saniyədə ~1 frame çıxır.
++//
++//   • STOP (`typing_stop` / `recording_stop`) — yalnız KƏNAR-TETİKLƏMƏ ilə
++//     buraxılır: qarşı tərəfə əvvəlcədən "yazır" göndərilməyibsə stop
++//     siqnalının ötürüləcək məlumatı YOXDUR və atılır. Yalnız start-a limit
++//     qoymaq KİFAYƏT DEYİLDİ — hücumçu `typing_stop` seli qurub qurbanın
++//     `Send` buferini doldurub onu BAĞLANTIDAN ATDIRA bilirdi.
++//
++// Stop siqnalı vəziyyət `true` olduqda HƏMİŞƏ ötürülür — hətta blok ARADA
++// qoyulmuş olsa belə. Əks halda blok anında qurbanın ekranında əbədi
++// "X yazır…" ilişib qalardı.
++//
++// Blok qərarı 30 saniyə keşlənir (hər frame-də DB sorğusu YOX). Keş qəsdən
++// qısadır: yeni qoyulan blok ən çox 30 saniyə gec təsir edir.
++
++const (
++	typingBlockCacheTTL = 30 * time.Second
++	typingMinInterval   = 800 * time.Millisecond
++	// typingPeerIdleTTL — bu müddət ərzində toxunulmayan qeyd zibil sayılır.
++	typingPeerIdleTTL = 10 * time.Minute
++	// typingGateMaxPeers — bir client-in keşdə saxlaya biləcəyi maksimum
++	// qarşı tərəf sayı.
++	//
++	// DİQQƏT: dolduqda keşi TAM TƏMİZLƏMƏK OLMAZ — hücumçu hər frame-də YENİ
++	// `receiver_id` göndərib limiti sıfırlaya və beləliklə sürət limitini
++	// tamamilə keçə bilər. Bunun əvəzinə əvvəlcə KÖHNƏLMİŞ qeydlər atılır;
++	// yer yenə açılmasa YENİ qarşı tərəflərə siqnal BURAXILMIR (mövcud
++	// söhbətlər təsirlənmir).
++	typingGateMaxPeers = 256
++)
++
++type typingPeerState struct {
++	blocked        bool
++	blockCheckedAt time.Time
++	lastStartSent  time.Time
++	// sentTyping — bu qarşı tərəfə SON ÖTÜRÜLƏN vəziyyət.
++	sentTyping bool
++	// touchedAt — zibil toplama üçün son toxunma vaxtı.
++	touchedAt time.Time
++}
++
++// typingGate — client başına "yazır…" siqnal qapısı.
++type typingGate struct {
++	mu    sync.Mutex
++	peers map[uint]*typingPeerState
++}
++
++func newTypingGate() *typingGate {
++	return &typingGate{peers: make(map[uint]*typingPeerState)}
++}
++
++// pruneLocked — köhnəlmiş qeydləri atır. Çağıran `mu`-nu tutmalıdır.
++func (g *typingGate) pruneLocked(now time.Time) {
++	for k, st := range g.peers {
++		if now.Sub(st.touchedAt) > typingPeerIdleTTL {
++			delete(g.peers, k)
++		}
++	}
++}
++
++// allow — bu `receiverID`-yə "yazır/səs yazır" siqnalı ötürülsünmü?
++//
++// `isStart` — true: "yazmağa başladı", false: "dayandırdı".
++func (g *typingGate) allow(h *Hub, senderID, receiverID uint, isStart bool) bool {
++	if receiverID == 0 || receiverID == senderID {
++		return false
++	}
++
++	now := time.Now()
++
++	g.mu.Lock()
++	st, ok := g.peers[receiverID]
++	if !ok {
++		// Vəziyyəti OLMAYAN qarşı tərəfə DAYANDIRMA siqnalı mənasızdır
++		// (heç vaxt "yazır" göndərməmişik) — qeyd də açmırıq. Bu, hücumçunun
++		// `typing_stop` seli ilə keşi doldurmasının qarşısını alır.
++		if !isStart {
++			g.mu.Unlock()
++			return false
++		}
++		if len(g.peers) >= typingGateMaxPeers {
++			g.pruneLocked(now)
++			if len(g.peers) >= typingGateMaxPeers {
++				g.mu.Unlock()
++				return false // yer yoxdur — siqnalı at (mövcud söhbətlər qorunur)
++			}
++		}
++		st = &typingPeerState{}
++		g.peers[receiverID] = st
++	}
++	st.touchedAt = now
++
++	// STOP — kənar-tetikləmə: "yazır" göndərilməyibsə ötürüləcək bir şey yoxdur.
++	// Bu, təkrarlanan `typing_stop` selini TAM udur (DoS vektoru bağlanır).
++	// Vəziyyət `true` idisə isə blokdan ASILI OLMAYARAQ ötürülür ki, qarşı
++	// tərəfdə göstərici ilişib qalmasın.
++	if !isStart {
++		if !st.sentTyping {
++			g.mu.Unlock()
++			return false
++		}
++		st.sentTyping = false
++		g.mu.Unlock()
++		return true
++	}
++
++	// START — təkrarlar keepalive-dır, udulmur; yalnız seyrəldilir.
++	if !st.lastStartSent.IsZero() && now.Sub(st.lastStartSent) < typingMinInterval {
++		g.mu.Unlock()
++		return false
++	}
++
++	needBlockCheck := st.blockCheckedAt.IsZero() || now.Sub(st.blockCheckedAt) > typingBlockCacheTTL
++	blocked := st.blocked
++	g.mu.Unlock()
++
++	if needBlockCheck {
++		// DB sorğusu kilid TUTMADAN — kilid altında I/O etmirik.
++		blocked = models.IsBlocked(h.db, senderID, receiverID)
++		g.mu.Lock()
++		if cur, ok := g.peers[receiverID]; ok {
++			cur.blocked = blocked
++			cur.blockCheckedAt = now
++		}
++		g.mu.Unlock()
++	}
++
++	if blocked {
++		return false
++	}
++
++	g.mu.Lock()
++	if cur, ok := g.peers[receiverID]; ok {
++		cur.lastStartSent = now
++		cur.sentTyping = true
++	}
++	g.mu.Unlock()
++	return true
++}
++
++// allowGroupTyping — qrup "yazır…" siqnalları üçün qapı.
++// Üzvlük yoxlaması `handleGroupTyping` içindədir; burada vəziyyət izlənməsi
++// və tezlik məhdudlaşdırması var (bir qrup frame-i N üzvə yayıldığı üçün
++// gücləndirmə əmsalı DM-dən qat-qat böyükdür).
++func (g *typingGate) allowGroupTyping(conversationID uint, isStart bool) bool {
++	if conversationID == 0 {
++		return false
++	}
++	// Qrup açarları DM user id-ləri ilə toqquşmasın deyə ayrı ad fəzası.
++	// (Toqquşma üçün user id ≈ 1.8e19 olmalıdır — mümkün deyil.)
++	key := ^conversationID
++
++	now := time.Now()
++	g.mu.Lock()
++	defer g.mu.Unlock()
++
++	st, ok := g.peers[key]
++	if !ok {
++		if !isStart {
++			return false
++		}
++		if len(g.peers) >= typingGateMaxPeers {
++			g.pruneLocked(now)
++			if len(g.peers) >= typingGateMaxPeers {
++				return false
++			}
++		}
++		st = &typingPeerState{}
++		g.peers[key] = st
++	}
++	st.touchedAt = now
++
++	// STOP — kənar-tetikləmə (DM ilə eyni məntiq).
++	if !isStart {
++		if !st.sentTyping {
++			return false
++		}
++		st.sentTyping = false
++		return true
++	}
++	// START — keepalive; seyrəldilir, udulmur.
++	if !st.lastStartSent.IsZero() && now.Sub(st.lastStartSent) < typingMinInterval {
++		return false
++	}
++	st.lastStartSent = now
++	st.sentTyping = true
++	return true
++}
+--- /dev/null	2026-07-26 13:30:38.463095057 +0000
++++ b/MIGRATION_chat_media_objects.md	2026-07-26 14:05:32.124076386 +0000
+@@ -0,0 +1,116 @@
++# MIGRATION — `chat_media_objects` (Issue 56: sahibsiz S3 obyektləri)
++
++## Problem
++
++`POST /messenger/upload-media` və `/messenger/upload-voice` faylı S3-ə yazıb
++URL qaytarır. Mesajın **göndərilməsi** isə AYRI bir sorğudur. Aralarında hər
++şey baş verə bilər:
++
++* istifadəçi şəkli composer-dən silir / fikrini dəyişir,
++* tətbiq öldürülür, şəbəkə qopur,
++* göndərmə icazə xətası (blok, spam-ban, qrup icazəsi) ilə rədd olunur.
++
++Bu hallarda obyekt S3-də **əbədi** qalırdı: heç bir mesaj ona istinad etmir,
++heç bir yerdə qeydi yoxdur, üstəlik `S3Uploader`-də **`Delete` metodu belə
++yox idi**. Bucket ölçüsü yalnız artırdı.
++
++## Niyə daha sadə həllər işləmir
++
++**Bucket lifecycle qaydası ("N gündən köhnəni sil") — YOX.**
++İstinad olunan media ilə sahibsiz eyni prefiksdədir (`images/user_7/…`).
++Belə qayda istifadəçinin real şəkillərini də silərdi.
++
++**"Mesaj silinəndə obyekti də sil" — YOX.**
++İki səbəb:
++
++1. Mesaj mətni `encrypted_text` sütununda **şifrəli** saxlanılır → server
++   tərəfdə "bu açara neçə mesaj istinad edir?" sualını SQL ilə cavablamaq
++   mümkün deyil.
++2. `BroadcastMessage` **eyni** media URL-ini 20 alıcıya ayrı-ayrı mesaj sətri
++   kimi yazır — birini silmək qalan 19-u sındırardı.
++
++## Həll — istinad izləməsi
++
++* Yükləmə anında `chat_media_objects`-ə sətir yazılır.
++* Mesaj göndərilərkən mətn **hələ açıq** olduğu an (şifrələmədən ƏVVƏL)
++  içindəki S3 açarları çıxarılır və `referenced_at` yazılır.
++* Arxa-plan təmizləyicisi YALNIZ `referenced_at IS NULL` **və** yaşı 24
++  saatdan böyük sətirləri silir (əvvəl S3-dən, sonra cədvəldən).
++
++İstinad olunan media heç vaxt silinmir; broadcast təhlükəsizdir.
++
++## Tətbiq
++
++```sql
++CREATE TABLE IF NOT EXISTS chat_media_objects (
++    id            BIGSERIAL PRIMARY KEY,
++    user_id       BIGINT      NOT NULL,
++    s3_key        VARCHAR(512) NOT NULL,
++    referenced_at TIMESTAMPTZ NULL,
++    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
++);
++
++-- Təkrar yazılışın qarşısını alır (eyni açar iki dəfə qeydə düşməsin).
++CREATE UNIQUE INDEX IF NOT EXISTS chat_media_objects_s3_key_uniq
++    ON chat_media_objects (s3_key);
++
++-- Təmizləyicinin isti sorğusu: WHERE referenced_at IS NULL AND created_at < ?
++CREATE INDEX IF NOT EXISTS chat_media_objects_orphan_idx
++    ON chat_media_objects (created_at)
++    WHERE referenced_at IS NULL;
++
++CREATE INDEX IF NOT EXISTS chat_media_objects_user_idx
++    ON chat_media_objects (user_id);
++```
++
++`CREATE INDEX CONCURRENTLY` yalnız cədvəldə artıq data varsa lazımdır — yeni
++cədvəl üçün adi forma kifayətdir.
++
++## Deploy sırası SƏRBƏSTDİR
++
++Kod **fail-open**-dur: cədvəl yoxdursa `MediaTracker` ilk xətada özünü
++söndürür (`42P01 / does not exist`), bir dəfə log yazır və bir daha DB-yə
++vurmur. Yükləmə və göndərmə axınları **heç bir şəkildə pozulmur** — sadəcə
++təmizləmə işləmir. Ona görə miqrasiyanı deploy-dan əvvəl də, sonra da
++çalışdıra bilərsiniz.
++
++## Tənzimləmə
++
++`services/media_gc.go` daxilində (`NewMediaTracker`):
++
++| Sahə | Default | Mənası |
++|---|---|---|
++| `orphanTTL` | 24 saat | Bu müddətdən artıq istinadsız = sahibsiz |
++| `sweepEvery` | 30 dəqiqə | Təmizləmə dövrü |
++| `batchSize` | 500 | Bir dövrdə maksimum silinən obyekt |
++
++`orphanTTL`-i 24 saatdan aşağı salmayın: istifadəçi şəkli seçib telefonu
++kənara qoya, sonra göndərə bilər.
++
++## Geriyə dönük təmizləmə (opsional, BİR DƏFƏLİK)
++
++Miqrasiyadan ƏVVƏL yüklənmiş sahibsiz obyektlər cədvəldə yoxdur, ona görə
++təmizləyici onlara toxunmur (təhlükəsiz default). Onları təmizləmək üçün
++S3 tərəfdə obyekt siyahısını çıxarıb `messages` cədvəlindəki istinadlarla
++tutuşdurmaq lazımdır — **amma mətn şifrəli olduğu üçün bu, yalnız tətbiq
++səviyyəsində (deşifrə edərək) mümkündür**. Tövsiyə: bunu ayrıca bir dəfəlik
++skript kimi, iş saatlarından kənarda və əvvəlcə `--dry-run` ilə çalışdırın.
++
++## Yoxlama
++
++```sql
++-- İzləmə işləyirmi? (yükləmədən sonra sətir görünməlidir)
++SELECT COUNT(*) FROM chat_media_objects;
++
++-- Neçəsi istinadsızdır və nə qədər köhnədir?
++SELECT COUNT(*) AS orphan_count, MIN(created_at) AS oldest
++FROM chat_media_objects
++WHERE referenced_at IS NULL;
++
++-- Sağlam vəziyyət: göndərilən mesajların mediası tez işarələnir.
++SELECT
++  COUNT(*) FILTER (WHERE referenced_at IS NOT NULL) AS referenced,
++  COUNT(*) FILTER (WHERE referenced_at IS NULL)     AS pending
++FROM chat_media_objects
++WHERE created_at > NOW() - INTERVAL '1 hour';
++```
+--- /dev/null	2026-07-26 13:30:38.463095057 +0000
++++ b/MIGRATION_invite_token_ttl.md	2026-07-26 14:28:54.312033967 +0000
+@@ -0,0 +1,105 @@
++# MIGRATION — dəvət linklərinə müddət (Issue 18)
++
++## Problem
++
++`conversations.invite_token_expires_at` sütunu **mövcud idi** və qoşulma
++yollarında (`PreviewByToken`, `JoinByToken`) yoxlanılırdı — amma **heç bir
++yerdə TƏYİN EDİLMİRDİ**. Nə qrup yaradılanda, nə də `RefreshInviteToken`-də.
++Yoxlama həmişə `NULL` görüb keçirdi, yəni **hər dəvət linki əbədi idi**:
++
++* bir dəfə paylaşılan link (skrinşot, forward, arxivlənmiş söhbət, indekslənmiş
++  veb səhifə) aylar sonra da qrupa giriş verirdi;
++* `RefreshInviteToken` yalnız tokeni dəyişirdi → admin "bu link nə vaxta qədər
++  etibarlıdır?" sualına cavab verə bilmirdi.
++
++## Kod tərəfi (miqrasiya TƏLƏB ETMİR)
++
++`handlers/group_handler.go`:
++
++* `inviteTokenExpiry(now)` — `INVITE_TOKEN_TTL_HOURS` mühit dəyişənindən oxuyur,
++  default **168 saat (7 gün)**. `0` → müddətsiz (açıq seçim).
++* `CreateGroup` — yeni qrupun tokeninə TTL yazır.
++* `RefreshInviteToken` — yenilənən tokenə TTL yazır və cavabda
++  `invite_token_expires_at` qaytarır.
++
++Bu dəyişiklik **yalnız yeni yaradılan/yenilənən** tokenlərə təsir edir.
++
++## ⚠️ MÖVCUD QRUPLAR — BACKFILL (ayrıca qərar)
++
++Kod dəyişikliyi köhnə qrupların linklərinə **toxunmur**: onların
++`invite_token_expires_at` dəyəri `NULL` qalır və linkləri **əbədi işləməyə
++davam edir**. Yəni əsl risk (indiyə qədər yayılmış bütün linklər) yalnız
++aşağıdakı backfill ilə bağlanır.
++
++Bu qəsdən ayrı addımdır: backfill bir anda **bütün** mövcud dəvət linklərini
++etibarsız edir. Bu, məhsul qərarıdır — istifadəçilərə əvvəlcədən xəbər verilməli
++və adminlərin "linki yenilə" düyməsindən xəbəri olmalıdır.
++
++### Variant A — yumşaq keçid (TÖVSİYƏ OLUNAN)
++
++Mövcud linklərə **30 günlük** möhlət verilir; bu müddətdə adminlər yeni link
++yarada bilir.
++
++```sql
++UPDATE conversations
++SET invite_token_expires_at = NOW() + INTERVAL '30 days'
++WHERE chat_type = 'group'
++  AND deleted_at IS NULL
++  AND invite_token IS NOT NULL
++  AND invite_token_expires_at IS NULL;
++```
++
++### Variant B — dərhal bağla (yüksək risk halında)
++
++Yalnız sızma şübhəsi varsa. Bütün köhnə linklər **dərhal** ölür.
++
++```sql
++UPDATE conversations
++SET invite_token_expires_at = NOW()
++WHERE chat_type = 'group'
++  AND deleted_at IS NULL
++  AND invite_token IS NOT NULL
++  AND invite_token_expires_at IS NULL;
++```
++
++### Variant C — yalnız köhnə/passiv qruplar
++
++Son 90 gündə heç bir mesaj olmayan qrupların linkləri (ən çox sızmış, ən az
++istifadə olunan) bağlanır; aktiv qruplar toxunulmur.
++
++```sql
++UPDATE conversations
++SET invite_token_expires_at = NOW()
++WHERE chat_type = 'group'
++  AND deleted_at IS NULL
++  AND invite_token IS NOT NULL
++  AND invite_token_expires_at IS NULL
++  AND COALESCE(last_message_at, created_at) < NOW() - INTERVAL '90 days';
++```
++
++## Geri qaytarma
++
++```sql
++-- Backfill-i ləğv et (linklər yenidən müddətsiz olur).
++UPDATE conversations
++SET invite_token_expires_at = NULL
++WHERE chat_type = 'group' AND deleted_at IS NULL;
++```
++
++Kod tərəfini söndürmək üçün: `INVITE_TOKEN_TTL_HOURS=0`.
++
++## Yoxlama
++
++```sql
++-- Müddətsiz link qalan qrup sayı (backfill-dən sonra 0 olmalıdır).
++SELECT COUNT(*) FROM conversations
++WHERE chat_type = 'group' AND deleted_at IS NULL
++  AND invite_token IS NOT NULL AND invite_token_expires_at IS NULL;
++
++-- Yaxın 7 gündə bitəcək linklər (adminlərə xatırlatma üçün).
++SELECT id, group_name, invite_token_expires_at
++FROM conversations
++WHERE chat_type = 'group' AND deleted_at IS NULL
++  AND invite_token_expires_at BETWEEN NOW() AND NOW() + INTERVAL '7 days'
++ORDER BY invite_token_expires_at;
++```

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"beanpon_messenger/models"
+	"beanpon_messenger/services"
 	"beanpon_messenger/xmpp"
 
 	"github.com/google/uuid"
@@ -90,6 +91,12 @@ func (h *Hub) IngestDM(senderID, receiverID uint, text, kind, replyToID, storyID
 	//
 	// İndi WS yolu ilə birebir: şifrələ → (insert + conversation yeniləməsi
 	// TEK transaction) → yalnız uğurda yay.
+	// Issue 56: `text` hələ AÇIQ mətndir — S3 media açarlarını burada
+	// "istifadə olunub" işarələ. Bu sətir olmasa XMPP istemçisindən gələn
+	// media 24 saat sonra sahibsiz sayılıb S3-dən silinərdi, halbuki mesaj
+	// hələ ona işarə edir (XMPP açılan gün "şəkil yüklənmir" kimi görünərdi).
+	services.MarkMediaReferenced(text)
+
 	encryptedText, encErr := h.encryptionService.EncryptMessage(text)
 	if encErr != nil {
 		log.Printf("XMPP IngestDM encrypt failed: %v", encErr)

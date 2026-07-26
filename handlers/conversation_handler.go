@@ -336,8 +336,9 @@ func (h *ConversationHandler) checkConversationPermission(conversation *models.C
 
 // UpdateConversationOnMessage mesaj gönderildikten sonra conversation güncelle
 func (h *ConversationHandler) UpdateConversationOnMessage(senderID, receiverID uint) error {
-	return h.UpdateConversationOnMessageTx(database.DB, senderID, receiverID,
+	_, err := h.UpdateConversationOnMessageTx(database.DB, senderID, receiverID,
 		h.ShouldSkipConversationCreate(senderID, receiverID))
+	return err
 }
 
 // ShouldSkipConversationCreate — Issue 40: mesaj banı yoxlaması REDİS I/O edir
@@ -365,21 +366,39 @@ func (h *ConversationHandler) ShouldSkipConversationCreate(senderID, receiverID 
 //
 // `skipCreate` — `ShouldSkipConversationCreate`-in transaction-dan ƏVVƏL
 // hesablanmış nəticəsi (Redis I/O transaction içində olmasın deyə).
-func (h *ConversationHandler) UpdateConversationOnMessageTx(db *gorm.DB, senderID, receiverID uint, skipCreate bool) error {
+//
+// ── Issue 10: push qapısı üçün GERÇƏK status qaytarılır ──────────────────────
+// Əvvəl bu funksiya yalnız `error` qaytarırdı və REST `SendMessage` push
+// qapısına SABİT `"active"` ötürürdü. WS yolu isə `conversation.Status`-un
+// həqiqi dəyərini ötürür. Nəticə: EYNİ mesaj REST ilə göndərildikdə push
+// GEDİR, WS ilə göndərildikdə (status `pending`/`restricted` olanda) push
+// GETMİR — yəni bildiriş davranışı NƏQLİYYATDAN asılı olurdu. iOS mətn
+// mesajlarını əsasən WS, media mesajlarını REST ilə göndərdiyi üçün
+// istifadəçi "bəzi mesajlarda bildiriş gəlir, bəzilərində yox" görürdü.
+// Üstəlik mesajlaşma istəyini (pending) hələ qəbul etməmiş adama və
+// məhdudlaşdırılmış (restricted) söhbətdə REST üzərindən push GEDİRDİ —
+// spam qapısının birbaşa deşiyi.
+//
+// İndi hər iki yol eyni mənbədən (`conversation.Status`) qidalanır.
+func (h *ConversationHandler) UpdateConversationOnMessageTx(db *gorm.DB, senderID, receiverID uint, skipCreate bool) (string, error) {
 	// 🚫 SPAM KORUMASI: mesaj banlı kullanıcı YENİ conversation başlatamaz.
 	// Conversation yoksa ve gönderenin mesaj banı varsa sessizce çık
 	// (conversation oluşturulmaz, hata da dönülmez). Conversation zaten
 	// varsa dokunma — bu kontrol yalnızca ilk conversation create için.
 	if skipCreate {
-		return nil
+		// Söhbət yaradılmadı → aktiv söhbət yoxdur → push da getmir.
+		return "", nil
 	}
 
 	conversation, err := h.getOrCreateConversationTx(db, senderID, receiverID)
 	if err != nil {
-		return err
+		return "", err
 	}
 
-	return applyConversationMessageUpdate(db, conversation, senderID)
+	if err := applyConversationMessageUpdate(db, conversation, senderID); err != nil {
+		return "", err
+	}
+	return conversation.Status, nil
 }
 
 // applyConversationMessageUpdate — Issue 14: sayğac artımı ATOMİK SQL ilə.

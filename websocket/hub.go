@@ -3,15 +3,20 @@ package websocket
 import (
 	"beanpon_messenger/config"
 	"beanpon_messenger/models"
+	"beanpon_messenger/services"
 	"beanpon_messenger/utils"
 	"beanpon_messenger/xmpp"
 	"bytes"
 	"encoding/json"
-	"github.com/google/uuid"
+	"errors"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -25,6 +30,13 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
 		return true
 	},
+	// Issue 17: token artıq `Sec-WebSocket-Protocol: bearer, <JWT>` ilə də
+	// gələ bilir (brauzer WS API-si ixtiyari başlıq göndərə bilmir, yeganə
+	// kanal budur). Protokol danışığında server SEÇİLƏN alt-protokolu geri
+	// əks etdirməlidir, yoxsa brauzer əl sıxmanı RƏDD edir. Burada həmişə
+	// "bearer" seçirik — istemçi onu göndərməyibsə gorilla boş qaytarır və
+	// davranış dəyişmir (köhnə `?token=` istemçiləri təsirlənmir).
+	Subprotocols: []string{"bearer"},
 }
 
 // Client WebSocket bağlantısını temsil eder
@@ -52,6 +64,29 @@ type Client struct {
 	// heç vaxt bağlı kanala yazmır → send-on-closed-channel panic (bütün
 	// prosesi çökdürən) tamamilə aradan qalxır. writePump `done` ilə dayanır.
 	done chan struct{}
+
+	// typing — Issue 16: "yazır…" siqnalları üçün blok yoxlaması + sürət
+	// limiti (bax websocket/typing_gate.go). Client ömürlüdür.
+	typing *typingGate
+
+	// evicting — Issue 22: `Send` buferi dolduqda client "yavaş istehlakçı"
+	// sayılır və unregister-ə göndərilir. Bu, hər uğursuz yazımda AYRI bir
+	// goroutine yaradırdı: 500 üzvlü qrupda tıxanmış bir client üçün yüzlərlə
+	// goroutine eyni unregister kanalında növbəyə düşürdü. Atomik bayraq
+	// çıxarılmanı yalnız BİR dəfə növbəyə qoyur.
+	evicting atomic.Bool
+}
+
+// enqueueEvict — Issue 22: yavaş client-i BİR dəfə unregister növbəsinə qoyur.
+// Bloklamır (unregister kanalı Run döngüsündədir və Run bu anda çağıranı
+// gözləyir ola bilər) — ona görə ayrıca goroutine-də yazılır.
+func (c *Client) enqueueEvict(h *Hub) {
+	if c.evicting.Swap(true) {
+		return // artıq növbədədir
+	}
+	go func() {
+		h.unregister <- c
+	}()
 }
 
 // closeSend client-i təhlükəsiz (idempotent) bağlayır: `Send`-i DEYİL, `done`-u
@@ -62,6 +97,11 @@ func (c *Client) closeSend() {
 		close(c.done)
 	})
 }
+
+// errClientMessageIDTaken — Issue 9: göndərilən `client_message_id` BAŞQA
+// istifadəçinin mesajına aiddir. Transaction-dan bu sentinel qaytarılır ki,
+// çağıran tərəf onu ümumi "persist failed" xətasından ayıra bilsin.
+var errClientMessageIDTaken = errors.New("client_message_id artıq istifadə olunub")
 
 // Hub tüm client'ları yönetir
 type Hub struct {
@@ -136,10 +176,13 @@ func NewHub(db *gorm.DB, encryptionService interface {
 	DecryptMessage(encryptedText string) (string, error)
 }, config *config.Config) *Hub { // ← config parametri əlavə
 	return &Hub{
-		clients:           make(map[uint]*Client),
-		register:          make(chan *Client),
-		unregister:        make(chan *Client),
-		broadcast:         make(chan *Message),
+		clients:    make(map[uint]*Client),
+		register:   make(chan *Client),
+		unregister: make(chan *Client),
+		// Issue 22: bu kanalın artıq daxili yazıcısı yoxdur (`SendToUser`
+		// birbaşa çatdırır). Geriyə uyğunluq üçün saxlanılır və buferlənir ki,
+		// gələcək bir yazıcı `Run` ilə rendezvous-a məcbur qalmasın.
+		broadcast:         make(chan *Message, 256),
 		db:                db,
 		encryptionService: encryptionService,
 		httpClient:        &http.Client{Timeout: 10 * time.Second}, // ← YENI
@@ -184,6 +227,10 @@ func (h *Hub) registerClient(client *Client) {
 	//online oldugunu yazir
 	h.setUserOnline(client.UserID)
 
+	// Issue 4: paylaşılan presence — digər instanslar da bu istifadəçinin
+	// onlayn olduğunu görsün (`IsUserOnline` yalan danışmasın).
+	h.writePresence(client.UserID, 0, 0)
+
 	// XMPP: this user is on a legacy WS client → mark them OLD in the registry
 	// so the egress seam routes their incoming messages over legacy WS. No-op
 	// when XMPP is disabled.
@@ -217,6 +264,9 @@ func (h *Hub) unregisterClient(client *Client) {
 
 		h.setUserOffline(client.UserID)
 
+		// Issue 4: paylaşılan presence qeydini götür (yalnız BİZƏ aiddirsə).
+		h.clearPresence(client.UserID)
+
 		client.closeSend()
 
 		_ = client.Conn.Close()
@@ -242,38 +292,74 @@ func (h *Hub) broadcastUserStatus(userID uint, status string) {
 		},
 	}
 
-	// Tüm bağlı kullanıcılara gönder
+	// Tüm bağlı kullanıcılara gönder.
+	// Issue 22: payload BİR dəfə marshal olunur (əvvəl hər alıcı üçün ayrıca
+	// JSON marshal edilirdi — N bağlı client = N marshal).
+	payload := h.messageToBytes(statusMessage)
+	if payload == nil {
+		return
+	}
 	for _, client := range h.clients {
 		if client.UserID != userID { // Kendisi hariç
 			select {
-			case client.Send <- h.messageToBytes(statusMessage):
+			case client.Send <- payload:
 			default:
-				go func(c *Client) {
-					h.unregister <- c
-				}(client)
+				client.enqueueEvict(h)
 			}
 		}
 	}
 }
 
-// broadcastMessage mesajı yayınla
+// broadcastMessage — köhnə `h.broadcast` kanalı üçün saxlanılan nazik örtük.
 func (h *Hub) broadcastMessage(message *Message) {
-	h.mutex.RLock()
-	defer h.mutex.RUnlock()
+	h.deliver(message)
+}
 
-	if client, exists := h.clients[message.ReceiverID]; exists {
-		select {
-		case client.Send <- h.messageToBytes(message):
-			// Canlı new_message push-u BAĞLI alıcıya çatdısa (kanala yazıla
-			// bildi) → server tərəfdə dərhal delivered=true (WhatsApp davranışı,
-			// ani iki tick). Uğursuz göndərmə (default branch) bura düşmür.
-			h.maybeMarkLivePushDelivered(message)
-		default:
-			go func() {
-				h.unregister <- client
-			}()
-		}
+// deliver — mesajı alıcının `Send` buferinə non-blocking yazır.
+//
+// Issue 22: əvvəllər HƏR göndərmə BUFERSİZ `h.broadcast` kanalından keçib TƏK
+// `Run` goroutine-i tərəfindən növbə ilə emal olunurdu. Nəticələr:
+//   - head-of-line blocking: `SendToMultipleUsers` 500 üzvlü qrupda 500 dəfə
+//     `Run` ilə rendezvous edirdi; bu müddətdə `register`/`unregister` də
+//     dayanırdı → yeni bağlantılar və təmizləmə gecikirdi;
+//   - bir yavaş/tıxanmış client bütün prosesin throughput tavanını təyin edirdi;
+//   - hər uğursuz yazım AYRI goroutine yaradıb `unregister`-də növbəyə düşürdü.
+//
+// İndi çatdırma çağıranın öz goroutine-ində, yalnız qısa `RLock` altında baş
+// verir. Per-client sıra POZULMUR — hər client-in öz `Send` kanalı və tək
+// `writePump`-ı var, sıralamanı o təmin edir.
+func (h *Hub) deliver(message *Message) {
+	h.mutex.RLock()
+	client, exists := h.clients[message.ReceiverID]
+	h.mutex.RUnlock()
+	if !exists {
+		return
 	}
+
+	payload := h.messageToBytes(message)
+	if payload == nil {
+		return
+	}
+
+	select {
+	case client.Send <- payload:
+		// Canlı new_message push-u BAĞLI alıcıya çatdısa (kanala yazıla
+		// bildi) → server tərəfdə dərhal delivered=true (WhatsApp davranışı,
+		// ani iki tick). Uğursuz göndərmə (default branch) bura düşmür.
+		h.maybeMarkLivePushDelivered(message)
+	default:
+		client.enqueueEvict(h)
+	}
+}
+
+// deliverWithCluster — lokal çatdırma + Issue 4 üçün digər instanslara yayım.
+// Alıcı bu instansda TAPILSA DA yayım edilir: istifadəçi reconnect anında
+// başqa instansa keçmiş ola bilər və uzaq instansda ona çatmalıdır. Uzaq
+// tərəf onu tapmazsa frame sadəcə atılır (ucuz), tapsa istemçi id-yə görə
+// dublikatı özü süzür.
+func (h *Hub) deliverWithCluster(message *Message) {
+	h.deliver(message)
+	h.publishCluster([]uint{message.ReceiverID}, message.Type, message.Data)
 }
 
 // maybeMarkLivePushDelivered — canlı `new_message` push-u bağlı alıcının Send
@@ -343,19 +429,112 @@ func (h *Hub) maybeMarkLivePushDelivered(message *Message) {
 
 // SendToUser belirli kullanıcıya mesaj gönder
 func (h *Hub) SendToUser(userID uint, messageType string, data interface{}) {
-	message := &Message{
+	h.deliverWithCluster(&Message{
 		Type:       messageType,
 		ReceiverID: userID,
 		Data:       data,
-	}
-	h.broadcast <- message
+	})
 }
 
-// SendToMultipleUsers birden fazla kullanıcıya mesaj gönder
+// SendToMultipleUsers birden fazla kullanıcıya mesaj gönder.
+//
+// Issue 22: qrup fan-out-u üçün isti yol. Əvvəl hər alıcı üçün ayrıca
+// marshal + ayrıca kilid + `Run` döngüsü ilə ayrıca rendezvous vardı
+// (N alıcı = 3N sinxronizasiya nöqtəsi). İndi: tək marshal, tək RLock
+// snapshot-u, sonra kilidsiz non-blocking yazımlar.
 func (h *Hub) SendToMultipleUsers(userIDs []uint, messageType string, data interface{}) {
-	for _, userID := range userIDs {
-		h.SendToUser(userID, messageType, data)
+	if len(userIDs) == 0 {
+		return
 	}
+
+	// `new_message` (DM) çatdırma-işarələmə yan effekti daşıyır — onu
+	// `deliver` yolunda saxlayırıq ki, davranış dəyişməsin.
+	if messageType == "new_message" {
+		unique := make([]uint, 0, len(userIDs))
+		seen := make(map[uint]struct{}, len(userIDs))
+		for _, userID := range userIDs {
+			if _, dup := seen[userID]; dup {
+				continue
+			}
+			seen[userID] = struct{}{}
+			unique = append(unique, userID)
+			h.deliver(&Message{Type: messageType, ReceiverID: userID, Data: data})
+		}
+		// Issue 4: bütün alıcılar üçün TƏK yayım (alıcı başına ayrıca deyil).
+		h.publishCluster(unique, messageType, data)
+		return
+	}
+
+	payload := h.messageToBytes(&Message{Type: messageType, Data: data})
+	if payload == nil {
+		return
+	}
+
+	// Alıcı snapshot-u TƏK RLock altında. Təkrarlanan id-lər süzülür —
+	// əks halda eyni client eyni frame-i iki dəfə alırdı.
+	seen := make(map[uint]struct{}, len(userIDs))
+	targets := make([]*Client, 0, len(userIDs))
+	h.mutex.RLock()
+	for _, userID := range userIDs {
+		if _, dup := seen[userID]; dup {
+			continue
+		}
+		seen[userID] = struct{}{}
+		if client, ok := h.clients[userID]; ok {
+			targets = append(targets, client)
+		}
+	}
+	h.mutex.RUnlock()
+
+	for _, client := range targets {
+		select {
+		case client.Send <- payload:
+		default:
+			client.enqueueEvict(h)
+		}
+	}
+
+	// Issue 4: lokal olmayan alıcılar üçün digər instanslara TƏK yayım.
+	unique := make([]uint, 0, len(seen))
+	for userID := range seen {
+		unique = append(unique, userID)
+	}
+	h.publishCluster(unique, messageType, data)
+}
+
+// FilterUsersInGroupChat — Issue 23: verilmiş id siyahısından hazırda BU qrup
+// səhifəsi AÇIQ olanları qaytarır. Əvvəl çağıran tərəf hər üzv üçün ayrıca
+// `IsUserInGroupChat` çağırırdı → N dəfə RLock alıb-buraxma. İndi tək kilid.
+func (h *Hub) FilterUsersInGroupChat(userIDs []uint, conversationID uint) []uint {
+	if len(userIDs) == 0 {
+		return nil
+	}
+	out := make([]uint, 0, len(userIDs))
+	missing := make([]uint, 0, len(userIDs))
+
+	h.mutex.RLock()
+	for _, userID := range userIDs {
+		client, ok := h.clients[userID]
+		if !ok {
+			missing = append(missing, userID)
+			continue
+		}
+		if client.ActiveGroupChat != nil && *client.ActiveGroupChat == conversationID {
+			out = append(out, userID)
+		}
+	}
+	h.mutex.RUnlock()
+
+	// Issue 4: lokal olmayan üzvlər üçün paylaşılan presence — TƏK MGET
+	// gedişi (üzv başına GET 5000-lik qrupda fəlakət olardı).
+	if len(missing) > 0 && conversationID != 0 {
+		for userID, rec := range remotePresenceMany(missing) {
+			if rec.Group == conversationID {
+				out = append(out, userID)
+			}
+		}
+	}
+	return out
 }
 
 // HandleNewMessage yeni mesajı handle et ve WebSocket üzerinden yayınla
@@ -474,8 +653,25 @@ func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, ms
 		return
 	}
 
-	// 🎯 Sadece active conversation'larda notification gönder
-	if conversationStatus == "active" {
+	// ── Issue 10: push qapısı ────────────────────────────────────────────────
+	//
+	// Əvvəl yalnız `"active"` buraxılırdı, LAKİN REST yolu bura HƏMİŞƏ sabit
+	// `"active"` ötürürdü — yəni praktikada REST hər statusda push göndərirdi,
+	// WS isə yalnız `active`-də. Eyni mesaj nəqliyyatdan asılı olaraq bildiriş
+	// doğurur və ya doğurmurdu.
+	//
+	// İndi hər iki yol GERÇƏK statusu ötürür və qapı BURADA, bir yerdə qərar
+	// verir:
+	//   • "active"   → normal söhbət, push var (dəyişmədi);
+	//   • "pending"  → MESAJ İSTƏYİ. Push VAR — istifadəçi tanımadığı adamdan
+	//                  gələn ilk mesajı görməlidir (REST-də onsuz da gedirdi,
+	//                  yalnız WS-də yox idi). Spam qapısı `CanSendMessage`-in
+	//                  `max_pending_messages` limiti + shadow-ban ilə qorunur;
+	//   • "restricted" → tək tərəfli mesaj limiti aşılıb, söhbət kilidli →
+	//                  push YOXDUR (əvvəl REST üzərindən GEDİRDİ — spam deşiyi);
+	//   • ""         → söhbət ümumiyyətlə yaradılmayıb (mesaj banı) → push yox.
+	switch conversationStatus {
+	case "active", "pending":
 		if !h.IsUserOnline(receiverID) {
 			go h.sendPushNotification(senderID, receiverID, content, msgType)
 		} else if !h.IsUserInChatWith(receiverID, senderID) {
@@ -528,12 +724,21 @@ func (h *Hub) HandleMessageRead(messageID string, senderID, readerID uint) {
 	log.Printf("Mesaj okundu WebSocket üzerinden yayınlandı: %s", messageID)
 }
 
-// IsUserOnline kullanıcının online olup olmadığını kontrol et
+// IsUserOnline kullanıcının online olup olmadığını kontrol et.
+//
+// Issue 4: əvvəl YALNIZ bu prosesin map-inə baxırdı. İki replica ilə
+// B instansındakı onlayn istifadəçi A-da "offline" görünürdü → çatda
+// oturduğu halda ona push gedirdi. İndi lokal map (sürətli yol) tapmasa
+// paylaşılan presence yoxlanılır.
 func (h *Hub) IsUserOnline(userID uint) bool {
 	h.mutex.RLock()
-	defer h.mutex.RUnlock()
 	_, exists := h.clients[userID]
-	return exists
+	h.mutex.RUnlock()
+	if exists {
+		return true
+	}
+	_, remote := remotePresence(userID)
+	return remote
 }
 
 // GetConnectedUsersCount bağlı kullanıcı sayısı
@@ -747,6 +952,7 @@ func (h *Hub) HandleWebSocket(c *gin.Context) {
 		Send:   make(chan []byte, 256),
 		Hub:    h,
 		done:   make(chan struct{}),
+		typing: newTypingGate(), // Issue 16
 	}
 
 	h.register <- client
@@ -812,54 +1018,33 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 		}
 		c.sendMessage(response)
 
+	// Issue 16: bütün "yazır…" siqnalları eyni qapıdan keçir — blok yoxlaması
+	// (30 sn keşli) + başlanğıc siqnalları üçün sürət limiti. Bax
+	// websocket/typing_gate.go.
 	case "typing":
 		// Yazıyor durumunu karşı tarafa bildir (action: text yazma)
-		if msg.ReceiverID > 0 {
-			c.Hub.SendToUser(msg.ReceiverID, "user_typing", map[string]interface{}{
-				"user_id": c.UserID,
-				"typing":  true,
-				"action":  "typing",
-			})
-		}
+		c.emitTypingSignal(msg.ReceiverID, "typing", true)
 
 	case "typing_stop":
 		// Yazmayı bıraktı durumunu karşı tarafa bildir
-		if msg.ReceiverID > 0 {
-			c.Hub.SendToUser(msg.ReceiverID, "user_typing", map[string]interface{}{
-				"user_id": c.UserID,
-				"typing":  false,
-				"action":  "typing",
-			})
-		}
+		c.emitTypingSignal(msg.ReceiverID, "typing", false)
 
 	case "recording":
 		// Səs mesajı yazır (mic basılı tutub) — qarşı tərəfə bildir.
 		// Eyni user_typing event-i, amma action: recording.
-		if msg.ReceiverID > 0 {
-			c.Hub.SendToUser(msg.ReceiverID, "user_typing", map[string]interface{}{
-				"user_id": c.UserID,
-				"typing":  true,
-				"action":  "recording",
-			})
-		}
+		c.emitTypingSignal(msg.ReceiverID, "recording", true)
 
 	case "recording_stop":
 		// Səs yazmağı dayandırdı (buraxdı/ləğv etdi).
-		if msg.ReceiverID > 0 {
-			c.Hub.SendToUser(msg.ReceiverID, "user_typing", map[string]interface{}{
-				"user_id": c.UserID,
-				"typing":  false,
-				"action":  "recording",
-			})
-		}
+		c.emitTypingSignal(msg.ReceiverID, "recording", false)
 
 	case "group_typing":
 		// Qrupda yazma — həmin qrupun digər üzvlərinə bildir.
-		c.Hub.handleGroupTyping(c.UserID, msg.Data, true)
+		c.Hub.handleGroupTyping(c.UserID, msg.Data, true, c.typing)
 
 	case "group_typing_stop":
 		// Qrupda yazmağı dayandırdı.
-		c.Hub.handleGroupTyping(c.UserID, msg.Data, false)
+		c.Hub.handleGroupTyping(c.UserID, msg.Data, false, c.typing)
 
 	case "get_online_users":
 		// Online kullanıcı listesini gönder
@@ -975,7 +1160,28 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 			return
 		}
 
-		messageID := uuid.New().String()
+		// Issue 9: idempotentlik — istemçi mesajın UUID-ni özü verə bilir
+		// (`client_message_id`). WS bağlantısı qopub yenidən qurulanda istemçi
+		// çatmamış mesajı TƏKRAR göndərir; server UUID-i ilə bu HƏR DƏFƏ yeni
+		// sətir yaradırdı → söhbətdə dublikat. İndi eyni açar → eyni sətir.
+		messageID := ""
+		if cmid, exists := dataMap["client_message_id"].(string); exists {
+			if parsed, perr := uuid.Parse(strings.TrimSpace(cmid)); perr == nil {
+				messageID = parsed.String()
+			} else if strings.TrimSpace(cmid) != "" {
+				c.sendMessage(&OutgoingMessage{
+					Type: "message_error",
+					Data: map[string]interface{}{
+						"error": "client_message_id UUID formatında olmalıdır",
+						"code":  "INVALID_CLIENT_MESSAGE_ID",
+					},
+				})
+				return
+			}
+		}
+		if messageID == "" {
+			messageID = uuid.New().String()
+		}
 		// Issue 30: REST yolu ilə eyni — UTC saxla ki, `ORDER BY created_at`
 		// iki yol arasında düzgün sıralansın (server TZ ≠ UTC olsa belə).
 		createdAt := time.Now().UTC()
@@ -986,6 +1192,10 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 		// açanda YOX olurdu. İndi REST yolu ilə eyni: şifrələ → yaz → (uğurlusa)
 		// conversation-u güncəllə → yay. Yazma xətası → göndərənə message_error,
 		// yayım yoxdur. Wire dəyişmir (köhnə istemçilər eyni davranır).
+		// Issue 56: `content` hələ AÇIQ mətndir — S3 media açarlarını burada
+		// "istifadə olunub" işarələ (şifrələmədən sonra mümkün deyil).
+		services.MarkMediaReferenced(content)
+
 		encryptedText, encErr := c.Hub.encryptionService.EncryptMessage(content)
 		if encErr != nil {
 			log.Printf("Mesaj şifreleme hatası (WS): %v", encErr)
@@ -1012,19 +1222,66 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 		// yeniləməsi (sayğac/status/last_message_at) TEK TRANSACTION.
 		// Issue 8 WS yoluna yeniləməni gətirmişdi, amma REST-dəki eyni
 		// atomiklik boşluğu ilə: xəta udulurdu → mesaj var, siyahı köhnə.
+		//
+		// Issue 9: `ON CONFLICT (id) DO NOTHING` — təkrar göndərilən eyni
+		// `client_message_id` yeni sətir yaratmır və sayğaclar İKİNCİ DƏFƏ
+		// artmır. `duplicate` olduqda yayım/moderasiya da təkrarlanmır;
+		// göndərənə `message_duplicate` gedir ki, öz outbox-unu təmizləsin.
+		duplicate := false
 		if err := c.Hub.db.Transaction(func(tx *gorm.DB) error {
-			if err := tx.Create(&message).Error; err != nil {
-				return err
+			res := tx.Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "id"}},
+				DoNothing: true,
+			}).Create(&message)
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected == 0 {
+				var existing models.Message
+				if err := tx.Unscoped().Where("id = ?", message.ID).First(&existing).Error; err != nil {
+					return err
+				}
+				// Yalnız `sender_id` yoxlamaq KİFAYƏT DEYİL — eyni istifadəçi
+				// eyni açarı BAŞQA alıcıya (və ya qrupa) işlətsə mesaj səssizcə
+				// yaradılmazdı və istemçi uğur sayardı. Alıcı və söhbət növü də
+				// uyğun gəlməlidir.
+				sameReceiver := existing.ReceiverID != nil && *existing.ReceiverID == receiverID
+				if existing.SenderID != c.UserID || !sameReceiver || existing.ConversationID != nil {
+					return errClientMessageIDTaken
+				}
+				duplicate = true
+				return nil
 			}
 			if conversation != nil {
 				return applyConversationMessageUpdateDB(tx, conversation, c.UserID)
 			}
 			return nil
 		}); err != nil {
+			if errors.Is(err, errClientMessageIDTaken) {
+				c.sendMessage(&OutgoingMessage{
+					Type: "message_error",
+					Data: map[string]interface{}{
+						"error": "client_message_id artıq istifadə olunub",
+						"code":  "CLIENT_MESSAGE_ID_TAKEN",
+					},
+				})
+				return
+			}
 			log.Printf("Mesaj DB'ye yazılamadı (WS): %v", err)
 			c.sendMessage(&OutgoingMessage{
 				Type: "message_error",
 				Data: map[string]interface{}{"error": "message_persist_failed", "code": "SEND_FAILED"},
+			})
+			return
+		}
+
+		if duplicate {
+			c.sendMessage(&OutgoingMessage{
+				Type: "message_duplicate",
+				Data: map[string]interface{}{
+					"id":          messageID,
+					"receiver_id": receiverID,
+				},
 			})
 			return
 		}
@@ -1138,11 +1395,19 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 }
 
 func (h *Hub) SetActiveChat(userID uint, chatWithUserID *uint) {
-	h.mutex.Lock()
-	defer h.mutex.Unlock()
+	var dm, group uint
+	found := false
 
+	h.mutex.Lock()
 	if client, exists := h.clients[userID]; exists {
 		client.ActiveChatWith = chatWithUserID
+		found = true
+		if chatWithUserID != nil {
+			dm = *chatWithUserID
+		}
+		if client.ActiveGroupChat != nil {
+			group = *client.ActiveGroupChat
+		}
 
 		if chatWithUserID != nil {
 			log.Printf("Kullanıcı %d aktif chat: %d", userID, *chatWithUserID)
@@ -1150,27 +1415,49 @@ func (h *Hub) SetActiveChat(userID uint, chatWithUserID *uint) {
 			log.Printf("Kullanıcı %d chat'ten çıktı", userID)
 		}
 	}
+	h.mutex.Unlock()
+
+	// Issue 4: açıq çat konteksti paylaşılan presence-ə yazılır — başqa
+	// instansdakı göndərən `IsUserInChatWith` ilə doğru cavab alsın
+	// (əks halda çatda oturan istifadəçiyə push göndərilirdi).
+	if found {
+		h.writePresence(userID, dm, group)
+	}
 }
 
-// IsUserInChatWith kontrol fonksiyonu
+// IsUserInChatWith kontrol fonksiyonu.
+// Issue 4: lokal map tapmasa paylaşılan presence-ə düşür.
 func (h *Hub) IsUserInChatWith(userID, otherUserID uint) bool {
 	h.mutex.RLock()
-	defer h.mutex.RUnlock()
-
-	if client, exists := h.clients[userID]; exists {
-		return client.ActiveChatWith != nil && *client.ActiveChatWith == otherUserID
+	client, exists := h.clients[userID]
+	var local bool
+	if exists {
+		local = client.ActiveChatWith != nil && *client.ActiveChatWith == otherUserID
 	}
-	return false
+	h.mutex.RUnlock()
+	if exists {
+		return local
+	}
+	rec, ok := remotePresence(userID)
+	return ok && rec.DM == otherUserID && otherUserID != 0
 }
 
 // SetActiveGroupChat — istifadəçinin hazırda açıq olan qrup çatını qeyd edir
 // (nil = qrup səhifəsindən çıxdı). SetActiveChat-in qrup ekvivalenti.
 func (h *Hub) SetActiveGroupChat(userID uint, conversationID *uint) {
-	h.mutex.Lock()
-	defer h.mutex.Unlock()
+	var dm, group uint
+	found := false
 
+	h.mutex.Lock()
 	if client, exists := h.clients[userID]; exists {
 		client.ActiveGroupChat = conversationID
+		found = true
+		if conversationID != nil {
+			group = *conversationID
+		}
+		if client.ActiveChatWith != nil {
+			dm = *client.ActiveChatWith
+		}
 
 		if conversationID != nil {
 			log.Printf("Kullanıcı %d aktif grup chat: %d", userID, *conversationID)
@@ -1178,18 +1465,46 @@ func (h *Hub) SetActiveGroupChat(userID uint, conversationID *uint) {
 			log.Printf("Kullanıcı %d grup chat'ten çıktı", userID)
 		}
 	}
+	h.mutex.Unlock()
+
+	// Issue 4: bax SetActiveChat.
+	if found {
+		h.writePresence(userID, dm, group)
+	}
 }
 
 // IsUserInGroupChat — istifadəçi hazırda BU qrupun səhifəsindədirmi?
 // True isə qrup mesajı push-u GÖNDƏRİLMİR (DM IsUserInChatWith məntiqi).
+// Issue 4: lokal map tapmasa paylaşılan presence-ə düşür.
 func (h *Hub) IsUserInGroupChat(userID, conversationID uint) bool {
 	h.mutex.RLock()
-	defer h.mutex.RUnlock()
-
-	if client, exists := h.clients[userID]; exists {
-		return client.ActiveGroupChat != nil && *client.ActiveGroupChat == conversationID
+	client, exists := h.clients[userID]
+	var local bool
+	if exists {
+		local = client.ActiveGroupChat != nil && *client.ActiveGroupChat == conversationID
 	}
-	return false
+	h.mutex.RUnlock()
+	if exists {
+		return local
+	}
+	rec, ok := remotePresence(userID)
+	return ok && rec.Group == conversationID && conversationID != 0
+}
+
+// emitTypingSignal — Issue 16: "yazır…"/"səs yazır" siqnalını qarşı tərəfə
+// ötürür, ancaq qapıdan keçirsə (blok yoxdur + sürət limiti pozulmayıb).
+func (c *Client) emitTypingSignal(receiverID uint, action string, isStart bool) {
+	if receiverID == 0 {
+		return
+	}
+	if c.typing == nil || !c.typing.allow(c.Hub, c.UserID, receiverID, isStart) {
+		return
+	}
+	c.Hub.SendToUser(receiverID, "user_typing", map[string]interface{}{
+		"user_id": c.UserID,
+		"typing":  isStart,
+		"action":  action,
+	})
 }
 
 // sendMessage client'a mesaj gönder
@@ -1287,6 +1602,13 @@ func (h *Hub) ScheduleGroupPushNotification(
 			}
 		}
 
+		// Issue 23: üzv başına `IsUserInGroupChat` (hər biri ayrıca RWMutex
+		// al-burax) → 5000-lik qrupda 5000 kilid əməliyyatı. İndi tək kilid.
+		inChat := make(map[uint]struct{})
+		for _, uid := range h.FilterUsersInGroupChat(memberIDs, conversationID) {
+			inChat[uid] = struct{}{}
+		}
+
 		remaining := make([]uint, 0, len(memberIDs))
 		for _, uid := range memberIDs {
 			if uid == senderID {
@@ -1297,7 +1619,7 @@ func (h *Hub) ScheduleGroupPushNotification(
 				continue
 			}
 			// Hazırda qrup səhifəsindədir — mesajı canlı görür.
-			if h.IsUserInGroupChat(uid, conversationID) {
+			if _, open := inChat[uid]; open {
 				continue
 			}
 			remaining = append(remaining, uid)
@@ -1563,7 +1885,7 @@ func (h *Hub) SendUnreadCountUpdate(userID uint) {
 // aktiv üzvlərinə yayır. data içindən conversation_id çıxarılır (JSON number
 // → float64). DM "typing" ilə simmetrikdir, amma tək receiver yerine qrup
 // üzvlərinə (göndərən istisna) göndərilir.
-func (h *Hub) handleGroupTyping(userID uint, data interface{}, isTyping bool) {
+func (h *Hub) handleGroupTyping(userID uint, data interface{}, isTyping bool, gate *typingGate) {
 	dataMap, ok := data.(map[string]interface{})
 	if !ok {
 		return
@@ -1573,6 +1895,30 @@ func (h *Hub) handleGroupTyping(userID uint, data interface{}, isTyping bool) {
 		return
 	}
 	conversationID := uint(convFloat)
+
+	// ── Issue 16: SÜRƏT LİMİTİ (yalnız başlanğıc siqnalları) ────────────────
+	// Qrup yolunda gücləndirmə əmsalı DM-dən böyükdür: bir frame N üzvə
+	// yayılır, üstəlik AŞAĞIDA 2 DB sorğusu var. Limitsiz halda bir soket
+	// saniyədə minlərlə frame göndərib bütün qrupu boğa bilərdi.
+	if gate != nil && !gate.allowGroupTyping(conversationID, isTyping) {
+		return
+	}
+
+	// ── Issue 16: GÖNDƏRƏNİN ÜZVLÜYÜ ─────────────────────────────────────────
+	// Əvvəl HEÇ BİR yoxlama yox idi: istənilən istifadəçi ixtiyari
+	// `conversation_id` göndərib öz adı və avatarı ilə HƏR QRUPDA
+	// "X yazır…" göstərə bilirdi — üzv olmadığı, hətta mövcud olmayan
+	// qrupda belə. Həm kimlik spoofinq-i, həm də üzv siyahısının sızması
+	// (fan-out cavabından qrupun mövcudluğu bilinirdi).
+	// Dəvəti qəbul etməmiş (pending) üzv də yaza bilmədiyi üçün siqnal
+	// göndərə bilməməlidir — `invite_status='active'` şərti də var.
+	var isMember int64
+	if err := h.db.Model(&models.ConversationParticipant{}).
+		Where("conversation_id = ? AND user_id = ? AND left_at IS NULL AND deleted_at IS NULL AND COALESCE(invite_status,'active') = 'active'",
+			conversationID, userID).
+		Count(&isMember).Error; err != nil || isMember == 0 {
+		return
+	}
 
 	// Action: "typing" (default) və ya "recording" (səs yazır). Flutter
 	// data-da göndərə bilər; göndərməsə typing sayılır.
@@ -1602,20 +1948,28 @@ func (h *Hub) handleGroupTyping(userID uint, data interface{}, isTyping bool) {
 		Where("conversation_id = ? AND left_at IS NULL AND deleted_at IS NULL AND COALESCE(invite_status,'active') = 'active'", conversationID).
 		Pluck("user_id", &memberIDs)
 
+	// Issue 22: göndərəni çıxarıb TƏK toplu fan-out (əvvəl üzv başına ayrıca
+	// marshal + kilid + Run döngüsü ilə rendezvous vardı).
+	targets := make([]uint, 0, len(memberIDs))
 	for _, mid := range memberIDs {
 		if mid == userID {
 			continue // göndərənə qaytarma
 		}
-		h.SendToUser(mid, "group_typing", map[string]interface{}{
-			"conversation_id": conversationID,
-			"user_id":         userID,
-			"typing":          isTyping,
-			"action":          action,
-			"sender_name":     sender.Name,
-			"sender_username": sender.Username,
-			"sender_avatar":   utils.PrependBaseURL(sender.ProfileImage),
-		})
+		targets = append(targets, mid)
 	}
+	if len(targets) == 0 {
+		return
+	}
+
+	h.SendToMultipleUsers(targets, "group_typing", map[string]interface{}{
+		"conversation_id": conversationID,
+		"user_id":         userID,
+		"typing":          isTyping,
+		"action":          action,
+		"sender_name":     sender.Name,
+		"sender_username": sender.Username,
+		"sender_avatar":   utils.PrependBaseURL(sender.ProfileImage),
+	})
 }
 
 // handleAddReaction mesaja reaction ekle

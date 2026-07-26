@@ -66,6 +66,45 @@ func isBodyTooLarge(err error) bool {
 // tooLargeMB — istifadəçiyə göstərilən limit (MB).
 func tooLargeMB(maxBytes int64) int64 { return maxBytes >> 20 }
 
+// ── Issue 55: MƏZMUN TİPİ FAYL ADINDAN GÜVƏNİLMİR ──────────────────────────
+//
+// Əvvəl həm QƏBUL/RƏDD qərarı, həm S3-ə yazılan `Content-Type` YALNIZ fayl
+// adının uzantısından gəlirdi. `voiceExtWhitelist` isə tərif olunub HEÇ
+// istifadə edilmirdi (ölü kod) — yəni `upload-voice` istənilən baytı
+// istənilən uzantı ilə qəbul edirdi (pulsuz fayl hostinqi).
+//
+// İndi ilk 512 bayt `http.DetectContentType` ilə "iyləndirilir" və uzantı ilə
+// AİLƏ səviyyəsində (image/video/audio) uyğunluğu yoxlanır. Sniff nəticəsi
+// qeyri-müəyyəndirsə (`application/octet-stream`) uzantıya güvənilir —
+// bəzi konteynerlər (m4a/3gp/webm) sabit imza vermir, yoxsa legitim
+// yükləmələri rədd edərdik.
+func sniffFamily(data []byte) string {
+	if len(data) == 0 {
+		return ""
+	}
+	head := data
+	if len(head) > 512 {
+		head = head[:512]
+	}
+	ct := http.DetectContentType(head)
+	switch {
+	case strings.HasPrefix(ct, "image/"):
+		return "image"
+	case strings.HasPrefix(ct, "video/"):
+		return "video"
+	case strings.HasPrefix(ct, "audio/"):
+		return "audio"
+	case ct == "application/ogg":
+		return "audio"
+	case strings.HasPrefix(ct, "text/html"), strings.HasPrefix(ct, "image/svg"):
+		// Aşkar TƏHLÜKƏLİ: etibarlı S3 yolu altında inline servis edilsə
+		// saxlanmış-XSS potensialı. Heç vaxt media/səs kimi qəbul etmə.
+		return "unsafe"
+	default:
+		return "" // qeyri-müəyyən → uzantıya güvən
+	}
+}
+
 // UploadHandler — voice/media S3 upload + waveform.
 type UploadHandler struct {
 	s3 *services.S3Uploader
@@ -134,12 +173,24 @@ func (h *UploadHandler) UploadVoice(c *gin.Context) {
 	if ext == "" {
 		ext = "bin"
 	}
+	// Issue 55: `voiceExtWhitelist` NƏHAYƏT tətbiq olunur (əvvəl ölü kod idi).
+	if !voiceExtWhitelist[ext] {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "Desteklenmeyen ses formatı"})
+		return
+	}
 	filename := uuid.NewString() + "." + ext
 
 	// Faylın bütün baytlarını oxu.
 	data, err := readMultipart(c, "voice", maxVoiceUploadBytes)
 	if err != nil || len(data) == 0 {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ses dosyası okunamadı"})
+		return
+	}
+
+	// Issue 55: baytları iylə — uzantı yalan danışa bilər.
+	switch sniffFamily(data) {
+	case "unsafe", "image", "video":
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "Desteklenmeyen ses formatı"})
 		return
 	}
 
@@ -150,9 +201,14 @@ func (h *UploadHandler) UploadVoice(c *gin.Context) {
 		return
 	}
 	if !h.s3.Exists(s3Key) {
+		// Issue 56: yarımçıq yazılmış obyekt qalmasın.
+		_ = h.s3.Delete(s3Key)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ses dosyası kaydedilemedi"})
 		return
 	}
+
+	// Issue 56: obyekti izləməyə al (mesaj göndərilməzsə 24 saat sonra silinir).
+	services.TrackMediaUpload(userID, s3Key)
 
 	// --- pixels-per-second: qısa səslərdə daha çox bar (Laravel ilə eyni).
 	pps := 10
@@ -244,6 +300,27 @@ func (h *UploadHandler) UploadMedia(c *gin.Context) {
 		return
 	}
 
+	// Issue 55: iylənmiş ailə elan olunan uzantı ilə uyğun gəlməlidir.
+	// (`.jpg` adı ilə göndərilən HTML/SVG burada tutulur.)
+	switch fam := sniffFamily(data); fam {
+	case "unsafe":
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "Desteklenmeyen dosya formatı"})
+		return
+	case "image":
+		if !isImage {
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "Dosya içeriği uzantıyla uyuşmuyor"})
+			return
+		}
+	case "video":
+		if !isVideo {
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "Dosya içeriği uzantıyla uyuşmuyor"})
+			return
+		}
+	case "audio":
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "Dosya içeriği uzantıyla uyuşmuyor"})
+		return
+	}
+
 	folder := "videos"
 	mediaType := "video"
 	if isImage {
@@ -257,6 +334,19 @@ func (h *UploadHandler) UploadMedia(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Medya dosyası kaydedilemedi"})
 		return
 	}
+	// Issue 43: obyektin HƏQİQƏTƏN yazıldığını təsdiqlə (UploadVoice onsuz da
+	// belə edir). Bu yoxlama olmadan istemçi mövcud olmayan bir obyekt üçün
+	// düzgün görünən URL alırdı → "medya sonsuza qədər yüklənir", səssiz.
+	if !h.s3.Exists(s3Key) {
+		// Issue 56: yarımçıq yazılmış obyekt qalmasın.
+		_ = h.s3.Delete(s3Key)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Medya dosyası kaydedilemedi"})
+		return
+	}
+
+	// Issue 56: obyekti izləməyə al. Mesaj göndərilməzsə 24 saat sonra
+	// sahibsiz sayılıb S3-dən silinəcək (bax services/media_gc.go).
+	services.TrackMediaUpload(userID, s3Key)
 
 	c.JSON(http.StatusOK, gin.H{
 		"url":           utils.FilePathS3(s3Key),

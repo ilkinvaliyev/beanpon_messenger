@@ -45,3 +45,37 @@ const (
 func SharedSpamBan(userID uint) string {
 	return fmt.Sprintf("spam_ban:%d", userID)
 }
+
+// ─── Lokal (messenger daxili) key suffix-ləri ───────────────────
+
+const (
+	// TTLWSPresence — Issue 4: paylaşılan WebSocket presence qeydinin ömrü.
+	// Heartbeat bunun YARISINDAN tez-tez yeniləyir, ona görə sağlam instansda
+	// qeyd heç vaxt bitmir. İnstans qəflətən ölsə (SIGKILL, OOM, node itkisi)
+	// qeyd bu müddətdən sonra öz-özünə yox olur — "zombi onlayn" qalmır.
+	TTLWSPresence = 90 * time.Second
+
+	// WSPresenceRefresh — heartbeat dövrü (TTL-in ~1/3-ü).
+	WSPresenceRefresh = 30 * time.Second
+)
+
+// WSFanout — Issue 4: instance-lar arası canlı yayım kanalı.
+//
+//	bp:msg:ws:fanout
+func WSFanout() string {
+	return "ws:fanout"
+}
+
+// WSPresence — istifadəçinin hansı instansda olduğu + açıq çat konteksti.
+//
+// Dəyər formatı (JSON):
+//
+//	{"i":"<instance-id>","dm":123,"grp":456,"at":1234567890}
+//
+//	dm  — hazırda açıq DM-in qarşı tərəf user id-si (0 = yoxdur)
+//	grp — hazırda açıq qrupun conversation id-si (0 = yoxdur)
+//
+//	bp:msg:ws:presence:{userId}
+func WSPresence(userID uint) string {
+	return fmt.Sprintf("ws:presence:%d", userID)
+}

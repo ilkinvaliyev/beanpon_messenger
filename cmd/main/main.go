@@ -10,6 +10,8 @@ import (
 	"beanpon_messenger/utils"
 	"beanpon_messenger/websocket"
 	"beanpon_messenger/xmpp"
+	"context"
+	"crypto/subtle"
 	"github.com/Depado/ginprom"
 	"github.com/gin-gonic/gin"
 	"log"
@@ -141,6 +143,12 @@ func main() {
 	database.DB.Exec("UPDATE user_presences SET is_online = false, last_seen_at = NOW() WHERE is_online = true")
 	go wsHub.Run()
 
+	// Issue 4: instance-lar arası canlı yayım + paylaşılan presence.
+	// Redis söndürülübsə hər ikisi no-op-dur (davranış tək instansdakı kimi
+	// qalır). Bax websocket/cluster.go.
+	go wsHub.StartClusterSubscriber(context.Background())
+	go wsHub.StartPresenceHeartbeat(context.Background())
+
 	// 1b. XMPP BRIDGE (transport migration for chat_page / group_chat_page).
 	// No-op unless XMPP_ENABLED=true. The Hub implements both xmpp.LegacyDelivery
 	// and xmpp.IngressSink (see websocket/hub_xmpp.go). When enabled, the Hub's
@@ -198,6 +206,13 @@ func main() {
 	// Voice/media upload — Laravel MessageController::uploadVoice/uploadMedia portu.
 	s3Uploader := services.NewS3Uploader(cfg.S3.Bucket, cfg.S3.Region, cfg.S3.Endpoint, cfg.S3.Key, cfg.S3.Secret, cfg.S3.PathStyle)
 	uploadHandler := handlers.NewUploadHandler(s3Uploader)
+
+	// Issue 56: sahibsiz (heç bir mesaja bağlanmayan) S3 media obyektlərinin
+	// izlənməsi + dövri təmizlənməsi. Cədvəl yoxdursa özünü söndürür — heç bir
+	// yükləmə axını pozulmur. Bax MIGRATION_chat_media_objects.md.
+	mediaTracker := services.NewMediaTracker(database.GetDB(), s3Uploader)
+	services.SetMediaTracker(mediaTracker)
+	go mediaTracker.StartReaper(context.Background())
 
 	// Gin router'ını oluştur
 	router := gin.Default()
@@ -395,7 +410,10 @@ func main() {
 	internal := router.Group("/internal")
 	internal.Use(func(c *gin.Context) {
 		secret := c.GetHeader("X-Internal-Secret")
-		if secret != cfg.InternalSecret {
+		// Issue 63: sabit-zamanlı müqayisə. Adi `!=` ilk fərqli baytda qısa
+		// qapanır və nəzəri olaraq sirri bayt-bayt bərpa etməyə imkan verir.
+		// Bir sətirlik dəyişiklik — praktik risk aşağı olsa da səbəb yoxdur.
+		if subtle.ConstantTimeCompare([]byte(secret), []byte(cfg.InternalSecret)) != 1 {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 			c.Abort()
 			return
@@ -422,6 +440,12 @@ func main() {
 		// XMPP client auth callback (ejabberd → Go, validates the JWT). Used in
 		// PHASE 2 when native XMPP clients connect; harmless when XMPP disabled.
 		internal.POST("/xmpp/auth", xmppBridge.AuthHandler(cfg.JWTSecret))
+
+		// Issue 62: spam-ban keşini məcburi təmizləmək/yeniləmək.
+		// Laravel banUser/unbanUser-dən sonra çağırır; keş yazısı uğursuz
+		// olsa belə messenger tərəf dərhal düzgün dəyəri görür.
+		// Bax handlers/internal_spam_ban.go.
+		internal.POST("/users/:user_id/spam-ban/invalidate", handlers.InvalidateSpamBanCache)
 	}
 
 	// Public routes

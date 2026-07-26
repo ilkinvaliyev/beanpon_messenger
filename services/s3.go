@@ -3,6 +3,7 @@ package services
 import (
 	"bytes"
 	"context"
+	"errors"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -48,7 +49,12 @@ func (u *S3Uploader) Enabled() bool { return u.client != nil }
 // qoyur (ContentType ilə).
 func (u *S3Uploader) Put(key string, body []byte, contentType string) error {
 	if u.client == nil {
-		return nil
+		// Issue 43: əvvəl `nil` (yəni UĞUR) qaytarırdı. S3 konfiqurasiya
+		// olunmayıbsa (bucket boş, ya da `LoadDefaultConfig` xəta verib)
+		// yükləmə SƏSSİZCƏ heç nə etmir, amma handler istifadəçiyə etibarlı
+		// görünən bir URL qaytarırdı → şəkil/video "sonsuza qədər yüklənir",
+		// heç bir xəta görünmür. İndi səhv AÇIQ şəkildə qayıdır.
+		return errors.New("s3: uploader konfiqurasiya olunmayıb (bucket/credentials yoxdur)")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -62,6 +68,26 @@ func (u *S3Uploader) Put(key string, body []byte, contentType string) error {
 		in.ContentType = aws.String(contentType)
 	}
 	_, err := u.client.PutObject(ctx, in)
+	return err
+}
+
+// Delete — Issue 56: verilmiş açarı bucket-dan silir. Sahibsiz media
+// təmizləyicisi (services/media_gc.go) və uğursuz yükləmə yolları işlədir.
+// Əvvəl `S3Uploader`-də silmə metodu ÜMUMİYYƏTLƏ yox idi — yəni bir dəfə
+// yazılan obyekti proqramla silmək mümkün deyildi.
+func (u *S3Uploader) Delete(key string) error {
+	if u.client == nil {
+		return errors.New("s3: uploader konfiqurasiya olunmayıb (bucket/credentials yoxdur)")
+	}
+	if key == "" {
+		return errors.New("s3: boş açar")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, err := u.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(u.bucket),
+		Key:    aws.String(key),
+	})
 	return err
 }
 
