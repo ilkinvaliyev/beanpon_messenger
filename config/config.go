@@ -136,6 +136,7 @@ func LoadConfig() *Config {
 			Secret:    envStr("AWS_SECRET_ACCESS_KEY", ""),
 			PathStyle: envBool("AWS_USE_PATH_STYLE_ENDPOINT", false),
 		},
+
 		Cache: CacheConfig{
 			Enabled:          envBool("REDIS_ENABLED", true),
 			Host:             envStr("REDIS_HOST", "127.0.0.1"),
