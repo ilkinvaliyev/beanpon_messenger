@@ -113,21 +113,9 @@ func TrackMediaUpload(userID uint, s3Key string) {
 
 // MarkMediaReferenced — mesaj mətnindəki (HƏLƏ ŞİFRƏLƏNMƏMİŞ) S3 açarlarını
 // "istifadə olunub" kimi işarələyir. Göndərmə yollarının hamısından çağırılır.
-//
-// `db` — İŞARƏLƏMƏNİN GEDƏCƏYİ HANDLE. Mesajı yazan TRANSACTION-ın `tx`-i
-// ötürülməlidir.
-//
-// NİYƏ: əvvəl bu funksiya parametrsiz idi və HƏMİŞƏ qlobal `t.db` üzərində
-// yazırdı, üstəlik göndərmə transaction-ı BAŞLAMAZDAN ƏVVƏL çağırılırdı.
-// Transaction geri qayıtsa (insert xətası, conversation yeniləməsi xətası,
-// icazə/idempotentlik konflikti) mesaj HEÇ VAXT yaranmırdı, amma media ƏBƏDİ
-// "istinad olunub" qalırdı: `referenced_at IS NULL` şərti pozulduğu üçün
-// təmizləyici (StartReaper) həmin obyektə bir daha toxuna bilmirdi → hər
-// uğursuz göndərmə S3-də daimi sızıntı buraxırdı. İndi işarələmə mesajla
-// EYNİ transaction-dadır: mesaj yoxdursa işarə də yoxdur.
-func MarkMediaReferenced(db *gorm.DB, plainText string) {
+func MarkMediaReferenced(plainText string) {
 	if t := mediaTracker.Load(); t != nil {
-		t.MarkReferenced(db, plainText)
+		t.MarkReferenced(plainText)
 	}
 }
 
@@ -174,16 +162,9 @@ func ExtractMediaKeys(text string) []string {
 	return out
 }
 
-// MarkReferenced — bax MarkMediaReferenced. `db` nil olduqda qlobal handle
-// istifadə olunur (test/CLI yolları üçün).
-func (t *MediaTracker) MarkReferenced(db *gorm.DB, plainText string) {
+// MarkReferenced — bax MarkMediaReferenced.
+func (t *MediaTracker) MarkReferenced(plainText string) {
 	if t == nil || t.disabled.Load() {
-		return
-	}
-	if db == nil {
-		db = t.db
-	}
-	if db == nil {
 		return
 	}
 	keys := ExtractMediaKeys(plainText)
@@ -191,21 +172,9 @@ func (t *MediaTracker) MarkReferenced(db *gorm.DB, plainText string) {
 		return
 	}
 	now := time.Now().UTC()
-
-	// SAVEPOINT (iç transaction) — FAIL-OPEN davranışını qorumaq üçün ŞƏRTDİR.
-	// Cədvəl yoxdursa (miqrasiya işlədilməyib) Postgres xətanı bütün AÇIQ
-	// transaction-a yayır ("current transaction is aborted, commands ignored")
-	// və ardınca gələn HƏR sorğu uğursuz olur → mesaj insert-i də geri qayıdır.
-	// Yəni izləmə cədvəlinin olmaması MESAJLAŞMANI dayandırardı. GORM artıq
-	// transaction içindəki `Transaction` çağırışını SAVEPOINT-ə çevirir, ona
-	// görə buradakı uğursuzluq YALNIZ özünü geri alır — çöl transaction sağ
-	// qalır. Handle transaction-da deyilsə bu, ucuz tək-ifadəli transaction-dır.
-	err := db.Transaction(func(inner *gorm.DB) error {
-		return inner.Model(&ChatMediaObject{}).
-			Where("s3_key IN ? AND referenced_at IS NULL", keys).
-			Update("referenced_at", now).Error
-	})
-	if err != nil {
+	if err := t.db.Model(&ChatMediaObject{}).
+		Where("s3_key IN ? AND referenced_at IS NULL", keys).
+		Update("referenced_at", now).Error; err != nil {
 		t.noteFailure("chat_media_objects mark referenced", err)
 	}
 }

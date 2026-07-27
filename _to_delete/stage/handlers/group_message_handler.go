@@ -230,6 +230,10 @@ func (h *GroupMessageHandler) SendGroupMessage(c *gin.Context) {
 		return
 	}
 
+	// Issue 56: mətn hələ açıqdır — S3 media açarlarını "istifadə olunub"
+	// işarələ ki, sahibsiz media təmizləyicisi onlara toxunmasın.
+	services.MarkMediaReferenced(req.Text)
+
 	messageID := newMessageID
 	now := time.Now()
 
@@ -285,17 +289,6 @@ func (h *GroupMessageHandler) SendGroupMessage(c *gin.Context) {
 		})
 		return
 	}
-
-	// Issue 56: mətn hələ açıqdır (`req.Text`) — S3 media açarlarını "istifadə
-	// olunub" işarələ ki, sahibsiz media təmizləyicisi onlara toxunmasın.
-	//
-	// İŞARƏLƏMƏ İNSERT-DƏN SONRADIR: əvvəl insert-dən ƏVVƏL edilirdi, ona görə
-	// insert uğursuz olduqda (və ya `client_message_id` konflikti 409 ilə
-	// qayıtdıqda) mesaj yaranmasa da media əbədi "istinad olunub" qalıb GC-dən
-	// çıxırdı — daimi S3 sızıntısı. Təkrar (duplicate) yolda isə yenidən
-	// işarələmək lazım deyil: ilk göndərmə onsuz da işarələyib, o budaq
-	// yuxarıda return edir.
-	services.MarkMediaReferenced(database.DB, req.Text)
 
 	// Gönderen otomatik read
 	messageRead := models.MessageRead{

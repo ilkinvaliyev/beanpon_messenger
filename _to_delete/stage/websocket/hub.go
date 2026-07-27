@@ -105,14 +105,10 @@ var errClientMessageIDTaken = errors.New("client_message_id artıq istifadə olu
 
 // Hub tüm client'ları yönetir
 type Hub struct {
-	clients    map[uint]*Client
-	register   chan *Client
-	unregister chan *Client
-	// QEYD: burada bir `broadcast chan *Message` sahəsi vardı. Issue 22-dən
-	// sonra ONA YAZAN QALMAMIŞDI (`SendToUser`/`SendToMultipleUsers` birbaşa
-	// `deliver` çağırır) — kanal, `make`, `Run`-dakı select budağı və
-	// `broadcastMessage` örtüyü ölü kod idi və "mesajlar bu kanaldan keçir"
-	// təəssüratı yaradırdı. Hamısı silindi.
+	clients           map[uint]*Client
+	register          chan *Client
+	unregister        chan *Client
+	broadcast         chan *Message
 	mutex             sync.RWMutex
 	db                *gorm.DB
 	encryptionService interface {
@@ -180,9 +176,13 @@ func NewHub(db *gorm.DB, encryptionService interface {
 	DecryptMessage(encryptedText string) (string, error)
 }, config *config.Config) *Hub { // ← config parametri əlavə
 	return &Hub{
-		clients:           make(map[uint]*Client),
-		register:          make(chan *Client),
-		unregister:        make(chan *Client),
+		clients:    make(map[uint]*Client),
+		register:   make(chan *Client),
+		unregister: make(chan *Client),
+		// Issue 22: bu kanalın artıq daxili yazıcısı yoxdur (`SendToUser`
+		// birbaşa çatdırır). Geriyə uyğunluq üçün saxlanılır və buferlənir ki,
+		// gələcək bir yazıcı `Run` ilə rendezvous-a məcbur qalmasın.
+		broadcast:         make(chan *Message, 256),
 		db:                db,
 		encryptionService: encryptionService,
 		httpClient:        &http.Client{Timeout: 10 * time.Second}, // ← YENI
@@ -199,6 +199,9 @@ func (h *Hub) Run() {
 
 		case client := <-h.unregister:
 			h.unregisterClient(client)
+
+		case message := <-h.broadcast:
+			h.broadcastMessage(message)
 		}
 	}
 }
@@ -359,6 +362,11 @@ func (h *Hub) broadcastUserStatus(userID uint, status string, targets []*Client)
 	// Frame `origin` sahəsi ilə özünü tanıyır → yayan instans onu təkrar
 	// emal etmir (bax StartClusterSubscriber).
 	h.publishClusterBroadcast([]uint{userID}, "user_status", data)
+}
+
+// broadcastMessage — köhnə `h.broadcast` kanalı üçün saxlanılan nazik örtük.
+func (h *Hub) broadcastMessage(message *Message) {
+	h.deliver(message)
 }
 
 // deliver — mesajı alıcının `Send` buferinə non-blocking yazır.
@@ -1238,6 +1246,9 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 		// açanda YOX olurdu. İndi REST yolu ilə eyni: şifrələ → yaz → (uğurlusa)
 		// conversation-u güncəllə → yay. Yazma xətası → göndərənə message_error,
 		// yayım yoxdur. Wire dəyişmir (köhnə istemçilər eyni davranır).
+		// Issue 56: `content` hələ AÇIQ mətndir — S3 media açarlarını burada
+		// "istifadə olunub" işarələ (şifrələmədən sonra mümkün deyil).
+		services.MarkMediaReferenced(content)
 
 		encryptedText, encErr := c.Hub.encryptionService.EncryptMessage(content)
 		if encErr != nil {
@@ -1296,17 +1307,8 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 				return nil
 			}
 			if conversation != nil {
-				if err := applyConversationMessageUpdateDB(tx, conversation, c.UserID); err != nil {
-					return err
-				}
+				return applyConversationMessageUpdateDB(tx, conversation, c.UserID)
 			}
-			// Issue 56: `content` hələ AÇIQ mətndir — S3 media açarlarını
-			// "istifadə olunub" işarələ (şifrələmədən sonra mümkün deyil).
-			// TRANSACTION-IN İÇİNDƏ və insert-dən SONRA: əvvəl transaction
-			// başlamazdan qabaq, qlobal handle üzərində edilirdi — yazma və ya
-			// conversation yeniləməsi geri qayıtdıqda mesaj yox olurdu, media
-			// isə əbədi "istinad olunub" qalıb GC-dən çıxırdı (S3 sızıntısı).
-			services.MarkMediaReferenced(tx, content)
 			return nil
 		}); err != nil {
 			if errors.Is(err, errClientMessageIDTaken) {

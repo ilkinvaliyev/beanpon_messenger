@@ -403,9 +403,6 @@ func (h *Hub) writePresence(userID uint, dm, group uint) {
 	if !clusterActive() {
 		return
 	}
-	// Bu istifadəçinin vəziyyəti indi dəyişdi — uzaq presence memo-su bayat
-	// oldu, dərhal at (bax remotePresence memo şərhi).
-	presenceMemoForget(userID)
 	c := cache.GetClient()
 	rec := presenceRecord{Instance: instanceID, DM: dm, Group: group, At: time.Now().Unix()}
 	raw, err := json.Marshal(rec)
@@ -428,7 +425,6 @@ func (h *Hub) clearPresence(userID uint) {
 	if !clusterActive() {
 		return
 	}
-	presenceMemoForget(userID)
 	c := cache.GetClient()
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -511,112 +507,12 @@ func (h *Hub) refreshAllPresence() {
 	}
 }
 
-// ── UZAQ PRESENCE MEMO-SU (proses daxili, qısa ömürlü) ──────────────────────
-//
-// PROBLEM
-// `remotePresence` SİNXRON Redis `GET`-dir (1 s kontekst). O, `IsUserOnline`,
-// `IsUserInChatWith` və `IsUserInGroupChat`-dən çağırılır — yəni LOKAL OLMAYAN
-// hər alıcı üçün, HƏR mesajın push qərarında ƏN AZI bir dəfə. Redis yavaşlasa
-// və ya şəbəkə tıxansa göndərmə isti yolu alıcı başına 1 saniyəyə qədər
-// dayanır; toplu göndərmə/qrup fan-out-unda bu ardıcıl toplanır.
-//
-// HƏLL
-// Nəticə (HƏM tapılan, HƏM tapılmayan) qısa müddət yaddaşda saxlanılır. Push
-// qərarı üçün 2 saniyəlik köhnəlik təhlükəsizdir: presence qeydinin özünün
-// TTL-i onsuz da 90 s-dir və heartbeat 30 s-də bir yeniləyir, yəni məlumat
-// mənbədə də bu dəqiqlikdədir. MƏNFİ nəticəni də keşləmək VACİBDİR — adi hal
-// məhz odur (alıcı ümumiyyətlə onlayn deyil) və keşsiz halda hər dəfə tam
-// gediş edilirdi.
-//
-// NƏ KEŞLƏNMİR
-// LOKAL istifadəçinin vəziyyəti. `IsUserOnline`/`IsUserInChatWith`/
-// `IsUserInGroupChat` ƏVVƏLCƏ `h.clients` map-inə baxır və tapdıqda buraya heç
-// düşmür — yəni `register`/`unregister`/`SetActiveChat`/`SetActiveGroupChat`
-// DƏQİQ qalır. Üstəlik lokal presence yazan/silən yollar (`writePresence`,
-// `clearPresence`) həmin istifadəçinin memo sətrini AÇIQ ŞƏKİLDƏ silir ki,
-// reconnect anındakı keçidlər 2 saniyə bayat qalmasın.
-const (
-	// remotePresenceMemoTTL — bir nəticənin yaddaşda qalma müddəti.
-	remotePresenceMemoTTL = 2 * time.Second
-	// remotePresenceMemoMaxEntries — map-in yuxarı həddi. Aşıldıqda əvvəlcə
-	// vaxtı bitmişlər atılır; yenə yer yoxdursa map tamamilə sıfırlanır
-	// (sadə və sabit xərcli: keş yalnız 2 saniyəlik sürət güzəştidir,
-	// itirilməsi düzgünlüyə təsir etmir).
-	remotePresenceMemoMaxEntries = 20000
-)
-
-type presenceMemoEntry struct {
-	rec     presenceRecord
-	found   bool
-	expires time.Time
-}
-
-var presenceMemo = struct {
-	mu sync.Mutex
-	m  map[uint]presenceMemoEntry
-}{m: make(map[uint]presenceMemoEntry)}
-
-// presenceMemoGet — hələ vaxtı keçməmiş nəticə varsa qaytarır.
-func presenceMemoGet(userID uint, now time.Time) (presenceRecord, bool, bool) {
-	presenceMemo.mu.Lock()
-	defer presenceMemo.mu.Unlock()
-	e, ok := presenceMemo.m[userID]
-	if !ok || now.After(e.expires) {
-		return presenceRecord{}, false, false
-	}
-	return e.rec, e.found, true
-}
-
-// presenceMemoPut — nəticəni (tapılan və ya tapılmayan) yazır və map-i sərhəddə saxlayır.
-func presenceMemoPut(userID uint, rec presenceRecord, found bool, now time.Time) {
-	presenceMemo.mu.Lock()
-	defer presenceMemo.mu.Unlock()
-	if len(presenceMemo.m) >= remotePresenceMemoMaxEntries {
-		for k, v := range presenceMemo.m {
-			if now.After(v.expires) {
-				delete(presenceMemo.m, k)
-			}
-		}
-		if len(presenceMemo.m) >= remotePresenceMemoMaxEntries {
-			presenceMemo.m = make(map[uint]presenceMemoEntry, remotePresenceMemoMaxEntries/4)
-		}
-	}
-	presenceMemo.m[userID] = presenceMemoEntry{
-		rec:     rec,
-		found:   found,
-		expires: now.Add(remotePresenceMemoTTL),
-	}
-}
-
-// presenceMemoForget — istifadəçinin memo sətrini dərhal etibarsız edir.
-// Lokal presence dəyişikliklərində (bağlanma/kopma/açıq çat dəyişməsi) çağırılır.
-func presenceMemoForget(userID uint) {
-	presenceMemo.mu.Lock()
-	delete(presenceMemo.m, userID)
-	presenceMemo.mu.Unlock()
-}
-
 // remotePresence — TƏK istifadəçi üçün uzaq presence qeydi (lokal deyilsə).
-// Yuxarıdakı qısa ömürlü memo ilə örtülüdür.
 func remotePresence(userID uint) (presenceRecord, bool) {
 	if !clusterActive() {
 		return presenceRecord{}, false
 	}
-	now := time.Now()
-	if rec, found, hit := presenceMemoGet(userID, now); hit {
-		return rec, found
-	}
-	rec, found := remotePresenceFetch(userID)
-	presenceMemoPut(userID, rec, found, now)
-	return rec, found
-}
-
-// remotePresenceFetch — keşsiz, birbaşa Redis gedişi.
-func remotePresenceFetch(userID uint) (presenceRecord, bool) {
 	c := cache.GetClient()
-	if c == nil {
-		return presenceRecord{}, false
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
 	raw, found, err := c.Get(ctx, c.LocalKey(cache.WSPresence(userID)))

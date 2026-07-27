@@ -100,24 +100,8 @@ func tooLargeMB(maxBytes int64) int64 { return maxBytes >> 20 }
 // Bu, sniff-in əsl məqsədini (HTML/SVG/şəkil maskalanması) tam saxlayır:
 // ISO-BMFF heç vaxt HTML və ya SVG deyil.
 func sniffFamily(data []byte) string {
-	fam, _ := sniffTypes(data)
-	return fam
-}
-
-// sniffTypes — `sniffFamily` ilə EYNİ məntiq, amma AİLƏ ilə birlikdə KONKRET
-// MIME-i də qaytarır.
-//
-// NİYƏ LAZIMDIR: S3-ə yazılan `Content-Type` uzantıdan (`mimeForExt`)
-// götürülürdü — yəni İSTEMÇİNİN seçdiyi addan. Baytlar isə onsuz da bir neçə
-// sətir yuxarıda iylənirdi; nəticə atılırdı. `.mp4` adı ilə göndərilən bir
-// şəkil S3-də `video/mp4` kimi qalırdı, `.jpg` adı ilə göndərilən naməlum bayt
-// isə `image/jpeg`. İndi qəti sniff nəticəsi ÜSTÜNDÜR, qeyri-müəyyən halda
-// uzantıya qayıdılır.
-//
-// mime == "" → sniff QƏTİ DEYİL (çağıran uzantıya güvənməlidir).
-func sniffTypes(data []byte) (family string, mime string) {
 	if len(data) == 0 {
-		return "", ""
+		return ""
 	}
 	head := data
 	if len(head) > 512 {
@@ -125,14 +109,7 @@ func sniffTypes(data []byte) (family string, mime string) {
 	}
 	// ISO-BMFF (mp4/m4a/mov/3gp) — `http.DetectContentType`-dan ƏVVƏL.
 	if iso, ok := isoBMFFFamily(head); ok {
-		if iso == "audio" {
-			// iOS `.m4a` (ftyp `M4A `) — konteyner mp4-dür, amma məzmun SƏSDİR.
-			// `video/mp4` YAZMAQ OLMAZ: `http.DetectContentType` məhz bunu
-			// qaytarır və düzəldilən reqressiyanın kökü elə budur.
-			return "audio", "audio/mp4"
-		}
-		// ISO-BMFF-dir, amma marka qəti demir → uzantıya güvən.
-		return "", ""
+		return iso
 	}
 	// İŞARƏLƏMƏ YOXLAMASI `http.DetectContentType`-dan ƏVVƏL OLMALIDIR.
 	//
@@ -143,71 +120,26 @@ func sniffTypes(data []byte) (family string, mime string) {
 	// göndərilən bir SVG (içində `<script>`) rahatca keçib S3-ə yazılır və
 	// etibarlı domendən inline servis edildikdə SAXLANMIŞ XSS olurdu.
 	if isMarkupPayload(head) {
-		return "unsafe", ""
+		return "unsafe"
 	}
 	ct := http.DetectContentType(head)
-	base := baseContentType(ct)
 	switch {
-	case strings.HasPrefix(base, "text/html"), strings.HasPrefix(base, "image/svg"),
-		strings.HasPrefix(base, "text/xml"), strings.HasPrefix(base, "application/xml"):
+	case strings.HasPrefix(ct, "image/"):
+		return "image"
+	case strings.HasPrefix(ct, "video/"):
+		return "video"
+	case strings.HasPrefix(ct, "audio/"):
+		return "audio"
+	case ct == "application/ogg":
+		return "audio"
+	case strings.HasPrefix(ct, "text/html"), strings.HasPrefix(ct, "image/svg"),
+		strings.HasPrefix(ct, "text/xml"), strings.HasPrefix(ct, "application/xml"):
 		// Aşkar TƏHLÜKƏLİ: etibarlı S3 yolu altında inline servis edilsə
 		// saxlanmış-XSS potensialı. Heç vaxt media/səs kimi qəbul etmə.
-		// (Bu budaq `image/` prefiksindən ƏVVƏL olmalıdır — `image/svg+xml`
-		// əks halda adi şəkil sayılardı.)
-		return "unsafe", ""
-	case strings.HasPrefix(base, "image/"):
-		return "image", base
-	case strings.HasPrefix(base, "video/"):
-		return "video", base
-	case strings.HasPrefix(base, "audio/"):
-		return "audio", base
-	case base == "application/ogg":
-		return "audio", "audio/ogg"
+		return "unsafe"
 	default:
-		return "", "" // qeyri-müəyyən → uzantıya güvən
+		return "" // qeyri-müəyyən → uzantıya güvən
 	}
-}
-
-// baseContentType — `;` parametrlərini (məs. `; charset=utf-8`) atır və
-// kiçik hərfə salır.
-func baseContentType(ct string) string {
-	if i := strings.IndexByte(ct, ';'); i >= 0 {
-		ct = ct[:i]
-	}
-	return strings.ToLower(strings.TrimSpace(ct))
-}
-
-// storableContentType — S3-də saxlanması İCAZƏLİ olan Content-Type-lar.
-// `text/*` və `image/svg+xml` HEÇ VAXT icazəli deyil: etibarlı domendən inline
-// servis edildikdə brauzer onları İCRA edər (saxlanmış XSS).
-func storableContentType(ct string) bool {
-	base := baseContentType(ct)
-	if base == "" || strings.HasPrefix(base, "text/") {
-		return false
-	}
-	switch base {
-	case "image/svg+xml", "image/svg", "application/xml", "application/xhtml+xml":
-		return false
-	}
-	return strings.HasPrefix(base, "image/") ||
-		strings.HasPrefix(base, "video/") ||
-		strings.HasPrefix(base, "audio/") ||
-		base == "application/octet-stream"
-}
-
-// uploadContentType — S3 obyektinə yazılacaq `Content-Type`.
-// Qəti sniff nəticəsi VARSA o üstündür (istemçinin seçdiyi uzantı yalan
-// danışa bilər); yoxdursa uzantıya qayıdılır. Heç bir halda icra oluna bilən
-// bir tip (text/*, svg) saxlanmır — belə hallarda neytral
-// `application/octet-stream` yazılır.
-func uploadContentType(sniffed, ext string) string {
-	if storableContentType(sniffed) {
-		return baseContentType(sniffed)
-	}
-	if byExt := mimeForExt(ext); storableContentType(byExt) {
-		return byExt
-	}
-	return "application/octet-stream"
 }
 
 // markupPrefixes — brauzerin İCRA EDƏ biləcəyi işarələmə başlanğıcları.
@@ -354,17 +286,15 @@ func (h *UploadHandler) UploadVoice(c *gin.Context) {
 	}
 
 	// Issue 55: baytları iylə — uzantı yalan danışa bilər.
-	voiceFamily, voiceSniffedMime := sniffTypes(data)
-	switch voiceFamily {
+	switch sniffFamily(data) {
 	case "unsafe", "image", "video":
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "Desteklenmeyen ses formatı"})
 		return
 	}
 
 	// --- S3-ə orijinal səsi qoy (kritik addım; alınmasa 500).
-	// Content-Type İYLƏNMİŞ baytlardan gəlir (uzantı yalnız ehtiyat yoldur).
 	s3Key := fmt.Sprintf("voices/user_%d/%s", userID, filename)
-	if err := h.s3.Put(s3Key, data, uploadContentType(voiceSniffedMime, ext)); err != nil {
+	if err := h.s3.Put(s3Key, data, mimeForExt(ext)); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ses dosyası kaydedilemedi"})
 		return
 	}
@@ -470,8 +400,7 @@ func (h *UploadHandler) UploadMedia(c *gin.Context) {
 
 	// Issue 55: iylənmiş ailə elan olunan uzantı ilə uyğun gəlməlidir.
 	// (`.jpg` adı ilə göndərilən HTML/SVG burada tutulur.)
-	mediaFamily, mediaSniffedMime := sniffTypes(data)
-	switch fam := mediaFamily; fam {
+	switch fam := sniffFamily(data); fam {
 	case "unsafe":
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "Desteklenmeyen dosya formatı"})
 		return
@@ -499,8 +428,7 @@ func (h *UploadHandler) UploadMedia(c *gin.Context) {
 	// Laravel local `public` disk yerinə S3-ə yazırıq (container-lər arası
 	// paylaşılan storage üçün daha etibarlı; URL sxemi s3-storage).
 	s3Key := fmt.Sprintf("%s/user_%d/%s", folder, userID, filename)
-	// Content-Type İYLƏNMİŞ baytlardan gəlir (uzantı yalnız ehtiyat yoldur).
-	if err := h.s3.Put(s3Key, data, uploadContentType(mediaSniffedMime, ext)); err != nil {
+	if err := h.s3.Put(s3Key, data, mimeForExt(ext)); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Medya dosyası kaydedilemedi"})
 		return
 	}

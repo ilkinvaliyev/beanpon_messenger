@@ -226,6 +226,13 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 		}
 	}
 
+	// Issue 56: bütün icazə qapılarından (blok, spam-ban, CanSendMessage,
+	// story yoxlaması) SONRA — mətn hələ ŞİFRƏLƏNMƏYİB, S3 media açarlarını
+	// məhz burada çıxarıb "istifadə olunub" işarələyirik. Şifrələmədən sonra
+	// bu mümkün deyil. Rədd edilən göndərmələrdə işarələməmək vacibdir: əks
+	// halda heç vaxt istifadə olunmayan media əbədi qalardı.
+	services.MarkMediaReferenced(req.Text)
+
 	// Veritabanına kaydet
 	message := models.Message{
 		ID:               messageID,
@@ -279,16 +286,6 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 			return uErr
 		}
 		conversationStatus = status
-		// Issue 56: bütün icazə qapılarından (blok, spam-ban, CanSendMessage,
-		// story yoxlaması) SONRA və mesaj sətri yazıldıqdan SONRA — mətn hələ
-		// ŞİFRƏLƏNMƏYİB (`req.Text`), S3 media açarlarını məhz burada çıxarıb
-		// "istifadə olunub" işarələyirik.
-		//
-		// DİQQƏT: bu çağırış TRANSACTION-IN İÇİNDƏ olmalıdır. Əvvəl
-		// transaction başlamazdan ƏVVƏL, qlobal handle üzərində edilirdi —
-		// göndərmə geri qayıtdıqda mesaj yox idi, amma media əbədi
-		// "istinad olunub" qalıb GC-dən çıxırdı (daimi S3 sızıntısı).
-		services.MarkMediaReferenced(tx, req.Text)
 		return nil
 	}); err != nil {
 		log.Printf("Mesaj/conversation transaction xətası: %v", err)
@@ -448,6 +445,8 @@ func (h *MessageHandler) BroadcastMessage(c *gin.Context) {
 		if encErr != nil {
 			continue
 		}
+		// Issue 56: media istinadını işarələ (şifrələmədən əvvəlki mətndən).
+		services.MarkMediaReferenced(req.Text)
 
 		rid := receiverID
 		message := models.Message{
@@ -459,50 +458,29 @@ func (h *MessageHandler) BroadcastMessage(c *gin.Context) {
 			CreatedAt:     time.Now().UTC(),
 			UpdatedAt:     time.Now().UTC(),
 		}
+		if err := database.DB.Create(&message).Error; err != nil {
+			continue
+		}
 
-		// ── Issue 40 (SendMessage ilə eyni): insert + conversation yeniləməsi
-		// TEK TRANSACTION ───────────────────────────────────────────────────
-		// Əvvəl bu yol Issue 40 düzəlişindən KƏNARDA qalmışdı: `database.DB.
-		// Create` ayrıca komit olunur, conversation yeniləməsi isə AYRI, qeyri-
-		// transaksional çağırış idi və xətası yalnız loglanırdı. Nəticədə mesaj
-		// sətri var, söhbət sətri isə köhnə qalırdı — `last_message_at`,
-		// sayğaclar və `pending→active` keçidi olmadan siyahı yenilənmirdi.
-		// İndi ya hər ikisi, ya heç biri.
-		//
 		// Issue 10: push qapısı GERÇƏK statusdan qidalansın (sabit "active"
 		// deyil) — REST/WS arasında bildiriş davranışı fərqlənməsin.
-		// FAIL-CLOSED: `convStatus` boş qalarsa push GÖNDƏRİLMİR — boş status
-		// `HandleNewMessage`-in switch-ində heç bir budağa düşmür (bax
-		// websocket/hub.go). Əvvəl xəta halında `"active"` yazılırdı, yəni
-		// statusu OXUYA BİLMƏDİYİMİZ halda push qapısı TAM AÇILIRDI
-		// (`restricted` söhbətə belə bildiriş gedirdi və bunu bilərəkdən
-		// tetikləmək spam üçün asan keçid idi). İndi transaction uğursuz
-		// olduqda mesaj ÜMUMİYYƏTLƏ yaranmır → nə yayım, nə push.
-		skipConvCreate := conversationHandler.ShouldSkipConversationCreate(senderID, receiverID)
-		convStatus := ""
-		if txErr := database.DB.Transaction(func(tx *gorm.DB) error {
-			if err := tx.Create(&message).Error; err != nil {
-				return err
-			}
-			status, uErr := conversationHandler.UpdateConversationOnMessageTx(
-				tx, senderID, receiverID, skipConvCreate,
-			)
-			if uErr != nil {
-				return uErr
-			}
-			convStatus = status
-			// Issue 56: media istinadını işarələ (şifrələmədən ƏVVƏLKİ mətndən),
-			// mesaj sətri yazıldıqdan SONRA və EYNİ transaction-da — transaction
-			// geri qayıdarsa media da işarəsiz qalsın (əks halda GC ona bir daha
-			// toxuna bilmir → daimi S3 sızıntısı).
-			services.MarkMediaReferenced(tx, req.Text)
-			return nil
-		}); txErr != nil {
-			// Xəta UDULMUR: bu alıcı ATLANIR (mesaj da, conversation da yoxdur),
-			// digər alıcılar davam edir — toplu göndərmənin mövcud davranışı.
-			log.Printf("Broadcast mesaj/conversation transaction xətası — alıcı atlandı (rcv=%d): %v",
-				receiverID, txErr)
-			continue
+		convStatus, cuErr := conversationHandler.UpdateConversationOnMessageTx(
+			database.DB, senderID, receiverID,
+			conversationHandler.ShouldSkipConversationCreate(senderID, receiverID),
+		)
+		if cuErr != nil {
+			// Issue 10: FAIL-CLOSED. Əvvəl burada `convStatus = "active"`
+			// yazılırdı — yəni statusu OXUYA BİLMƏDİYİMİZ halda push qapısı
+			// TAM AÇILIRDI. Nəticədə `restricted` (tək tərəfli spam limiti
+			// aşılmış) və ya heç yaradılmamış söhbətə belə bildiriş gedirdi;
+			// üstəlik bu, xətanı BİLƏRƏKDƏN tetikləyən spam üçün asan bir
+			// keçid idi. İndi statusu bilmiriksə push GÖNDƏRİLMİR: boş status
+			// `HandleNewMessage`-in switch-ində heç bir budağa düşmür
+			// (bax websocket/hub.go). Canlı WS çatdırma isə davam edir —
+			// alıcı çatı açıqdırsa mesajı yenə də görür.
+			log.Printf("Broadcast conversation güncellemesi başarısız — push GÖNDƏRİLMİR (rcv=%d): %v",
+				receiverID, cuErr)
+			convStatus = ""
 		}
 
 		h.wsHub.HandleNewMessage(
