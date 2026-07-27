@@ -309,6 +309,8 @@ func main() {
 
 		// ── DM: Conversation yönetimi ────────────────────────────────────
 		api.GET("/conversations/:other_user_id/details", conversationHandler.GetConversationDetails)
+		// Kullanıcı-bazlı sesli mesaj izni (override). Global ayar korunur.
+		api.POST("/voice-permission", messageHandler.SetVoiceOverride)
 		api.POST("/conversations/:other_user_id/archive", conversationHandler.ArchiveConversation)
 		api.POST("/conversations/:other_user_id/unarchive", conversationHandler.UnarchiveConversation)
 		api.POST("/conversations/:other_user_id/pin", conversationHandler.PinConversation)

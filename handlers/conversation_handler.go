@@ -1082,7 +1082,7 @@ func (h *ConversationHandler) GetConversationDetails(c *gin.Context) {
 		var otherUserSettings models.UserSettings
 		if err := database.DB.Where("user_id = ?", otherUserID).First(&otherUserSettings).Error; err == nil {
 
-			allowVoiceMessages = otherUserSettings.AllowVoiceMessages
+			allowVoiceMessages = EffectiveAllowVoice(uint(otherUserID), userID.(uint), otherUserSettings.AllowVoiceMessages)
 			showReadReceipts = otherUserSettings.ShowReadReceipts
 
 			if otherUserSettings.MessageRequests == "ONLY_VERIFIED" {
@@ -1121,13 +1121,24 @@ func (h *ConversationHandler) GetConversationDetails(c *gin.Context) {
 		// Mövcud conversation — settings yenə də lazımdır
 		var otherUserSettings models.UserSettings
 		if err := database.DB.Where("user_id = ?", otherUserID).First(&otherUserSettings).Error; err == nil {
-			allowVoiceMessages = otherUserSettings.AllowVoiceMessages
+			allowVoiceMessages = EffectiveAllowVoice(uint(otherUserID), userID.(uint), otherUserSettings.AllowVoiceMessages)
 			showReadReceipts = otherUserSettings.ShowReadReceipts
 		}
 
 		reason := "PREVIOUS_CONVERSATION"
 		stopMessageReason = &reason
 	}
+
+	// Cari user-in (A) qarşı tərəf (B=otherUser) üçün sesli mesaj izni — konuşma
+	// detayındaki toggle bunu gösterir: override(A→B) ?? A.global.
+	myVoiceGlobal := true
+	{
+		var mySettings models.UserSettings
+		if err := database.DB.Where("user_id = ?", userID.(uint)).First(&mySettings).Error; err == nil {
+			myVoiceGlobal = mySettings.AllowVoiceMessages
+		}
+	}
+	voicePermissionForOther := EffectiveAllowVoice(userID.(uint), uint(otherUserID), myVoiceGlobal)
 
 	responseData := gin.H{
 		"conversation": gin.H{
@@ -1144,9 +1155,11 @@ func (h *ConversationHandler) GetConversationDetails(c *gin.Context) {
 			"other_message_count":  otherMessageCount,
 			"max_pending_messages": conversation.MaxPendingMessages,
 			"allow_voice_messages": allowVoiceMessages,
-			"show_read_receipts":   showReadReceipts,
-			"blocked":              conversation.Blocked || len(userBlocks) > 0,
-			"blocked_by_me":        blockedByMe,
+			// A'nın B için sesli mesaj iznini kabul edip etmediği (toggle durumu).
+			"voice_permission_for_other": voicePermissionForOther,
+			"show_read_receipts":         showReadReceipts,
+			"blocked":                    conversation.Blocked || len(userBlocks) > 0,
+			"blocked_by_me":              blockedByMe,
 			// Admin (Filament) bloku info — client vaxtı + cəza ilə açılma
 			// düyməsini göstərmək üçün. Yalnız admin bloku üçün mənalı.
 			"is_admin_block":               conversation.Blocked,
