@@ -160,6 +160,13 @@ func (c *LiveRoomClient) readPump() {
 	for {
 		_, message, err := c.Conn.ReadMessage()
 		if err != nil {
+			// Təmiz close (1000 normal / 1001 goingAway) = QƏSDƏN çıxış → host
+			// üçün otaq dərhal bağlanır. Qeyri-normal qopma (1006 / şəbəkə xətası
+			// / ping timeout) = müvəqqəti kəsinti → host üçün grace tətbiq olunur
+			// (bax live_hub.go). Default false (grace) — daha təhlükəsiz seçim.
+			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+				c.deliberateClose = true
+			}
 			log.Printf("❌ ReadMessage hatası: %v", err)
 			break
 		}

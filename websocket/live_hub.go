@@ -62,6 +62,12 @@ type LiveRoomClient struct {
 	// əlavə olunur. Host/broadcaster/audience fərq etməz — hamı bu WS axını ilə
 	// qoşulur. Register-də təyin olunur.
 	JoinedAt time.Time
+
+	// deliberateClose — readPump təyin edir: client TƏMİZ close (1000 normal /
+	// 1001 goingAway) göndəribsə true = QƏSDƏN çıxış. Host üçün: qəsdən çıxış →
+	// otaq DƏRHAL bağlanır; qeyri-normal qopma (zəif internet / 1006 / timeout)
+	// → grace tətbiq olunur (bax scheduleHostGraceEnd). Default false = grace.
+	deliberateClose bool
 }
 
 // closeSend — client-i təhlükəsiz (idempotent) bağlayır: `Send`-i DEYİL,
@@ -133,6 +139,13 @@ type LiveHub struct {
 	Unregister    chan *LiveRoomClient
 	Broadcast     chan *LiveMessageEvent
 	mu            sync.RWMutex
+
+	// hostGrace — otaq başına planlanmış host-qopma grace taymeri
+	// (roomID → timer). Host qeyri-normal qopanda otaq DƏRHAL bağlanmır;
+	// hostGraceWindow gözlənilir. Host qayıtsa (Register) taymer ləğv olunur.
+	// `graceMu` ilə qorunur (h.mu-dan AYRI — grace callback h.mu-nu tutur).
+	hostGrace map[uint]*time.Timer
+	graceMu   sync.Mutex
 }
 
 type LiveMessageEvent struct {
@@ -150,7 +163,104 @@ func NewLiveHub() *LiveHub {
 		Register:       make(chan *LiveRoomClient),
 		Unregister:     make(chan *LiveRoomClient),
 		Broadcast:      make(chan *LiveMessageEvent),
+		hostGrace:      make(map[uint]*time.Timer),
 	}
+}
+
+// ─── HOST QOPMA TOLERANSI (grace) ───────────────────────────────────────────
+// Host-un WS-i QEYRI-NORMAL qopanda (zəif internet, arxa plan, 1006, ping
+// timeout) otağı DƏRHAL bitirmirik: hostGraceWindow gözləyirik. Host bu müddətdə
+// qayıtsa (Register) grace ləğv olunur və yayın davam edir; qayıtmasa otaq
+// bağlanır. QƏSDƏN çıxış (WS goingAway) və admin/host END (ForceEndRoom / REST)
+// isə dərhal bağlayır. Bu, piokio_live-dakı 90s LiveKit grace-i ilə eyni
+// fəlsəfədir — otağın həyat dövrü bu iki grace-aware servisə məxsusdur, Laravel
+// LiveKit webhook-u artıq otağı bitirmir.
+const hostGraceWindow = 90 * time.Second
+
+// scheduleHostGraceEnd — host qeyri-normal qopanda otağı gecikmə ilə bağlamağı
+// planlayır. Eyni otaq üçün ikinci çağırış no-op-dur (ilk taymer onsuz da yoxlayır).
+func (h *LiveHub) scheduleHostGraceEnd(roomID, hostUID uint) {
+	h.graceMu.Lock()
+	if _, busy := h.hostGrace[roomID]; busy {
+		h.graceMu.Unlock()
+		return
+	}
+	t := time.AfterFunc(hostGraceWindow, func() {
+		h.graceMu.Lock()
+		delete(h.hostGrace, roomID)
+		h.graceMu.Unlock()
+
+		// Cari host-u DB-dən oxu (bu arada transfer ola bilər) və qoşulu olub-
+		// olmadığını yoxla. Host (və ya yeni host) qayıdıbsa → yayın davam edir.
+		var curHost uint
+		database.DB.Raw("SELECT host_user_id FROM live_rooms WHERE id = ?", roomID).Scan(&curHost)
+		if curHost != 0 && h.hostConnected(roomID, curHost) {
+			log.Printf("live grace cancel room=%d — host returned", roomID)
+			return
+		}
+		log.Printf("live grace expired room=%d — host gone, ending room", roomID)
+		h.endLiveRoom(roomID, "host_gone")
+	})
+	h.hostGrace[roomID] = t
+	h.graceMu.Unlock()
+	log.Printf("live grace start room=%d host=%d — ends in %s unless host returns", roomID, hostUID, hostGraceWindow)
+}
+
+// cancelHostGraceEnd — planlanmış grace-i ləğv edir (host qayıtdı / otaq qəti bağlandı).
+func (h *LiveHub) cancelHostGraceEnd(roomID uint) {
+	h.graceMu.Lock()
+	if t, ok := h.hostGrace[roomID]; ok {
+		t.Stop()
+		delete(h.hostGrace, roomID)
+		log.Printf("live grace cancelled room=%d", roomID)
+	}
+	h.graceMu.Unlock()
+}
+
+// hostConnected — verilən istifadəçi hazırda otağa WS ilə qoşuludurmu.
+func (h *LiveHub) hostConnected(roomID, hostUID uint) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if room, ok := h.rooms[roomID]; ok {
+		_, ok := room[hostUID]
+		return ok
+	}
+	return false
+}
+
+// endLiveRoom — otağı qəti bitir: pending grace-i ləğv et, status=ended
+// (yalnız hələ 'live'-dırsa; idempotent), aktiv iştirakçıları left işarələ və
+// otaqdakı HAMIYA `ended` (reason + forced:true) yayımla. Grace bitişi, host
+// qəsdən çıxışı və admin/host force-end — hamısı bunu çağırır. `forced:true`
+// client-ə "bu, host blip-i deyil, qəti bitişdir → dərhal çıx" siqnalıdır.
+func (h *LiveHub) endLiveRoom(roomID uint, reason string) {
+	h.cancelHostGraceEnd(roomID)
+
+	if err := database.DB.Exec(
+		"UPDATE live_rooms SET status = 'ended', ended_at = NOW() WHERE id = ? AND status = 'live'",
+		roomID,
+	).Error; err != nil {
+		log.Printf("❌ endLiveRoom DB update error (room %d): %v", roomID, err)
+	}
+	database.DB.Exec(
+		"UPDATE live_room_participants SET status = 'left', left_at = NOW() WHERE live_room_id = ? AND status = 'active'",
+		roomID,
+	)
+
+	endedPayload, _ := json.Marshal(map[string]interface{}{
+		"type": "ended",
+		"data": map[string]interface{}{"reason": reason, "forced": true},
+	})
+	h.mu.RLock()
+	if roomClients, ok := h.rooms[roomID]; ok {
+		for _, c := range roomClients {
+			select {
+			case c.Send <- endedPayload:
+			default:
+			}
+		}
+	}
+	h.mu.RUnlock()
 }
 
 func (h *LiveHub) Run() {
@@ -169,6 +279,12 @@ func (h *LiveHub) Run() {
 			h.rooms[client.RoomID][client.UserID] = client
 			count := h.visibleCount(client.RoomID)
 			h.mu.Unlock()
+
+			// Host geri qoşuldu → planlanmış host-qopma grace-ini ləğv et
+			// (yayın davam edir, otaq bağlanmır).
+			if client.Role == "host" {
+				h.cancelHostGraceEnd(client.RoomID)
+			}
 
 			log.Printf("User %d joined Live Room %d as %s (ghost=%v)", client.UserID, client.RoomID, client.Role, client.IsGhost)
 
@@ -310,28 +426,17 @@ func (h *LiveHub) Run() {
 			}
 
 			if isRoomHost {
-				err := database.DB.Exec("UPDATE live_rooms SET status = 'ended', ended_at = NOW() WHERE id = ?", client.RoomID).Error
-				if err != nil {
-					log.Printf("❌ DB Update Error (Room Ended): %v", err)
+				if client.deliberateClose {
+					// Host QƏSDƏN çıxdı (WS goingAway/normal close) → otağı DƏRHAL
+					// bağla, hamı çıxsın.
+					h.endLiveRoom(client.RoomID, "host_ended")
+				} else {
+					// QEYRI-NORMAL qopma (zəif internet / 1006 / ping timeout) →
+					// otağı DƏRHAL bağlama. hostGraceWindow gözlə: host geri qayıtsa
+					// (Register) grace ləğv olunur və yayın davam edir; qayıtmasa
+					// otaq bağlanır. Zəif internet artıq yayını öldürmür.
+					h.scheduleHostGraceEnd(client.RoomID, client.UserID)
 				}
-
-				database.DB.Exec("UPDATE live_room_participants SET status = 'left', left_at = NOW() WHERE live_room_id = ?", client.RoomID)
-
-				endedPayload, _ := json.Marshal(map[string]interface{}{
-					"type": "ended",
-					"data": map[string]interface{}{},
-				})
-
-				h.mu.RLock()
-				if roomClients, ok := h.rooms[client.RoomID]; ok {
-					for _, c := range roomClients {
-						select {
-						case c.Send <- endedPayload:
-						default:
-						}
-					}
-				}
-				h.mu.RUnlock()
 			}
 
 		case event := <-h.Broadcast:
@@ -1561,23 +1666,9 @@ func (h *LiveHub) ForceEndRoom(c *gin.Context) {
 		return
 	}
 
-	endedPayload, _ := json.Marshal(map[string]interface{}{
-		"type": "ended",
-		"data": map[string]interface{}{},
-	})
-
-	h.mu.RLock()
-	roomClients, ok := h.rooms[uint(roomID)]
-	h.mu.RUnlock()
-
-	if ok {
-		for _, client := range roomClients {
-			select {
-			case client.Send <- endedPayload:
-			default:
-			}
-		}
-	}
+	// Admin/host QƏTİ bağlama: pending grace-i ləğv et, status=ended (idempotent —
+	// Laravel çağıran tərəf də yazır) və otaqdakı hamıya `ended` (forced) yayımla.
+	h.endLiveRoom(uint(roomID), "admin_ended")
 
 	c.JSON(http.StatusOK, gin.H{"message": "Room force ended."})
 }
