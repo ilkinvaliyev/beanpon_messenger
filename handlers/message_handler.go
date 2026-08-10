@@ -119,6 +119,16 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 		return
 	}
 
+	// 🕵️ GİZLİ MOD (Hidden Mode) — 1:1 DM qapısı. Qarşı tərəf (receiver) gizli
+	// olub göndərən onun close-friend'i deyilsə — VƏ YA göndərənin özü gizli
+	// olub receiver onun close-friend'i deyilsə — mesaj bloklanır. Gizli olduğunu
+	// İFŞA ETMƏMƏK üçün blok deyil, "istifadəçi tapılmadı" (deaktiv / mövcud
+	// olmayan hesab görünüşü) qaytarılır.
+	if models.DMHiddenBlocked(database.DB, senderID.(uint), req.ReceiverID) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "İstifadəçi tapılmadı"})
+		return
+	}
+
 	// 🚫 SPAM SHADOW-BAN — GLOBAL (yeni VƏ mövcud conversation üçün).
 	//
 	// Yalnız `actions` sütununa baxılır. Qaydalar:
@@ -551,6 +561,15 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 	otherUserID, err := strconv.ParseUint(c.Param("user_id"), 10, 32)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz kullanıcı ID"})
+		return
+	}
+
+	// 🕵️ GİZLİ MOD — 1:1 söhbəti açmaq/mesajları çəkmək. Qarşı tərəf gizli olub
+	// viewer onun close-friend'i deyilsə (və ya viewer gizli olub qarşı tərəf
+	// onun close-friend'i deyilsə) söhbət ƏLÇATMAZDIR. Gizli olduğunu ifşa
+	// etməmək üçün "istifadəçi tapılmadı".
+	if models.DMHiddenBlocked(database.DB, userID.(uint), uint(otherUserID)) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "İstifadəçi tapılmadı"})
 		return
 	}
 
@@ -2049,8 +2068,22 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 	// çəkib map-ə qoyuruq; döngüdə yoxlama yaddaşda (O(1)) edilir.
 	blockedUserIDs := models.GetBlockedUserIDs(database.DB, userID.(uint))
 
+	// 🕵️ GİZLİ MOD — BATCH filtr (N+1 qarşısı, blockedUserIDs deseni ilə eyni).
+	// Qarşı tərəfi gizli olub viewer'in görə bilmədiyi (və ya viewer gizli olub
+	// qarşı tərəf onun close-friend'i olmayan) 1:1 söhbətlər siyahıdan çıxarılır.
+	// Bu siyahı yalnız DM-dir (CTE-də conversation_id IS NULL) — qruplara təsir yox.
+	peerIDs := make([]uint, 0, len(conversations))
+	for i := range conversations {
+		peerIDs = append(peerIDs, conversations[i].OtherUserID)
+	}
+	hiddenBlocked := models.HiddenBlockedPeerIDs(database.DB, userID.(uint), peerIDs)
+
 	var responseConversations []gin.H
 	for _, conv := range conversations {
+		if hiddenBlocked[conv.OtherUserID] {
+			continue
+		}
+
 		decryptedText, err := h.encryptionService.DecryptMessage(conv.LastMessageText)
 		if err != nil {
 			decryptedText = "Mesaj çözülemedi"

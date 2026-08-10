@@ -244,6 +244,14 @@ func (h *ConversationHandler) GetOrCreateConversationWithPermission(senderID, re
 		return nil, false, "Bu istifadəçiyə mesaj göndərə bilməzsiniz (blokladınız)", nil
 	}
 
+	// Gizli Mod: gizli kullanıcıya (close-friend olmayan) DM engellenir; gizli
+	// kullanıcı da yalnız close-friends'e yazabilir. Bu, bütün REST göndərmə
+	// yollarının keçdiyi ortaq nöqtədir (CanSendMessage → burası). "Bulunamadı"
+	// kimi davranırıq ki, gizli durum sızmasın.
+	if models.DMHiddenBlocked(database.DB, senderID, receiverID) {
+		return nil, false, "İstifadəçi tapılmadı", nil
+	}
+
 	// Conversation'ı bul
 	var conversation models.Conversation
 	err := database.DB.Where(
@@ -988,6 +996,15 @@ func (h *ConversationHandler) GetConversationDetails(c *gin.Context) {
 	otherUserID, err := strconv.ParseUint(c.Param("other_user_id"), 10, 32)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz kullanıcı ID"})
+		return
+	}
+
+	// 🕵️ GİZLİ MOD — 1:1 söhbət detalını açmaq. Qarşı tərəf gizli olub viewer
+	// onun close-friend'i deyilsə (və ya viewer gizli olub qarşı tərəf onun
+	// close-friend'i deyilsə) söhbət ƏLÇATMAZDIR. Gizli olduğunu ifşa etməmək
+	// üçün "istifadəçi tapılmadı".
+	if models.DMHiddenBlocked(database.DB, userID.(uint), uint(otherUserID)) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "İstifadəçi tapılmadı"})
 		return
 	}
 

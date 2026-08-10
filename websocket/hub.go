@@ -2446,6 +2446,14 @@ func (h *Hub) getOrCreateConversationWithPermission(senderID, receiverID uint) (
 		return nil, false, "Bu kullanıcıya mesaj gönderemezsiniz", nil
 	}
 
+	// Gizli Mod: gizli kullanıcıya (close-friend olmayan) DM engellenir; gizli
+	// kullanıcı da yalnız close-friends'e yazabilir. WS de REST kimi tətbiq edir
+	// (əks halda WS ilə gizli istifadəçiyə mesaj bypass olurdu). Nonexistent/
+	// deactivated kimi davranırıq — hidden durumu sızmasın.
+	if models.DMHiddenBlocked(h.db, senderID, receiverID) {
+		return nil, false, "İstifadəçi tapılmadı", nil
+	}
+
 	var conversation models.Conversation
 	err := h.db.Where(
 		"(user1_id = ? AND user2_id = ?) OR (user1_id = ? AND user2_id = ?)",
