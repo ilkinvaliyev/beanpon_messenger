@@ -24,7 +24,13 @@ import (
 
 // IsUserHidden — istifadəçi hazırda Gizli Mod'dadırmı (hidden_mode + müddət
 // keçərli).
+// GİZLİ MOD GEÇİCİ KAPALI (performans — DM açılış yavaşlığı). true yap → aç.
+var hiddenModeEnabled = false
+
 func IsUserHidden(db *gorm.DB, userID uint) bool {
+	if !hiddenModeEnabled {
+		return false
+	}
 	var row struct {
 		HiddenMode  bool
 		HiddenUntil *time.Time
@@ -77,6 +83,9 @@ func CanViewHidden(db *gorm.DB, viewerID, targetID uint) bool {
 // İkinci (simmetrik) yoxlama YALNIZ viewer gizli olduqda edilir — əlavə sorğu
 // qənaəti. Yalnız DM üçündür; qrup söhbətlərinə tətbiq OLUNMAMALIDIR.
 func DMHiddenBlocked(db *gorm.DB, viewerID, peerID uint) bool {
+	if !hiddenModeEnabled {
+		return false
+	}
 	if !CanViewHidden(db, viewerID, peerID) {
 		return true
 	}

@@ -72,7 +72,12 @@ func NewModerationAIService(apiKey string) *ModerationAIService {
 
 // Enabled — servis konfiqurasiya olunubmu?
 func (s *ModerationAIService) Enabled() bool {
-	return s.apiKey != ""
+	// GEÇİCİ KAPALI: mesaj gönderiminde AI (OpenAI) moderation isteği gitmesin.
+	// Bu false olduğu sürece: queue worker başlamaz, Enqueue no-op olur, Analyze
+	// kısa devre yapar → hiçbir OpenAI çağrısı yapılmaz. Geri açmak için alttaki
+	// yorumu aktifleştir, bu return'ü sil.
+	return false
+	// return s.apiKey != ""
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
