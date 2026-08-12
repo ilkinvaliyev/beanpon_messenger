@@ -4,7 +4,7 @@ import "strings"
 
 // BaseURL — media full URL prefiksi. Default api.beanpon.com; main.go
 // SetBaseURL(cfg.AppURL) ilə override edir (Laravel APP_URL ilə byte-uyğunluq).
-var BaseURL = "http://api.beanpon.com"
+var BaseURL = "https://api.beanpon.com"
 
 // SetBaseURL — APP_URL-i tətbiq başlanğıcında təyin edir.
 func SetBaseURL(u string) {
