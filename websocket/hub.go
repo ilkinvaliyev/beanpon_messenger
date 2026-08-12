@@ -716,6 +716,12 @@ func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, ms
 	//   • "restricted" → tək tərəfli mesaj limiti aşılıb, söhbət kilidli →
 	//                  push YOXDUR (əvvəl REST üzərindən GEDİRDİ — spam deşiyi);
 	//   • ""         → söhbət ümumiyyətlə yaradılmayıb (mesaj banı) → push yox.
+	// TEŞHİS (geçici): push neden gidiyor/gitmiyor — status + online + inChat.
+	// Beklenen: status="active"/"pending" + online=false → push gider.
+	log.Printf("📨 PUSH-GATE: sender=%d receiver=%d status=%q online=%v inChat=%v",
+		senderID, receiverID, conversationStatus,
+		h.IsUserOnline(receiverID), h.IsUserInChatWith(receiverID, senderID))
+
 	switch conversationStatus {
 	case "active", "pending":
 		if !h.IsUserOnline(receiverID) {
@@ -723,6 +729,9 @@ func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, ms
 		} else if !h.IsUserInChatWith(receiverID, senderID) {
 			go h.sendPushNotification(senderID, receiverID, content, msgType)
 		}
+	default:
+		// active/pending DIŞINDA → push GÖNDERİLMİYOR. Sebebi görünür olsun.
+		log.Printf("⛔ PUSH-GATE atlandı: status=%q (yalnız active/pending push gönderir)", conversationStatus)
 	}
 }
 

@@ -30,7 +30,13 @@ func InitBadTraffic(delaySeconds, cacheSeconds int) {
 }
 
 // throttleBadTraffic — user bad_traffic flag-ındadırsa gecikmə tətbiq edir.
+// BAD_TRAFFIC THROTTLE GEÇİCİ KAPALI (performans). true et → yenidən aç.
+var badTrafficEnabled = false
+
 func throttleBadTraffic(userID int64) {
+	if !badTrafficEnabled {
+		return
+	}
 	if badTrafficDelay <= 0 {
 		return
 	}
