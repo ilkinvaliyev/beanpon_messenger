@@ -127,7 +127,7 @@ func LoadConfig() *Config {
 		TelegramBotToken:       envStr("TELEGRAM_BOT_TOKEN", "8862168493:AAH2WPoYyUgbIEmolXkCJ3JAaKh3aP53fBE"),
 		TelegramChatID:         envStr("TELEGRAM_CHAT_ID", "739452673"),
 		PgBouncerEnabled:       envBool("PGBOUNCER_ENABLED", false),
-		AppURL:                 envStr("APP_URL", "https://api.beanpon.com"),
+		AppURL:                 envStr("APP_URL", "http://api.beanpon.com"),
 		S3: S3Config{
 			Bucket:    envStr("AWS_BUCKET", ""),
 			Region:    envStr("AWS_DEFAULT_REGION", "us-east-1"),
