@@ -113,6 +113,16 @@ type clusterFrame struct {
 	// hədəfli frame kimi emal edər — istifadəçi siyahısı qarışıq olsa da
 	// nəticə yalnız "presence çatmır" olur, mesaj yolu təsirlənmir.
 	Broadcast bool `json:"b,omitempty"`
+
+	// ChatSubject — YALNIZ `WS_STATUS_FANOUT=chat` rejimində doldurulur.
+	// Dəyəri statusu dəyişən istifadəçinin id-sidir; uzaq instans frame-i
+	// yalnız MƏHZ o şəxsin söhbəti açıq olan lokal client-lərə verir.
+	//
+	// `omitempty` (0 = yoxdur): default `all` rejimində sahə heç yazılmır və
+	// tel bayt-bayt köhnə formatdadır. Bu sahəni tanımayan köhnə instans onu
+	// görməzdən gəlir → frame-i hamıya yayır → BUGÜNKÜ davranış. Yəni rolling
+	// deploy zamanı qarışıq versiyalarda ən pis hal "köhnə davranış"dır.
+	ChatSubject uint `json:"cs,omitempty"`
 }
 
 // presenceRecord — `ws:presence:{id}` dəyəri.
@@ -210,6 +220,14 @@ func (h *Hub) publishCluster(userIDs []uint, messageType string, data interface{
 // `publishCluster`-dən yeganə fərqi `Broadcast: true` bayrağıdır; növbə,
 // atılma sayğacı və `origin` süzgəci eyni qalır.
 func (h *Hub) publishClusterBroadcast(except []uint, messageType string, data interface{}) {
+	h.publishClusterBroadcastScoped(except, messageType, data, 0)
+}
+
+// publishClusterBroadcastScoped — `publishClusterBroadcast` + istəyə bağlı
+// `chatSubject`. `chatSubject != 0` olduqda uzaq instans frame-i yalnız həmin
+// istifadəçinin söhbəti AÇIQ olan client-lərinə verir (bax `WS_STATUS_FANOUT`).
+// `chatSubject == 0` → köhnə davranış (hamıya).
+func (h *Hub) publishClusterBroadcastScoped(except []uint, messageType string, data interface{}, chatSubject uint) {
 	if !clusterReady.Load() || !clusterActive() {
 		return
 	}
@@ -219,11 +237,12 @@ func (h *Hub) publishClusterBroadcast(except []uint, messageType string, data in
 		return
 	}
 	frame := clusterFrame{
-		Origin:    instanceID,
-		UserIDs:   except,
-		Type:      messageType,
-		Data:      raw,
-		Broadcast: true,
+		Origin:      instanceID,
+		UserIDs:     except,
+		Type:        messageType,
+		Data:        raw,
+		Broadcast:   true,
+		ChatSubject: chatSubject,
 	}
 	payload, err := json.Marshal(frame)
 	if err != nil {
@@ -260,7 +279,7 @@ func (h *Hub) StartClusterSubscriber(ctx context.Context) {
 		}
 		// Issue 4: presence frame-i hədəfsizdir — bütün lokal client-lərə.
 		if frame.Broadcast {
-			h.broadcastLocalRaw(frame.UserIDs, frame.Type, frame.Data)
+			h.broadcastLocalRaw(frame.UserIDs, frame.Type, frame.Data, frame.ChatSubject)
 			return
 		}
 		h.deliverLocalRaw(frame.UserIDs, frame.Type, frame.Data)
@@ -270,7 +289,11 @@ func (h *Hub) StartClusterSubscriber(ctx context.Context) {
 // broadcastLocalRaw — uzaq instansdan gələn YAYIM frame-ini bu instansdakı
 // BÜTÜN client-lərə ötürür (`except` siyahısındakılar xaric). `deliverLocalRaw`
 // kimi YENİDƏN yayım ETMİR — əks halda instanslar arasında sonsuz döngə olardı.
-func (h *Hub) broadcastLocalRaw(except []uint, messageType string, data json.RawMessage) {
+//
+// `chatSubject != 0` olduqda (yalnız `WS_STATUS_FANOUT=chat`) frame yalnız
+// həmin istifadəçinin söhbəti AÇIQ olan lokal client-lərə verilir. 0 → köhnə
+// davranış: `except` xaricindəki HAMIYA.
+func (h *Hub) broadcastLocalRaw(except []uint, messageType string, data json.RawMessage, chatSubject uint) {
 	// Wire formatı `messageToBytes` ilə eyni olmalıdır: {"type":..,"data":..}
 	payload, err := json.Marshal(struct {
 		Type string          `json:"type"`
@@ -292,6 +315,11 @@ func (h *Hub) broadcastLocalRaw(except []uint, messageType string, data json.Raw
 	for userID, client := range h.clients {
 		if _, excluded := skip[userID]; excluded {
 			continue
+		}
+		if chatSubject != 0 {
+			if client.ActiveChatWith == nil || *client.ActiveChatWith != chatSubject {
+				continue
+			}
 		}
 		targets = append(targets, client)
 	}

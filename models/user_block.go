@@ -18,15 +18,33 @@ func (UserBlock) TableName() string {
 	return "user_blocks"
 }
 
-// IsBlocked iki kullanıcı arasında block var mı kontrol et
+// IsBlocked iki kullanıcı arasında block var mı kontrol et.
+//
+// ── `COUNT(*)` → `EXISTS` ───────────────────────────────────────────────────
+// ÖNCE: `Count(&count)` bütün uyğun sətirləri sayırdı, halbuki cavab yalnız
+// "ən azı biri varmı?"dır. `COUNT` üçün planlaşdırıcı bütün uyğunluqları
+// gəzməlidir; `EXISTS` isə İLK uyğunluqda dayanır (LIMIT 1 semantikası).
+//
+// Bu funksiya mesaj göndərmə yolunda (`SendMessage`, WS `send_message`,
+// `GetOrCreateConversationWithPermission`, `BroadcastMessage`-də alıcı başına)
+// və "yazır…" qapısında çağırılır — yəni ən sıx işlənən sorğulardan biridir.
+//
+// Nəticə SEMANTİK OLARAQ EYNİDİR (count > 0 ⇔ EXISTS), yalnız daha ucuzdur.
 func IsBlocked(db *gorm.DB, userID1, userID2 uint) bool {
-	var count int64
-	db.Model(&UserBlock{}).Where(
-		"(blocker_id = ? AND blocked_id = ?) OR (blocker_id = ? AND blocked_id = ?)",
-		userID1, userID2, userID2, userID1,
-	).Count(&count)
-
-	return count > 0
+	var exists bool
+	err := db.Raw(`
+		SELECT EXISTS (
+			SELECT 1 FROM user_blocks
+			WHERE (blocker_id = ? AND blocked_id = ?)
+			   OR (blocker_id = ? AND blocked_id = ?)
+		)
+	`, userID1, userID2, userID2, userID1).Scan(&exists).Error
+	if err != nil {
+		// Fail-closed DEYİL: köhnə davranış xətada `count = 0` → `false`
+		// qaytarırdı (sorğu xətası mesajı bloklamırdı). Eyni saxlanır.
+		return false
+	}
+	return exists
 }
 
 // GetBlockedUserIDs — userID ilə hər hansı istiqamətdə (bloklayan VƏ ya

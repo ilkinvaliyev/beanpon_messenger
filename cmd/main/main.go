@@ -12,13 +12,16 @@ import (
 	"beanpon_messenger/xmpp"
 	"context"
 	"crypto/subtle"
-	"github.com/Depado/ginprom"
-	"github.com/gin-gonic/gin"
+	"errors"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Depado/ginprom"
+	"github.com/gin-gonic/gin"
 )
 
 func main() {
@@ -215,8 +218,30 @@ func main() {
 	services.SetMediaTracker(mediaTracker)
 	go mediaTracker.StartReaper(context.Background())
 
-	// Gin router'ını oluştur
-	router := gin.Default()
+	// ── GIN ARTIQ RELEASE MODUNDA ───────────────────────────────────────────
+	//
+	// ÖNCE: `gin.SetMode` bu repo-da HEÇ BİR YERDƏ çağırılmırdı (grep: 0
+	// nəticə), yəni proses DEBUG modunda işləyirdi. İki ayrı xərci vardı:
+	//   1. `gin.Default()` = `New() + Logger() + Recovery()`. `gin.Logger()`
+	//      HƏR HTTP sorğusu üçün formatlanmış bir sətri SİNXRON olaraq stdout-a
+	//      yazır — yəni `/api/v1/messages` POST-u (hər mesaj) cavab
+	//      tamamlanmadan əvvəl bir stderr/stdout yazımı ödəyir.
+	//   2. Debug modunda Gin `[GIN-debug]` route cədvəlini və xəbərdarlıq
+	//      bannerini çap edir və daxili `IsDebugging()` yoxlamaları açıq qalır.
+	//
+	// `docker-compose.yml`-dəki `ENV=production` Gin üçün heç bir məna daşımır.
+	//
+	// SONRA: release modu + `gin.New()` (yalnız `Recovery`). Sorğu log-una
+	// ehtiyac olduqda `GIN_ACCESS_LOG=true` ilə geri açılır. `/metrics`
+	// (ginprom) onsuz da bütün sorğuları ölçür — status/latensiya oradan
+	// izlənməlidir, hər sorğu üçün mətn sətrindən yox.
+	gin.SetMode(gin.ReleaseMode)
+	router := gin.New()
+	router.Use(gin.Recovery())
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("GIN_ACCESS_LOG")), "true") {
+		router.Use(gin.Logger())
+		log.Println("⚠️ GIN_ACCESS_LOG=true — hər HTTP sorğusu üçün log sətri yazılacaq")
+	}
 
 	// Issue 54: multipart parse zamanı RAM-da saxlanılacaq maksimum həcm.
 	// Gin default-u 32 MB-dır; bundan böyük hissələr müvəqqəti fayla axır.
@@ -553,7 +578,33 @@ func main() {
 	log.Println("  GET  /ws?token=JWT_TOKEN")
 	log.Println("  GET  /ws/live?room_id=ID&token=JWT_TOKEN")
 
-	if err := router.Run(":" + cfg.Port); err != nil {
+	// ── `router.Run()` YERİNƏ AÇIQ KONFİQURASİYALI `http.Server` ────────────
+	//
+	// ÖNCE: `router.Run()` daxildə `&http.Server{Addr, Handler}` qurur — YƏNİ
+	// BÜTÜN ZAMAN LİMİTLƏRİ SIFIR (sonsuz):
+	//   • ReadHeaderTimeout = 0 → başlıqları damla-damla göndərən bir bağlantı
+	//     goroutine-i və soketi ƏBƏDİ tutur (Slowloris sinfi);
+	//   • IdleTimeout = 0       → keep-alive bağlantıları heç vaxt yığışdırılmır
+	//     → fayl deskriptorları sızır.
+	//
+	// SONRA: aşağıdakı limitlər. WebSocket üçün TƏHLÜKƏSİZDİR, çünki
+	// `upgrader.Upgrade` bağlantını "hijack" edir və o andan sonra
+	// `http.Server` deadline-ları TƏTBİQ OLUNMUR; WS öz deadline-larını
+	// idarə edir (`hub.go` readPump/writePump).
+	//
+	// ⚠️ `WriteTimeout` QƏSDƏN 0 SAXLANILIR. Sıfırdan fərqli olsaydı, upgrade
+	// cavabı yazılan anda işə düşən deadline uzun-ömürlü WS bağlantısını
+	// kəsərdi. Bu sətri dəyişməyin.
+	srv := &http.Server{
+		Addr:              ":" + cfg.Port,
+		Handler:           router,
+		ReadHeaderTimeout: 10 * time.Second, // Slowloris qapısı
+		ReadTimeout:       60 * time.Second, // gövdə oxuma (upload-lar öz limitini qoyur)
+		WriteTimeout:      0,                // ⚠️ WS üçün 0 QALMALIDIR
+		IdleTimeout:       120 * time.Second,
+	}
+
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("Sunucu başlatma hatası: %v", err)
 	}
 }

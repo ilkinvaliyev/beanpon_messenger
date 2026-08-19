@@ -53,6 +53,37 @@ type Config struct {
 
 	// S3 — səs/media yükləmə (voice + upload-media). Laravel Storage::disk('s3').
 	S3 S3Config
+
+	// DB — PostgreSQL bağlantı hovuzu. Əvvəl `database/database.go`-da SABİT
+	// KODDA idi (MaxOpenConns=25) və bu, BÜTÜN prosesin eyni andakı sorğu
+	// tavanı demək idi: bir mesaj göndərmə ~12 gediş-dönüş tələb etdiyi üçün
+	// 25 bağlantı yük altında növbəyə çevrilirdi. İndi env ilə tənzimlənir.
+	//
+	// DİQQƏT: `DBMaxOpenConns` PostgreSQL-in `max_connections` dəyərindən
+	// (bütün replica-lar + Laravel + pgbouncer nəzərə alınmaqla) KİÇİK
+	// olmalıdır. Artırmadan əvvəl `SHOW max_connections;` yoxlanmalıdır.
+	DB DBConfig
+
+	// Ops — davranışa təsir etməyən istismar açarları (log səviyyəsi və s.).
+	Ops OpsConfig
+}
+
+// DBConfig — PostgreSQL hovuzu və sorğu vaxt limiti.
+type DBConfig struct {
+	MaxOpenConns int
+	MaxIdleConns int
+	// StatementTimeout — DSN-ə yazılan `statement_timeout` (ms). 0 = qoyma
+	// (köhnə davranış: ilişən sorğu bağlantını sonsuza qədər tutur).
+	StatementTimeoutMS int
+}
+
+// OpsConfig — yalnız log/diaqnostika. Heç bir wire davranışını dəyişmir.
+type OpsConfig struct {
+	// PushLog — hər uğurlu push bildirişi üçün log sətri. Default: false.
+	// Əvvəl şərtsiz yazılırdı (`hub.go` sendPushNotification) və Go-nun
+	// standart `log` paketi qlobal mutex + sinxron stderr yazımı etdiyi üçün
+	// mesaj yolunda seriyalaşma nöqtəsi yaradırdı.
+	PushLog bool
 }
 
 // S3Config — səs/media faylları üçün S3/MinIO/Hetzner. Laravel s3 disk ilə eyni.
@@ -90,7 +121,12 @@ type CacheConfig struct {
 	// amma gələcəkdə (məs. message draft cache) lazım ola bilər.
 	LocalPrefix string
 
-	PoolSize     int
+	PoolSize int
+	// MinIdleConns — boşda saxlanan minimum bağlantı. 0 (təyin olunmamış)
+	// olduqda go-redis hovuzu tamamilə boşaldır və növbəti sorğu yeni TCP +
+	// AUTH gözləyir. Presence yoxlamaları partiya-partiya gəldiyi üçün bu
+	// gecikmə birbaşa mesaj yoluna düşürdü.
+	MinIdleConns int
 	DialTimeout  time.Duration
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
@@ -137,16 +173,35 @@ func LoadConfig() *Config {
 			PathStyle: envBool("AWS_USE_PATH_STYLE_ENDPOINT", false),
 		},
 
+		DB: DBConfig{
+			// 25 → 50: hovuz bütün prosesin eyni andakı sorğu tavanı idi.
+			// Env ilə geri 25-ə çəkilə bilər (`DB_MAX_OPEN_CONNS=25`).
+			MaxOpenConns: envInt("DB_MAX_OPEN_CONNS", 50),
+			MaxIdleConns: envInt("DB_MAX_IDLE_CONNS", 25),
+			// 15 s: `GetConversations` hazırda 1–4 s sürə bilir (o sorğu
+			// yenidən yazılana qədər geniş marj saxlayırıq). 0 = söndür.
+			StatementTimeoutMS: envInt("DB_STATEMENT_TIMEOUT_MS", 15000),
+		},
+
+		Ops: OpsConfig{
+			PushLog: envBool("PUSH_LOG", false),
+		},
+
 		Cache: CacheConfig{
-			Enabled:          envBool("REDIS_ENABLED", true),
-			Host:             envStr("REDIS_HOST", "127.0.0.1"),
-			Port:             envStr("REDIS_PORT", "6379"),
-			ReadHost:         envStr("REDIS_READ_HOST", ""),
-			ReadPort:         envStr("REDIS_READ_PORT", ""),
-			Password:         envRedisPassword("REDIS_PASSWORD"),
-			SharedPrefix:     envStr("REDIS_SHARED_PREFIX", "bp:shared:"),
-			LocalPrefix:      envStr("REDIS_LOCAL_PREFIX", "bp:msg:"),
-			PoolSize:         envInt("REDIS_POOL_SIZE", 20),
+			Enabled:      envBool("REDIS_ENABLED", true),
+			Host:         envStr("REDIS_HOST", "127.0.0.1"),
+			Port:         envStr("REDIS_PORT", "6379"),
+			ReadHost:     envStr("REDIS_READ_HOST", ""),
+			ReadPort:     envStr("REDIS_READ_PORT", ""),
+			Password:     envRedisPassword("REDIS_PASSWORD"),
+			SharedPrefix: envStr("REDIS_SHARED_PREFIX", "bp:shared:"),
+			LocalPrefix:  envStr("REDIS_LOCAL_PREFIX", "bp:msg:"),
+			// 20 → 50: hovuz presence GET-ləri (mesaj yolunda), 4 publish
+			// worker-i və spam-ban yoxlamaları arasında paylaşılır.
+			PoolSize: envInt("REDIS_POOL_SIZE", 50),
+			// MinIdleConns əvvəl HEÇ TƏYİN OLUNMAMIŞDI (0) — hər boşluqdan
+			// sonrakı ilk presence sorğusu TCP+AUTH gözləyirdi.
+			MinIdleConns:     envInt("REDIS_MIN_IDLE_CONNS", 5),
 			DialTimeout:      envDuration("REDIS_DIAL_TIMEOUT", 2*time.Second),
 			ReadTimeout:      envDuration("REDIS_READ_TIMEOUT", 500*time.Millisecond),
 			WriteTimeout:     envDuration("REDIS_WRITE_TIMEOUT", 500*time.Millisecond),

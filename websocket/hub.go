@@ -11,6 +11,8 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -75,6 +77,60 @@ type Client struct {
 	// goroutine eyni unregister kanalında növbəyə düşürdü. Atomik bayraq
 	// çıxarılmanı yalnız BİR dəfə növbəyə qoyur.
 	evicting atomic.Bool
+
+	// ── ProtoVersion — İSTEMÇİ YETENEK PAZARLIĞI (geriyə uyumluluq) ──────────
+	//
+	// NİYƏ LAZIMDIR
+	// Bu serverə eyni anda ÜÇ istemçi qoşulur: canlı Flutter tətbiqi
+	// (`beanpon_app`), App Store-dakı KÖHNƏ `piokio_ios` buraxılışları və yeni
+	// iOS buraxılışı. Serverdə bir davranışı dəyişmək köhnə istemçini SESSİZCƏ
+	// sındıra bilər (frame gözləyir, gəlmir → mesaj görünmür). Ona görə heç bir
+	// yeni davranış "avtomatik" deyil: istemçi ÖZÜNÜ TANITMALIDIR.
+	//
+	// NECƏ İŞLƏYİR
+	// Yeni istemçi soketi `wss://…/ws?cv=2` ilə açır. Query string upgrade
+	// sorğusunda gəlir, yəni `registerClient`-dən ƏVVƏL məlumdur (bu vacibdir:
+	// `sendRecentMessages` qeydiyyat anında işləyir, istemçinin `hello` frame-i
+	// göndərməsini gözləyə bilmərik). Cloudflare və Caddy query string-i
+	// olduğu kimi ötürür.
+	//
+	//   ProtoVersion == 1  → parametr yoxdur = KÖHNƏ istemçi = BUGÜNKÜ davranış
+	//                        bayt-bayt eyni. Flutter və köhnə iOS buradadır.
+	//   ProtoVersion >= 2  → yeni istemçi: tarixçə selini almır, `message_ack`
+	//                        alır (bax `handleIncomingMessage` / `send_message`).
+	//
+	// Sahə yalnız `HandleWebSocket`-də, client qurulanda BİR DƏFƏ yazılır və
+	// sonra yalnız oxunur → kilid lazım deyil.
+	ProtoVersion int
+}
+
+// Protokol versiyaları — sehrli rəqəmlər kodun içinə səpələnməsin.
+const (
+	// protoLegacy — `?cv=` göndərməyən istemçi. Flutter + köhnə iOS.
+	protoLegacy = 1
+	// protoV2 — WS ilə mesaj göndərən, `message_ack` anlayan, bağlantıda
+	// tarixçə seli İSTƏMƏYƏN istemçi.
+	protoV2 = 2
+	// protoMax — serverin tanıdığı ən yüksək versiya. Daha böyük dəyər
+	// göndərən istemçi buna sıxılır (gələcək istemçi köhnə serverdə çökməsin).
+	protoMax = protoV2
+)
+
+// parseProtoVersion — `?cv=` parametrini təhlükəsiz oxuyur.
+// Boş / pozuq / 1-dən kiçik dəyər → protoLegacy (yəni köhnə davranış).
+func parseProtoVersion(raw string) int {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return protoLegacy
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v < protoLegacy {
+		return protoLegacy
+	}
+	if v > protoMax {
+		return protoMax
+	}
+	return v
 }
 
 // enqueueEvict — Issue 22: yavaş client-i BİR dəfə unregister növbəsinə qoyur.
@@ -232,20 +288,52 @@ func (h *Hub) registerClient(client *Client) {
 	// when XMPP is disabled.
 	h.markLegacyPresence(client.UserID)
 
-	// Issue 23: `user_status` fan-out-unun ALICI SİYAHISI kilid altında
-	// kopyalanır; faktiki yazılar kilid BURAXILDIQDAN sonra edilir.
-	statusTargets := h.statusTargetsLocked(client.UserID)
-
 	h.mutex.Unlock()
+
+	// ── O(N) TARAMA ARTIQ YAZMA KİLİDİNİN ALTINDA DEYİL ─────────────────────
+	// Əvvəl `statusTargetsLocked` MƏHZ BURADA, `h.mutex.Lock()` altında
+	// çağırılırdı: hər bağlanmada bütün `h.clients` map-i gəzilib O(N) uzunluqda
+	// bir dilim ayrılırdı və bu müddətdə `deliver()`-in `RLock`-u — yəni BÜTÜN
+	// mesaj çatdırılması — dayanırdı. (Issue 23 kanal yazımlarını kiliddən
+	// çıxarmışdı, amma TARAMANIN ÖZÜ içəridə qalmışdı.)
+	//
+	// İndi snapshot ayrıca, PAYLAŞILAN (RLock) kilid altında alınır → digər
+	// oxuyucularla paralel işləyir və yazma kilidini heç bloklamır.
+	//
+	// Doğruluq: `statusTargets` istifadəçini id-yə görə onsuz da istisna edir,
+	// ona görə snapshot-ın kiliddən sonra alınması davranışı dəyişmir.
+	statusTargets := h.statusTargets(client.UserID)
 
 	// Kullanıcı online durumunu diğer kullanıcılara bildir (kilidsiz)
 	h.broadcastUserStatus(client.UserID, "online", statusTargets)
 
-	//İlk bağlantıda okunmamış mesaj sayısını gönder
-	go h.SendUnreadCountUpdate(client.UserID)
+	//İlk bağlantıda okunmamış mesaj sayısını gönder.
+	// `...Now`: bağlantı anı birləşdirmə pəncərəsini gözləməməlidir —
+	// istemçi rozeti dərhal doğru göstərsin.
+	go h.SendUnreadCountUpdateNow(client.UserID)
 
-	// Bağlandıktan sonra son 30 mesajı gönder
-	go h.sendRecentMessages(client)
+	// ── TARİXÇƏ SELİ ARTIQ YALNIZ KÖHNƏ İSTEMÇİYƏ GEDİR ─────────────────────
+	//
+	// `sendRecentMessages` hər bağlantıda:
+	//   • 2 LEFT JOIN-li ağır bir sorğu işlədir (`sender_id = ? OR receiver_id = ?`
+	//     + `ORDER BY created_at` — uyğun index yoxdur),
+	//   • 30 mesajın şifrəsini açır (30 × AES),
+	//   • 31 WebSocket frame yazır (256-lıq `Send` buferinin 12%-i).
+	//
+	// Üstəlik sorğu `ORDER BY m.created_at ASC` yazır — yəni "son 30" deyil,
+	// istifadəçinin HƏYATDAKI İLK 30 MESAJI. Funksiya adı və şərhi ilə davranış
+	// uyğun gəlmir.
+	//
+	// Yeni iOS istemçisi bu frame-ləri onsuz da EMAL ETMİR (`history_message`
+	// üçün `switch`-də `case` yoxdur → `default: break`) və kaçırılan mesajları
+	// `runDeltaSync` / `syncMissed` ilə daha dəqiq bərpa edir. Ona görə v2-də
+	// tamamilə atlanır.
+	//
+	// KÖHNƏ istemçi (Flutter + köhnə iOS) üçün HEÇ NƏ DƏYİŞMİR — həmin 31
+	// frame eyni sıra ilə göndərilir.
+	if client.ProtoVersion < protoV2 {
+		go h.sendRecentMessages(client)
+	}
 }
 
 // unregisterClient client'ı çıkar
@@ -259,9 +347,9 @@ func (h *Hub) unregisterClient(client *Client) {
 	// göstərməməlidir. Yalnız öz `Send` kanalını bağlamalıdır.
 	current, exists := h.clients[client.UserID]
 
-	// Issue 23: fan-out kilid altında EDİLMİR — yalnız alıcı siyahısı
-	// kopyalanır, göndərmə aşağıda (kilidsiz) baş verir.
-	var statusTargets []*Client
+	// Issue 23: fan-out kilid altında EDİLMİR — göndərmə aşağıda (kilidsiz)
+	// baş verir. Alıcı siyahısı da artıq kiliddən SONRA alınır (bax
+	// `registerClient`-dəki şərh).
 	wentOffline := false
 
 	if exists && current == client {
@@ -278,9 +366,6 @@ func (h *Hub) unregisterClient(client *Client) {
 		_ = client.Conn.Close()
 		//log.Printf("Kullanıcı %d WebSocket'ten ayrıldı", client.UserID)
 
-		// Snapshot map-dən SİLDİKDƏN sonra alınır — çıxan client özünə
-		// "offline" frame-i almasın.
-		statusTargets = h.statusTargetsLocked(client.UserID)
 		wentOffline = true
 	} else {
 		// Köhnə/əvəz olunmuş client — yeni bağlantıya toxunma, yalnız
@@ -291,23 +376,70 @@ func (h *Hub) unregisterClient(client *Client) {
 
 	h.mutex.Unlock()
 
-	// Kullanıcı offline durumunu diğer kullanıcılara bildir (kilidsiz)
+	// Kullanıcı offline durumunu diğer kullanıcılara bildir (kilidsiz).
+	// Snapshot map-dən SİLİNDİKDƏN sonra alınır — çıxan client özünə "offline"
+	// frame-i almasın (`statusTargets` onu id-yə görə də istisna edir).
 	if wentOffline {
-		h.broadcastUserStatus(client.UserID, "offline", statusTargets)
+		h.broadcastUserStatus(client.UserID, "offline", h.statusTargets(client.UserID))
 	}
 }
 
-// statusTargetsLocked — `user_status` fan-out-unun alıcı siyahısını kopyalayır.
+// ── `user_status` FAN-OUT ƏHATƏSİ ───────────────────────────────────────────
 //
-// ÇAĞIRAN `h.mutex`-i TUTMALIDIR. Yalnız map gəzilir və göstəricilər
-// kopyalanır — heç bir kanal yazısı yoxdur, yəni kilid altındakı iş
-// sabit və qısadır.
-func (h *Hub) statusTargetsLocked(exceptUserID uint) []*Client {
+// PROBLEM (dəyişdirilmədi, yalnız açarı əlavə edildi)
+// Bir istifadəçi bağlanan/kopan HƏR dəfə `user_status` frame-i O AN BAĞLI OLAN
+// HƏR KƏSƏ göndərilir. Dost siyahısı süzgəci yoxdur. 10.000 bağlantı və
+// dəqiqədə %10 dövriyyə = dəqiqədə 10 milyon frame; xərc istifadəçi sayının
+// KVADRATI ilə artır və yatay ölçəklənməni kilidləyir.
+//
+// NİYƏ DEFAULT-DA DƏYİŞMİRİK
+// Bu frame-i yeni iOS istemçisi ONSUZ DA EMAL ETMİR (`switch`-də `case` yoxdur),
+// AMMA canlı Flutter tətbiqi onu söhbət siyahısındakı "onlayn" nöqtəsi üçün
+// istifadə edir ola bilər. Süzgəci birbaşa açmaq həmin nöqtələri söndürərdi.
+// Ona görə açar ƏLAVƏ olunur, default KÖHNƏ davranışdır; ölçüb sonra açacağıq.
+//
+//	WS_STATUS_FANOUT=all   (default) → bugünkü davranış, bayt-bayt eyni
+//	WS_STATUS_FANOUT=chat            → yalnız həmin şəxsin söhbəti AÇIQ olanlara
+const (
+	statusFanoutAll  = "all"
+	statusFanoutChat = "chat"
+)
+
+var statusFanoutMode = func() string {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("WS_STATUS_FANOUT"))) {
+	case statusFanoutChat:
+		return statusFanoutChat
+	default:
+		return statusFanoutAll
+	}
+}()
+
+// statusTargets — `user_status` fan-out-unun alıcı siyahısını kopyalayır.
+//
+// Kilidi ÖZÜ alır (paylaşılan `RLock`) — çağıran heç bir kilid tutmamalıdır.
+// Əvvəlki `statusTargetsLocked` yazma kilidinin (`Lock`) altından çağırılırdı və
+// bu müddətdə bütün mesaj çatdırılması dayanırdı; bax `registerClient` şərhi.
+//
+// Yalnız map gəzilir və göstəricilər kopyalanır — heç bir kanal yazısı yoxdur.
+func (h *Hub) statusTargets(exceptUserID uint) []*Client {
+	chatOnly := statusFanoutMode == statusFanoutChat
+
+	h.mutex.RLock()
+	defer h.mutex.RUnlock()
+
 	targets := make([]*Client, 0, len(h.clients))
 	for _, client := range h.clients {
-		if client.UserID != exceptUserID { // Kendisi hariç
-			targets = append(targets, client)
+		if client.UserID == exceptUserID { // Kendisi hariç
+			continue
 		}
+		if chatOnly {
+			// Yalnız `exceptUserID` ilə söhbəti AÇIQ olanlar. `ActiveChatWith`
+			// `SetActiveChat` ilə yazılır və eyni `h.mutex` altında qorunur.
+			if client.ActiveChatWith == nil || *client.ActiveChatWith != exceptUserID {
+				continue
+			}
+		}
+		targets = append(targets, client)
 	}
 	return targets
 }
@@ -320,8 +452,9 @@ func (h *Hub) statusTargetsLocked(exceptUserID uint) []*Client {
 // cümlədən `deliver`-in `RLock`-unu — bağlı client sayı qədər (O(N))
 // addımlıq müddətə dondururdu; buferi dolu bir client üçün əlavə olaraq
 // `enqueueEvict` da həmin kilid altında çağırılırdı. İndi alıcılar
-// `statusTargetsLocked` ilə kilid altında SNAPSHOT edilir, kanal yazıları
-// isə kilid buraxıldıqdan SONRA baş verir — `deliver` (:331) və
+// `statusTargets` ilə PAYLAŞILAN kilid altında SNAPSHOT edilir (Issue 23-də
+// yalnız kanal yazıları çıxarılmışdı, taramanın özü hələ də yazma kilidinin
+// altındaydı), kanal yazıları isə kiliddən sonra baş verir — `deliver` və
 // `SendToMultipleUsers` ilə tam eyni naxış.
 //
 // `Send` kanalı HEÇ VAXT bağlanmır (bağlanma siqnalı `done` kanalıdır,
@@ -358,7 +491,16 @@ func (h *Hub) broadcastUserStatus(userID uint, status string, targets []*Client)
 	// `publishCluster` ilə yayımlanır, status yolu isə qalmışdı).
 	// Frame `origin` sahəsi ilə özünü tanıyır → yayan instans onu təkrar
 	// emal etmir (bax StartClusterSubscriber).
-	h.publishClusterBroadcast([]uint{userID}, "user_status", data)
+	//
+	// `WS_STATUS_FANOUT=chat` rejimində uzaq instans da eyni süzgəci tətbiq
+	// etməlidir — `subject` sahəsi ona kimin statusu olduğunu bildirir.
+	// Sahə `omitempty`-dir: köhnə instans onu görməzdən gəlir və frame-i
+	// hamıya yayır, yəni bugünkü davranış → rolling deploy təhlükəsizdir.
+	subject := uint(0)
+	if statusFanoutMode == statusFanoutChat {
+		subject = userID
+	}
+	h.publishClusterBroadcastScoped([]uint{userID}, "user_status", data, subject)
 }
 
 // deliver — mesajı alıcının `Send` buferinə non-blocking yazır.
@@ -716,22 +858,38 @@ func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, ms
 	//   • "restricted" → tək tərəfli mesaj limiti aşılıb, söhbət kilidli →
 	//                  push YOXDUR (əvvəl REST üzərindən GEDİRDİ — spam deşiyi);
 	//   • ""         → söhbət ümumiyyətlə yaradılmayıb (mesaj banı) → push yox.
-	// TEŞHİS (geçici): push neden gidiyor/gitmiyor — status + online + inChat.
-	// Beklenen: status="active"/"pending" + online=false → push gider.
-	log.Printf("📨 PUSH-GATE: sender=%d receiver=%d status=%q online=%v inChat=%v",
-		senderID, receiverID, conversationStatus,
-		h.IsUserOnline(receiverID), h.IsUserInChatWith(receiverID, senderID))
+	//
+	// ── "TEŞHİS (geçici)" LOG SƏTRİ SİLİNDİ ─────────────────────────────────
+	// Burada hər mesajda işləyən bir `log.Printf("📨 PUSH-GATE: …")` vardı.
+	// Yorumu "geçici" deyirdi, amma qalıcı olmuşdu və sistemin ƏN İSTİ
+	// yolundaydı. İki ayrı zərəri vardı:
+	//
+	//  1. Go `log.Printf` arqumentlərini HƏMİŞƏ hesablayır (səviyyə qapısı
+	//     yoxdur). Sətir `IsUserOnline(receiverID)` və
+	//     `IsUserInChatWith(receiverID, senderID)` çağırırdı — AŞAĞIDAKI
+	//     şərtlərdə TƏKRAR çağırılan eyni funksiyalar. Yəni mesaj başına
+	//     2 yerinə 4 `h.mutex.RLock()` alınırdı (bu kilid `deliver()` ilə
+	//     birbaşa yarışır) və keş soyuq olduqda 2 əlavə Redis GET edilirdi.
+	//  2. Standart `log` qlobal mutex tutub stderr-ə sinxron yazır.
+	//
+	// İndi hər iki dəyər BİR DƏFƏ hesablanıb dəyişənə alınır.
+	online := h.IsUserOnline(receiverID)
+	inChat := false
+	if online {
+		// Yalnız onlayn olduqda mənalıdır — offline istifadəçi üçün bu
+		// çağırış lazımsız bir kilid/Redis gedişi olardı.
+		inChat = h.IsUserInChatWith(receiverID, senderID)
+	}
 
 	switch conversationStatus {
 	case "active", "pending":
-		if !h.IsUserOnline(receiverID) {
-			go h.sendPushNotification(senderID, receiverID, content, msgType)
-		} else if !h.IsUserInChatWith(receiverID, senderID) {
+		if !online || !inChat {
 			go h.sendPushNotification(senderID, receiverID, content, msgType)
 		}
 	default:
-		// active/pending DIŞINDA → push GÖNDERİLMİYOR. Sebebi görünür olsun.
-		log.Printf("⛔ PUSH-GATE atlandı: status=%q (yalnız active/pending push gönderir)", conversationStatus)
+		// active/pending DIŞINDA → push GÖNDERİLMİYOR. (Əvvəlki `log.Printf`
+		// buradan da silindi: `restricted`/boş status normal bir haldır, hər
+		// dəfəsində sətir yazmağın diaqnostik dəyəri yoxdur.)
 	}
 }
 
@@ -1001,6 +1159,14 @@ func (h *Hub) HandleWebSocket(c *gin.Context) {
 		return
 	}
 
+	// ── OKUMA BOYUT LİMİTİ (əvvəl HEÇ YOX İDİ) ──────────────────────────────
+	// `ReadBufferSize: 1024` (yuxarıda, upgrader) bir BUFER ölçüsüdür, LİMİT
+	// deyil. Limit olmadan `ReadMessage` istənilən ölçüdə bir frame-i bütövlükdə
+	// yaddaşa alır — pozuq və ya bədniyyətli bir istemçi prosesi şişirdə bilər.
+	// Ən böyük real frame (uzun mətn + reply + payload) onlarla KB-dır; 256 KB
+	// geniş marjdır. Limit aşıldıqda gorilla bağlantını 1009 ilə bağlayır.
+	conn.SetReadLimit(256 << 10)
+
 	client := &Client{
 		UserID: userID.(uint),
 		Conn:   conn,
@@ -1008,6 +1174,9 @@ func (h *Hub) HandleWebSocket(c *gin.Context) {
 		Hub:    h,
 		done:   make(chan struct{}),
 		typing: newTypingGate(), // Issue 16
+		// Yetenek pazarlığı — bax `Client.ProtoVersion` şərhi.
+		// `?cv=` YOXDURSA protoLegacy (1) → köhnə istemçi davranışı.
+		ProtoVersion: parseProtoVersion(c.Query("cv")),
 	}
 
 	h.register <- client
@@ -1176,6 +1345,14 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 			return
 		}
 
+		// ── İSTEMÇİNİN GÖNDƏRDİYİ `client_message_id` (varsa) ────────────────
+		// Aşağıda ID kimi istifadə olunmazdan ƏVVƏL burada tutulur, çünki
+		// `message_error` / `message_ack` frame-lərində istemçiyə GERİ
+		// qaytarılmalıdır: v2 istemçi ekrandakı hansı optimistik baloncuğun
+		// nəticələndiyini yalnız bununla bilir.
+		clientMsgID, _ := dataMap["client_message_id"].(string)
+		clientMsgID = strings.TrimSpace(clientMsgID)
+
 		// 🚫 SPAM SHADOW-BAN — GLOBAL (yeni VƏ mövcud conversation üçün).
 		//
 		// Yalnız `actions` sütununa baxılır:
@@ -1205,11 +1382,14 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 			}
 
 			log.Printf("Mesaj gönderilemedi: %d -> %d, error: %v, msg: %s", c.UserID, receiverID, err, errorMsg)
+			// `cid`: v2 istemçi hansı optimistik baloncuğun rədd edildiyini
+			// bilməlidir. Köhnə istemçi bu ƏLAVƏ sahəni sadəcə görməzdən gəlir.
 			c.sendMessage(&OutgoingMessage{
 				Type: "message_error",
 				Data: map[string]interface{}{
 					"error": errorMsg,
 					"code":  "SEND_NOT_ALLOWED",
+					"cid":   clientMsgID,
 				},
 			})
 			return
@@ -1220,15 +1400,16 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 		// çatmamış mesajı TƏKRAR göndərir; server UUID-i ilə bu HƏR DƏFƏ yeni
 		// sətir yaradırdı → söhbətdə dublikat. İndi eyni açar → eyni sətir.
 		messageID := ""
-		if cmid, exists := dataMap["client_message_id"].(string); exists {
-			if parsed, perr := uuid.Parse(strings.TrimSpace(cmid)); perr == nil {
+		if clientMsgID != "" {
+			if parsed, perr := uuid.Parse(clientMsgID); perr == nil {
 				messageID = parsed.String()
-			} else if strings.TrimSpace(cmid) != "" {
+			} else {
 				c.sendMessage(&OutgoingMessage{
 					Type: "message_error",
 					Data: map[string]interface{}{
 						"error": "client_message_id UUID formatında olmalıdır",
 						"code":  "INVALID_CLIENT_MESSAGE_ID",
+						"cid":   clientMsgID,
 					},
 				})
 				return
@@ -1324,6 +1505,7 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 					Data: map[string]interface{}{
 						"error": "client_message_id artıq istifadə olunub",
 						"code":  "CLIENT_MESSAGE_ID_TAKEN",
+						"cid":   clientMsgID,
 					},
 				})
 				return
@@ -1331,12 +1513,19 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 			log.Printf("Mesaj DB'ye yazılamadı (WS): %v", err)
 			c.sendMessage(&OutgoingMessage{
 				Type: "message_error",
-				Data: map[string]interface{}{"error": "message_persist_failed", "code": "SEND_FAILED"},
+				Data: map[string]interface{}{
+					"error": "message_persist_failed",
+					"code":  "SEND_FAILED",
+					"cid":   clientMsgID,
+				},
 			})
 			return
 		}
 
 		if duplicate {
+			// v2 üçün ƏLAVƏ `message_ack` (duplicate=true). `message_duplicate`
+			// AYNEN qalır — köhnə istemçilər onu gözləyir.
+			c.sendAckIfV2(messageID, clientMsgID, receiverID, createdAt, true)
 			c.sendMessage(&OutgoingMessage{
 				Type: "message_duplicate",
 				Data: map[string]interface{}{
@@ -1346,6 +1535,24 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 			})
 			return
 		}
+
+		// ── `message_ack` — v2 istemçi üçün "sunucu aldı" onayı ──────────────
+		//
+		// ÖNCE: göndərənin yeganə onayı `HandleNewMessage`-in ona geri
+		// göndərdiyi TAM `new_message` echo-su idi (reply obyekti, story
+		// obyekti, hər şey daxil). İstemçi ekrandakı optimistik baloncuğu bu
+		// echo ilə METN QARŞILAŞDIRARAQ eşleştirməyə çalışırdı
+		// (`ChatViewModel.removeFirstTemp` — üç ayrı strategiya: mətn, payload
+		// url, voiceUrl) — kövrək və bahalı.
+		//
+		// İNDİ: v2 istemçi ~80 baytlıq bir onay alır və `cid` ilə DƏQİQ
+		// eşleştirir. Echo hələ də göndərilir (köhnə istemçilər üçün lazımdır
+		// və v2 istemçi onu id-yə görə onsuz da təkrar sayır) — echo-nun
+		// dayandırılması Deploy 3-dədir.
+		//
+		// Ack YAYIMDAN ÖVVƏL göndərilir: göndərənin "tək tik"i fan-out, push
+		// qapısı və `SendUnreadCountUpdate` işini gözləməsin.
+		c.sendAckIfV2(messageID, clientMsgID, receiverID, createdAt, false)
 
 		// Yenilənmiş status-u götür (pending→active keçmiş ola bilər) —
 		// HandleNewMessage push qapısı bunu istifadə edir.
@@ -1565,6 +1772,42 @@ func (c *Client) emitTypingSignal(receiverID uint, action string, isStart bool) 
 		"user_id": c.UserID,
 		"typing":  isStart,
 		"action":  action,
+	})
+}
+
+// sendAckIfV2 — v2 istemçiyə minik "sunucu aldı" onayı göndərir.
+//
+// KÖHNƏ İSTEMÇİ (ProtoVersion < 2) ÜÇÜN NO-OP — heç bir frame yazılmır, yəni
+// Flutter və köhnə iOS üçün tel bayt-bayt dəyişmir.
+//
+// Frame formatı:
+//
+//	{"type":"message_ack","data":{
+//	   "cid":"<istemçinin client_message_id-si; boş ola bilər>",
+//	   "id":"<serverdəki mesaj id>",
+//	   "receiver_id":123,
+//	   "created_at":"2026-08-19T12:34:56Z",
+//	   "duplicate":false
+//	}}
+//
+// `cid` ilə `id` bu server-də ADƏTƏN eynidir (istemçinin verdiyi UUID mesajın
+// nihai id-si olur — Issue 9). Yenə də hər ikisi göndərilir: istemçi
+// `client_message_id` vermədikdə `cid` boş olur və `id` serverin yaratdığı
+// UUID-dir; həmçinin bu, gələcəkdə id sxemi dəyişsə (məs. UUIDv7) teli
+// qırmadan keçidə imkan verir.
+func (c *Client) sendAckIfV2(messageID, clientMsgID string, receiverID uint, createdAt time.Time, duplicate bool) {
+	if c.ProtoVersion < protoV2 {
+		return
+	}
+	c.sendMessage(&OutgoingMessage{
+		Type: "message_ack",
+		Data: map[string]interface{}{
+			"cid":         clientMsgID,
+			"id":          messageID,
+			"receiver_id": receiverID,
+			"created_at":  createdAt.UTC().Format(time.RFC3339),
+			"duplicate":   duplicate,
+		},
 	})
 }
 
@@ -1909,7 +2152,12 @@ func (h *Hub) sendPushNotification(senderID, receiverID uint, message, msgType s
 		defer resp.Body.Close()
 
 		if resp.StatusCode == 200 {
-			log.Printf("✅ Push notification gönderildi: %d -> %d", senderID, receiverID)
+			// UĞUR sətri artıq default-da YAZILMIR (`PUSH_LOG=true` ilə açılır).
+			// Push göndərilən hər mesaj üçün bir stderr yazımı idi; xəta yolu
+			// (aşağıda) olduğu kimi qalır — problem görünməz olmasın.
+			if h.config != nil && h.config.Ops.PushLog {
+				log.Printf("✅ Push notification gönderildi: %d -> %d", senderID, receiverID)
+			}
 		} else {
 			log.Printf("❌ Push notification başarısız, status: %d", resp.StatusCode)
 		}
@@ -1917,22 +2165,32 @@ func (h *Hub) sendPushNotification(senderID, receiverID uint, message, msgType s
 }
 
 // GetUnreadCount kullanıcının okunmamış mesaj sayısını getir
+//
+// ── İKİ FƏRQLİ SAYĞAC BİRLƏŞDİRİLDİ ─────────────────────────────────────────
+//
+// ÖNCE: bu sorğuda `users` JOIN-i YOX idi, REST əkizində (`MessageHandler.
+// GetUnreadCount`, message_handler.go) VAR idi. Yəni SİLİNMİŞ hesabdan gələn
+// oxunmamış mesajlar WS yolunda sayılır, REST yolunda sayılmırdı. İstifadəçi
+// eyni anda iki fərqli rozet dəyəri görürdü: WS `unread_count_update` frame-i
+// bir rəqəm yazır, növbəti REST yeniləməsi onu DƏYİŞDİRİRDİ — "rozet zıplıyor".
+//
+// SONRA: hər iki yol EYNİ şərtlərdən keçir (`users.deleted_at IS NULL` daxil).
+// Nəticə bəzi istifadəçilərdə AZALA bilər — bu düzgün istiqamətdir, çünki
+// silinmiş hesabın mesajı söhbət siyahısında onsuz da görünmür.
+//
+// Sorğu `Raw` deyil, `Model(...)` ilə yazılıb ki, REST əkizi ilə hərfi-hərfinə
+// eyni predikatlar işlənsin (kopyala-yapışdır sürüşməsi olmasın).
 func (h *Hub) GetUnreadCount(userID uint) int {
 	var count int64
 
-	query := `
-		SELECT COUNT(*) 
-		FROM messages 
-		WHERE receiver_id = ? 
-		AND read = false 
-		AND is_deleted_by_receiver = false
-		-- Issue 59: yalnız DM. Qrup mesajları conversation_id ilə gəlir və ayrı
-		-- axındır; söhbət siyahısındakı CTE onsuz da bu şərti tətbiq edir, ona
-		-- görə rozet ilə sətirlərin cəmi bir-birini tutmurdu.
-		AND conversation_id IS NULL
-	`
-
-	if err := h.db.Raw(query, userID).Scan(&count).Error; err != nil {
+	err := h.db.Model(&models.Message{}).
+		Joins("JOIN users ON users.id = messages.sender_id").
+		// Issue 59: `conversation_id IS NULL` — yalnız DM. Qrup mesajları ayrı
+		// axındır; söhbət siyahısındakı `unread_counts` CTE-si də bu şərti
+		// tətbiq edir, ona görə rozet ilə sətirlərin cəmi uyğun gəlsin.
+		Where("messages.receiver_id = ? AND messages.read = false AND messages.is_deleted_by_receiver = false AND messages.conversation_id IS NULL AND users.deleted_at IS NULL", userID).
+		Count(&count).Error
+	if err != nil {
 		log.Printf("Okunmamış mesaj sayısı alınamadı: %v", err)
 		return 0
 	}
@@ -1940,15 +2198,69 @@ func (h *Hub) GetUnreadCount(userID uint) int {
 	return int(count)
 }
 
-// SendUnreadCountUpdate kullanıcıya okunmamış mesaj sayısını gönder
+// ── OXUNMAMIŞ SAYĞACININ BİRLƏŞDİRİLMƏSİ (coalescing) ───────────────────────
+//
+// PROBLEM (ölçülmüş)
+// `SendUnreadCountUpdate` HƏR mesajda çağırılır (`HandleNewMessage` →
+// `go h.SendUnreadCountUpdate(receiverID)`), hər oxunmada bir daha. Hər çağırış
+// `messages` üzərində tam bir `COUNT(*)` işlədir. Real indekslərlə (PostgreSQL
+// 16, 430k sətir) ölçüldü: 21 min oxunmamışı olan istifadəçi üçün **15 ms**
+// (Deploy 1-dən əvvəlki forma) — yəni 10 mesajlıq bir seriya 150 ms DB işi və
+// 10 ayrı WS frame-i deməkdir.
+//
+// Halbuki `unread_count_update` MÜTLƏQ dəyər daşıyır (artım deyil): ardıcıl
+// 10 frame-dən yalnız SONUNCUSU mənalıdır, əvvəlkilər onsuz da üzərinə yazılır.
+//
+// HƏLL — trailing-edge debounce, istifadəçi başına.
+// Pəncərə ərzində gələn bütün istəklər BİR sorğuya birləşir; sayğac timer
+// işlədiyi anda oxunur, yəni HƏMİŞƏ TƏZƏDİR. İstifadəçi üçün fərq görünmür
+// (mesajın özü `new_message` ilə onsuz da dərhal gəlib; bu yalnız rozet
+// rəqəmidir), server tərəfdə isə sorğu sayı seriyada 10-dan 1-ə düşür.
+//
+// Bağlantı anındakı ilk göndərmə İSTİSNADIR — bax `SendUnreadCountUpdateNow`.
+const unreadCoalesceWindow = 300 * time.Millisecond
+
+var unreadPending = struct {
+	mu sync.Mutex
+	m  map[uint]bool
+}{m: make(map[uint]bool)}
+
+// SendUnreadCountUpdate — birləşdirilmiş (debounce edilmiş) göndərmə.
+// Pəncərə ərzində eyni istifadəçi üçün ikinci çağırış NO-OP-dur; artıq
+// planlanmış timer işə düşəndə sayğacı TƏZƏ oxuyub göndərəcək.
 func (h *Hub) SendUnreadCountUpdate(userID uint) {
+	if userID == 0 {
+		return
+	}
+	unreadPending.mu.Lock()
+	if unreadPending.m[userID] {
+		unreadPending.mu.Unlock()
+		return // artıq planlanıb — o, təzə dəyəri göndərəcək
+	}
+	unreadPending.m[userID] = true
+	unreadPending.mu.Unlock()
+
+	time.AfterFunc(unreadCoalesceWindow, func() {
+		unreadPending.mu.Lock()
+		delete(unreadPending.m, userID)
+		unreadPending.mu.Unlock()
+		h.SendUnreadCountUpdateNow(userID)
+	})
+}
+
+// SendUnreadCountUpdateNow — birləşdirmədən, DƏRHAL göndərir.
+// Bağlantı qurulduqda (`registerClient`) istifadə olunur: istemçi ilk rozet
+// dəyərini 300 ms gözləməməlidir.
+func (h *Hub) SendUnreadCountUpdateNow(userID uint) {
 	count := h.GetUnreadCount(userID)
 
 	h.SendToUser(userID, "unread_count_update", map[string]interface{}{
 		"count": count,
 	})
-
-	log.Printf("Okunmamış mesaj sayısı gönderildi: User %d, Count: %d", userID, count)
+	// LOG SİLİNDİ: bu funksiya HƏR mesajda çağırılır (`HandleNewMessage` →
+	// `go h.SendUnreadCountUpdate(receiverID)`) və hər oxunmada bir daha.
+	// Sətrin diaqnostik dəyəri yox idi, qlobal `log` mutex-i + sinxron stderr
+	// yazımı isə mesaj başına ödənilirdi.
 }
 
 // handleGroupTyping qrupda yazma/dayandırma siqnalını həmin qrupun digər

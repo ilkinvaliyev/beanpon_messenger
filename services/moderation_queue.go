@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"beanpon_messenger/config"
@@ -118,9 +119,37 @@ func (q *ModerationQueue) Enqueue(job ModerationJob) {
 	case q.jobs <- job:
 		// uğurla növbəyə qoyuldu
 	default:
-		log.Printf("⚠️ Moderasiya queue dolu — mesaj %s analiz edilmədən atıldı", job.MessageID)
+		// ── LOG BOĞULUR (throttle) ─────────────────────────────────────────
+		// Bu dal MESAJ YOLUNUN goroutine-indən çağırılır (`websocket/hub.go`
+		// `readPump` → `handleIncomingMessage`). Əvvəl BURADA hər atılan mesaj
+		// üçün bir `log.Printf` vardı: OpenAI yavaşladıqda növbə dolur və
+		// bundan sonra HƏR MESAJ qlobal `log` mutex-i + sinxron stderr yazımı
+		// ödəyirdi. Yəni moderasiyanın yavaşlaması birbaşa mesajlaşmanı
+		// yavaşladırdı — düzəltdiyimiz yeganə yer budur, `Enqueue`-nun özü
+		// onsuz da bloklamır.
+		moderationDropped.Add(1)
+		now := time.Now().Unix()
+		last := moderationDropLastLog.Load()
+		if now-last >= moderationDropLogInterval && moderationDropLastLog.CompareAndSwap(last, now) {
+			n := moderationDropped.Swap(0)
+			log.Printf("⚠️ Moderasiya queue dolu — son %ds ərzində %d mesaj analiz edilmədən atıldı (sonuncu: %s)",
+				moderationDropLogInterval, n, job.MessageID)
+		}
 	}
 }
+
+// Atılan moderasiya job-larının sayğacı. `clusterDropped` (websocket/cluster.go)
+// və `bandwidthDropped` (middleware) ilə eyni naxış.
+var (
+	moderationDropped     atomic.Int64
+	moderationDropLastLog atomic.Int64 // unix saniyə
+)
+
+const moderationDropLogInterval = 60 // saniyə
+
+// ModerationDroppedTotal — /metrics və ya diaqnostika üçün cari sayğac.
+// (Sayğac log yazıldıqda sıfırlanır; bu funksiya PƏNCƏRƏDƏKİ dəyəri verir.)
+func ModerationDroppedTotal() int64 { return moderationDropped.Load() }
 
 // worker — channel-dan job götürüb emal edən goroutine.
 func (q *ModerationQueue) worker(id int) {

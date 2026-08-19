@@ -104,8 +104,26 @@ func DMHiddenBlocked(db *gorm.DB, viewerID, peerID uint) bool {
 //
 // Boş nəticə = heç bir söhbət filtrlənmir. (DB uzaq host-da olduğu üçün siyahı
 // yolunda per-row sorğudan qaçırıq — bax GetConversations N+1 qeydləri.)
+//
+// ── `hiddenModeEnabled` QAPISI (əvvəl BURADA YOX İDİ) ────────────────────────
+//
+// Bayraq `false` olmasına baxmayaraq bu funksiya qapısız işləyirdi, halbuki
+// qardaşları (`IsUserHidden` :31, `DMHiddenBlocked` :86) onu yoxlayır.
+// Nəticə YARIM-AÇIQ, tutarsız bir vəziyyət idi:
+//   - `DMHiddenBlocked` false qaytarır  → gizli istifadəçiyə MESAJ GEDİR;
+//   - `HiddenBlockedPeerIDs` işləyir    → həmin söhbət GƏLƏN QUTUDA GÖRÜNMÜR.
+//
+// İstifadəçi üçün bu "mesaj yazdım, söhbət yoxa çıxdı" deməkdir. Üstəlik bunun
+// üçün hər söhbət siyahısı yüklənişində 1–3 əlavə sorğu ödənilirdi.
+//
+// İndi hər üç funksiya EYNİ bayrağa tabedir. Gizli Modu geri açmaq üçün tək
+// dəyişiklik: `hiddenModeEnabled = true` (:28). O zaman bu funksiya da
+// avtomatik işə düşür.
 func HiddenBlockedPeerIDs(db *gorm.DB, viewerID uint, peerIDs []uint) map[uint]bool {
 	blocked := make(map[uint]bool)
+	if !hiddenModeEnabled {
+		return blocked
+	}
 	if len(peerIDs) == 0 {
 		return blocked
 	}

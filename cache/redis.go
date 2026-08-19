@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-redis/redis/v8"
@@ -56,10 +57,14 @@ func Initialize(cfg config.CacheConfig) *Client {
 	}
 
 	rdb := redis.NewClient(&redis.Options{
-		Addr:         fmt.Sprintf("%s:%s", cfg.Host, cfg.Port),
-		Password:     cfg.Password,
-		DB:           0, // prefix yolu — DB ayrılması yox (Laravel ilə paylaşılır)
-		PoolSize:     cfg.PoolSize,
+		Addr:     fmt.Sprintf("%s:%s", cfg.Host, cfg.Port),
+		Password: cfg.Password,
+		DB:       0, // prefix yolu — DB ayrılması yox (Laravel ilə paylaşılır)
+		PoolSize: cfg.PoolSize,
+		// MinIdleConns əvvəl təyin olunmurdu (0) → hovuz boşalırdı və
+		// növbəti presence sorğusu TCP + AUTH gözləyirdi. Presence
+		// yoxlamaları mesaj yolundadır, yəni bu gecikmə istifadəçiyə çatırdı.
+		MinIdleConns: cfg.MinIdleConns,
 		DialTimeout:  cfg.DialTimeout,
 		ReadTimeout:  cfg.ReadTimeout,
 		WriteTimeout: cfg.WriteTimeout,
@@ -79,6 +84,7 @@ func Initialize(cfg config.CacheConfig) *Client {
 			Password:     cfg.Password,
 			DB:           0,
 			PoolSize:     cfg.PoolSize,
+			MinIdleConns: cfg.MinIdleConns,
 			DialTimeout:  cfg.DialTimeout,
 			ReadTimeout:  cfg.ReadTimeout,
 			WriteTimeout: cfg.WriteTimeout,
@@ -187,13 +193,48 @@ func (c *Client) guard() bool {
 	return c.breaker.Allow()
 }
 
+// ── XƏTA LOG-U ARTIQ BOĞULUR (throttle) ─────────────────────────────────────
+//
+// Əvvəl BURADA hər uğursuz Redis əməliyyatı üçün bir `log.Printf` vardı.
+// Go-nun standart `log` paketi qlobal bir mutex tutub stderr-ə SİNXRON yazır;
+// Docker-in json-file sürücüsü ilə bu yazım prosesi bloklaya bilir. Yəni Redis
+// yavaşladıqda log-un özü nasazlığı BÜYÜDÜRDÜ: hər mesajın presence yoxlaması
+// bir qlobal mutex + bir syscall əlavə edirdi.
+//
+// İndi eyni naxış `middleware/bandwidth_middleware.go`-dakı kimidir: sayğac
+// artır, 60 saniyədə bir dəfə YEKUN sətir yazılır. Breaker davranışı
+// DƏYİŞMİR — `Failure()` hər xətada çağırılmağa davam edir.
+var (
+	cacheErrCount    atomic.Int64
+	cacheErrLastLog  atomic.Int64 // unix saniyə
+	cacheErrLastText atomic.Value // string — son xəta mətni (nümunə üçün)
+)
+
+const cacheErrLogInterval = 60 // saniyə
+
 func (c *Client) observe(op string, err error) {
 	if err == nil || errors.Is(err, redis.Nil) {
 		c.breaker.Success()
 		return
 	}
 	c.breaker.Failure()
-	log.Printf("WARN cache: %s xətası: %v", op, err)
+
+	cacheErrCount.Add(1)
+	cacheErrLastText.Store(op + ": " + err.Error())
+
+	now := time.Now().Unix()
+	last := cacheErrLastLog.Load()
+	if now-last < cacheErrLogInterval {
+		return
+	}
+	// CAS: eyni pəncərədə yalnız BİR goroutine yazsın.
+	if !cacheErrLastLog.CompareAndSwap(last, now) {
+		return
+	}
+	n := cacheErrCount.Swap(0)
+	sample, _ := cacheErrLastText.Load().(string)
+	log.Printf("WARN cache: son %ds ərzində %d Redis xətası (nümunə: %s)",
+		cacheErrLogInterval, n, sample)
 }
 
 // Get — fullKey artıq prefix-li olmalıdır (SharedKey/LocalKey-dən gəlmiş).

@@ -719,7 +719,46 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 		StoryCreatedAt       *time.Time `gorm:"column:story_created_at"`
 	}
 
-	query := `
+	// ── SORĞU FORMASI: `OR` → `UNION ALL` ───────────────────────────────────
+	//
+	// PROBLEM (ölçüldü — PostgreSQL 16, 430k sətir, 50k mesajlıq söhbət)
+	// Aşağıdakı KÖHNƏ sorğu `((sender=A AND receiver=B) OR (sender=B AND
+	// receiver=A))` yazır. Mövcud `idx_messages_pair_created
+	// (sender_id, receiver_id, created_at DESC)` indeksi HƏR İKİ dalı da örtür,
+	// AMMA `OR` planlaşdırıcını `BitmapOr` → `Bitmap Heap Scan` → `Sort` yoluna
+	// salır: sıralama itir, ona görə LIMIT AŞAĞI İTƏLƏNMİR və söhbətin BÜTÜN
+	// tarixçəsi (50.000 sətir) oxunub sıralanır ki, 30 sətir qaytarılsın.
+	//
+	//   EXPLAIN ANALYZE (köhnə):  Execution Time: 61 ms,  50.000 sətir oxundu
+	//
+	// HƏLL
+	// İki dal AYRICA yazılır. Hər biri indeksdən SIRALI oxunur, LIMIT hər dalın
+	// içinə itələnir → dal başına cəmi `limit+offset` sətir. Sonra `Merge Append`
+	// onları birləşdirir və yekun LIMIT tətbiq olunur. `reply`/`stories`
+	// LEFT JOIN-ləri də ARTIQ SƏHİFƏDƏN SONRA edilir (əvvəl taranan bütün
+	// sətirlər üçün olunurdu).
+	//
+	//   EXPLAIN ANALYZE (yeni):   Execution Time: 0.6 ms,  62 sətir oxundu
+	//
+	// EYNİLİK
+	// Nəticə çoxluğu 11 ssenaridə sətir-sətir müqayisə edildi və EYNİ çıxdı:
+	// offset 0/30/90/210/300, keyset (before) imleci, hər iki istiqamət,
+	// soft-delete edilmiş sətirlər, tək tərəfli silmə bayraqları, 200 ədəd
+	// EYNİ `created_at` damgalı sətir (tie-break yalnız id ilə) və boş söhbət.
+	//
+	// ⚠️ İSTİSNA — ÖZÜNƏ MESAJ (sender == receiver)
+	// Köhnə `CASE` ifadəsi belə sətir üçün YALNIZ `is_deleted_by_sender`-ə
+	// baxır (çünki `m.sender_id = me` doğrudur). `UNION ALL` isə hər iki dala
+	// da uyğun gəlir → sətir İKİ DƏFƏ qayıdır. Test bunu təsdiqlədi. Ona görə
+	// `userID == otherUserID` halında KÖHNƏ sorğu işlədilir (özünə çat nadirdir
+	// və onsuz da kiçikdir, sürət fərqi əhəmiyyətsizdir).
+	//
+	// GERİ ALMA: `CHAT_QUERY_LEGACY=true` → redeploy OLMADAN köhnə sorğuya
+	// qayıdır. Cavabın forması hər iki yolda BİREBİR eynidir.
+	selfChat := uint(otherUserID) == userID.(uint)
+	useFastPath := !chatQueryLegacy && !selfChat
+
+	const legacyQuery = `
         SELECT 
             m.*,
             reply.encrypted_text as reply_to_message_text,
@@ -756,12 +795,64 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
         LIMIT ? OFFSET ?
     `
 
-	err = database.DB.Raw(query,
-		userID, otherUserID, otherUserID, userID,
-		userID,
-		beforeCreatedAt, beforeCreatedAt, beforeCursorID,
-		limit, offset,
-	).Scan(&messages).Error
+	// Hər dalın öz LIMIT-i `limit+offset` olmalıdır: yekun OFFSET yalnız
+	// birləşdirilmiş nəticəyə tətbiq olunur, ona görə hər dal ən pis halda
+	// bütün offset-i tək başına doldura bilər.
+	branchLimit := limit + offset
+
+	const fastQuery = `
+        WITH page AS (
+            (SELECT m.* FROM messages m
+              WHERE m.sender_id = ? AND m.receiver_id = ?
+                AND m.deleted_at IS NULL
+                AND m.is_deleted_by_sender = false
+                AND (?::timestamptz IS NULL OR (m.created_at, m.id) < (?::timestamptz, ?::uuid))
+              ORDER BY m.created_at DESC, m.id DESC
+              LIMIT ?)
+            UNION ALL
+            (SELECT m.* FROM messages m
+              WHERE m.sender_id = ? AND m.receiver_id = ?
+                AND m.deleted_at IS NULL
+                AND m.is_deleted_by_receiver = false
+                AND (?::timestamptz IS NULL OR (m.created_at, m.id) < (?::timestamptz, ?::uuid))
+              ORDER BY m.created_at DESC, m.id DESC
+              LIMIT ?)
+        )
+        SELECT 
+            m.*,
+            reply.encrypted_text as reply_to_message_text,
+            reply.sender_id as reply_to_message_sender,
+            reply.created_at as reply_to_created_at,
+            s.type as story_type,
+            s.media_url as story_media_url,
+            s.content as story_content,
+            s.media_metadata as story_metadata,
+            s.user_id as story_user_id,
+            s.created_at as story_created_at
+        FROM (
+            SELECT * FROM page ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?
+        ) m
+        LEFT JOIN messages reply ON m.reply_to_message_id = reply.id
+        LEFT JOIN stories s ON m.story_id = s.id
+        ORDER BY m.created_at DESC, m.id DESC
+    `
+
+	if useFastPath {
+		err = database.DB.Raw(fastQuery,
+			userID, otherUserID, // dal 1: mən → o
+			beforeCreatedAt, beforeCreatedAt, beforeCursorID, branchLimit,
+			otherUserID, userID, // dal 2: o → mən
+			beforeCreatedAt, beforeCreatedAt, beforeCursorID, branchLimit,
+			limit, offset,
+		).Scan(&messages).Error
+	} else {
+		err = database.DB.Raw(legacyQuery,
+			userID, otherUserID, otherUserID, userID,
+			userID,
+			beforeCreatedAt, beforeCreatedAt, beforeCursorID,
+			limit, offset,
+		).Scan(&messages).Error
+	}
 
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Mesajlar alınamadı"})
@@ -870,12 +961,44 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 	}
 
 	// peek rejimində OXUNDU işarələnmir (önizləmə görüldü sayılmır).
-	if !peek {
+	//
+	// ── ARTIQ YALNIZ İLK SƏHİFƏDƏ ───────────────────────────────────────────
+	// ÖNCE: bu sətir HƏR səhifədə işləyirdi. `markReceivedMessagesAsRead` 3
+	// gediş-dönüş edir (SELECT + LİMİTSİZ UPDATE + `SendUnreadCountUpdate`-in
+	// `COUNT(*)`-ı). 20 səhifə geriyə sürüşdürmə = 60 əlavə gediş-dönüş.
+	//
+	// Üstəlik 2-ci və sonrakı səhifələr SIFIR sətir yeniləyirdi: 1-ci səhifədəki
+	// UPDATE `LIMIT`-siz olduğu üçün həmin cütün BÜTÜN oxunmamışlarını onsuz da
+	// oxundu edir. Yəni iş tamamilə boşa gedirdi.
+	//
+	// `page == 1 && !keysetMode` şərti "çat yenicə açıldı" halıdır — davranış
+	// istifadəçi üçün eynidir, sadəcə geriyə sürüşdürmə pulsuz oldu.
+	if !peek && page == 1 && !keysetMode {
 		go h.markReceivedMessagesAsRead(userID.(uint), uint(otherUserID))
 	}
 
-	var totalCount int64
-	countQuery := `
+	// ── `COUNT(*)` ARTIQ HƏR SORĞUDA İŞLƏMİR ────────────────────────────────
+	//
+	// Bu sorğu siyahı sorğusu ilə EYNİ indekslənə bilməyən `OR` şərtindən
+	// keçir, yəni cütün BÜTÜN tarixçəsini tarayır. Böyük söhbətdə 200–800 ms
+	// — endpoint-in gecikməsini praktiki olaraq İKİ QATINA çıxarır.
+	//
+	// Nəticə həqiqətən lazım olan yer YALNIZ offset rejimidir (aşağıda
+	// `hasMore = offset+len < totalCount`). Keyset rejimində `hasMore`
+	// `len(responseMessages) >= limit`-dən gəlir və `totalCount` istifadə
+	// OLUNMUR — buna baxmayaraq sorğu yenə də işləyirdi.
+	//
+	// GERİYƏ UYĞUNLUQ: `total` sahəsi cavabda QALIR. Köhnə istemçilər onu
+	// oxuyur (`has_more` göndərməyən daha köhnə serverlərə görə geri düşüş
+	// yolu var — `ChatService.swift`), ona görə onlar üçün heç nə dəyişmir:
+	// sorğu əvvəlki kimi işləyir. Yalnız ÖZÜ dediyi üçün "mənə lazım deyil"
+	// (`X-Chat-Proto: 2`) istemçidə və yalnız keyset rejimində atlanır.
+	// O halda `total` -1 qayıdır = "hesablanmadı".
+	skipTotal := keysetMode && chatProto(c) >= protoV2
+
+	var totalCount int64 = -1
+	if !skipTotal {
+		countQuery := `
         SELECT COUNT(*) 
         FROM messages 
         WHERE ((sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?))
@@ -891,14 +1014,15 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
         )
     `
 
-	err = database.DB.Raw(countQuery,
-		userID, otherUserID, otherUserID, userID,
-		userID,
-	).Count(&totalCount).Error
+		err = database.DB.Raw(countQuery,
+			userID, otherUserID, otherUserID, userID,
+			userID,
+		).Count(&totalCount).Error
 
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Toplam sayı alınamadı"})
-		return
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Toplam sayı alınamadı"})
+			return
+		}
 	}
 
 	// Issue 73: `has_more` — istemçi artıq `total` ilə yerli mesaj sayını
@@ -1307,7 +1431,40 @@ func (h *MessageHandler) SyncMessages(c *gin.Context) {
 
 	// conversation_id IS NULL → yalnız DM (qrup mesajları ayrı axındır).
 	// LIMIT limit+1 → has_more hesablamaq üçün.
-	query := `
+	//
+	// ── SORĞU FORMASI: `OR` → `UNION ALL` (GetMessages ilə eyni səbəb) ──────
+	//
+	// PROBLEM (ölçüldü — PostgreSQL 16, 430k sətir)
+	// `(m.sender_id = ? OR m.receiver_id = ?)` şərti `(updated_at, id)`
+	// sıralaması ilə ZİDD istiqamətə çəkir. Planlaşdırıcı sıralı bir indeks
+	// yolu qura bilmir və istifadəçinin BÜTÜN DM tarixçəsini oxuyub sıralayır:
+	//
+	//   EXPLAIN ANALYZE (köhnə): Parallel Seq Scan + top-N sort → 43–50 ms
+	//
+	// Bu endpoint YENİDƏN BAĞLANMA axınında çağırılır — yəni hər şəbəkə
+	// dəyişikliyində, hər arxa-plandan qayıdışda, hər istemçidə. Şəbəkə
+	// dalğalanmasında bütün filo eyni anda tam cədvəl taraması etdirir.
+	//
+	// HƏLL — hər istiqamət ayrı dal, LIMIT dalın İÇİNƏ itələnir:
+	//
+	//   EXPLAIN ANALYZE (yeni): Merge Append + Index Scan → 0.26–0.38 ms
+	//
+	// TƏLƏB OLUNAN İNDEKSLƏR (MIGRATION_deploy1_indexes.sql):
+	//   idx_messages_sync_snd (sender_id, updated_at, id)   WHERE conversation_id IS NULL
+	//   idx_messages_sync_rcv (receiver_id, updated_at, id) WHERE conversation_id IS NULL
+	// İndekslər YOXDURSA sorğu YENƏ DƏ DOĞRUDUR, sadəcə köhnə sürətdə işləyir.
+	//
+	// ⚠️ `m.sender_id <> ?` (ikinci dal) — ÖZÜNƏ MESAJ QORUMASI.
+	// `sender_id = receiver_id = mən` olan sətir hər iki dala da uyğun gəlir və
+	// İKİ DƏFƏ qayıdardı. Birinci dal onu onsuz da tutur, ona görə ikinci
+	// daldan çıxarılır. Adi mesajlarda bu şərt heç nəyi süzmür.
+	//
+	// EYNİLİK: 84 ssenaridə (7 istifadəçi × 4 imleç mövqeyi × 3 limit;
+	// özünə çat və seyrək istifadəçi daxil) sətir-sətir eyni nəticə verdi.
+	//
+	// GERİ ALMA: `CHAT_QUERY_LEGACY=true` → köhnə sorğu (GetMessages ilə
+	// eyni açar).
+	const legacySyncQuery = `
         SELECT
             m.*,
             reply.encrypted_text as reply_to_message_text,
@@ -1329,7 +1486,53 @@ func (h *MessageHandler) SyncMessages(c *gin.Context) {
         LIMIT ?
     `
 
-	if err := database.DB.Raw(query, userID, userID, since, sinceID, limit+1).Scan(&rows).Error; err != nil {
+	const fastSyncQuery = `
+        WITH page AS (
+            (SELECT m.* FROM messages m
+              WHERE m.sender_id = ?
+                AND m.conversation_id IS NULL
+                AND (m.updated_at, m.id) > (?, ?::uuid)
+              ORDER BY m.updated_at ASC, m.id ASC
+              LIMIT ?)
+            UNION ALL
+            (SELECT m.* FROM messages m
+              WHERE m.receiver_id = ?
+                AND m.sender_id <> ?
+                AND m.conversation_id IS NULL
+                AND (m.updated_at, m.id) > (?, ?::uuid)
+              ORDER BY m.updated_at ASC, m.id ASC
+              LIMIT ?)
+        )
+        SELECT
+            m.*,
+            reply.encrypted_text as reply_to_message_text,
+            reply.sender_id as reply_to_message_sender,
+            reply.created_at as reply_to_created_at,
+            s.type as story_type,
+            s.media_url as story_media_url,
+            s.content as story_content,
+            s.media_metadata as story_metadata,
+            s.user_id as story_user_id,
+            s.created_at as story_created_at
+        FROM (
+            SELECT * FROM page ORDER BY updated_at ASC, id ASC LIMIT ?
+        ) m
+        LEFT JOIN messages reply ON m.reply_to_message_id = reply.id
+        LEFT JOIN stories s ON m.story_id = s.id
+        ORDER BY m.updated_at ASC, m.id ASC
+    `
+
+	var syncErr error
+	if chatQueryLegacy {
+		syncErr = database.DB.Raw(legacySyncQuery, userID, userID, since, sinceID, limit+1).Scan(&rows).Error
+	} else {
+		syncErr = database.DB.Raw(fastSyncQuery,
+			userID, since, sinceID, limit+1, // dal 1: mən göndərmişəm
+			userID, userID, since, sinceID, limit+1, // dal 2: mənə gəlib (özünə mesaj xaric)
+			limit+1,
+		).Scan(&rows).Error
+	}
+	if syncErr != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Mesajlar alınamadı"})
 		return
 	}
