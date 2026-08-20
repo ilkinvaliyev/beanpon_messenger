@@ -17,6 +17,7 @@ services:
     stop_grace_period: 30s
     environment:
       - ENV=production
+      - DB_STATEMENT_TIMEOUT_MS=0
     networks:
       - monitoring
       - beanpon_local-network
