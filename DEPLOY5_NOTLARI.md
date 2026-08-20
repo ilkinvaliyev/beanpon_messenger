@@ -83,7 +83,103 @@ kilitlendi.)
 
 ---
 
-## Deploy'dan sonra ilk bakılacaklar
+## NASIL BAKACAKSIN
+
+Üç yol var. Birincisi hiçbir kurulum istemiyor.
+
+### Yol 1 — hazır script (kurulum yok, hemen çalışır)
+
+`scripts/chat-metrics.py` — sunucuda çalıştır, tek komut:
+
+```bash
+./scripts/chat-metrics.py
+./scripts/chat-metrics.py http://10.10.0.5:5082/metrics
+```
+
+Çıktı şöyle:
+
+```
+=== MESAJ GÖNDERME (sunucu tarafındaki toplam süre) ===
+                                   adet   ortalama       ~p50       ~p95
+  WebSocket (yeni iOS)             5000     7.0 ms     8.0 ms    16.0 ms
+  REST (Flutter / eski iOS)         800    13.9 ms    16.0 ms    32.0 ms
+
+=== SÜRE NEREDE GEÇİYOR (WebSocket) ===
+  izin kontrolleri                 5000     1.8 ms     2.0 ms     4.0 ms
+  veritabanına yazma               5000     3.5 ms     4.0 ms     8.0 ms
+  yayın + push kapısı              5000     797 µs     1.0 ms     2.0 ms
+
+  → En pahalı adım: VERITABANINA YAZMA  (bir sonraki işimiz burası)
+...
+  kopartılan bağlantı (toplam)                    2   <-- yavaş istemci sorunu (W3)
+  yapılmayan yayın (tek instans)             24,500   <-- C3 kazancı
+```
+
+Sorunlu yerleri kendisi işaretliyor.
+
+**Önemli:** düz çalıştırdığında rakamlar **sunucu açılışından beri toplamdır**.
+Yani dünkü bir yavaşlık bugünkü ortalamayı kirletir. "Şu anda ne oluyor" için:
+
+```bash
+./scripts/chat-metrics.py --watch 60
+```
+
+İki ölçüm alıp **farkı** gösterir — son 60 saniyenin gerçek davranışı.
+
+Gereksinim: `python3`. Harici paket yok.
+
+### Yol 2 — ham hâli
+
+```bash
+curl -s http://10.10.0.5:5082/metrics | grep beanpon_messenger_dm_send
+```
+
+Histogramlarda `_sum` ve `_count` var; ortalama = `_sum / _count`.
+
+### Yol 3 — Prometheus + Grafana (grafik ve geçmiş)
+
+Repoda zaten bir `prometheus.yml` var (`app:5082` hedefliyor) ama
+`docker-compose.yml`'de Prometheus servisi **yok**. Yani ya başka yerde
+çalışıyor ya da hiç ayağa kalkmamış. Kontrol et:
+
+```bash
+docker ps | grep -i -E "prometheus|grafana"
+```
+
+Yoksa `docker-compose.yml`'e eklemek yeterli:
+
+```yaml
+  prometheus:
+    image: prom/prometheus:latest
+    restart: always
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    networks: [monitoring]
+
+  grafana:
+    image: grafana/grafana:latest
+    restart: always
+    ports:
+      - "127.0.0.1:3000:3000"     # yalnız sunucudan; dışarı AÇMA
+    volumes:
+      - grafana_data:/var/lib/grafana
+    networks: [monitoring]
+
+volumes:
+  prometheus_data:
+  grafana_data:
+```
+
+Sonra `ssh -L 3000:127.0.0.1:3000 sunucu` ile tünelleyip tarayıcıdan
+`localhost:3000` (ilk giriş admin/admin). Veri kaynağı olarak
+`http://prometheus:9090`.
+
+Grafana'da kullanacağın sorgular aşağıda.
+
+---
+
+## Deploy'dan sonra ilk bakılacaklar (Grafana / PromQL)
 
 Birkaç saat veri biriktikten sonra bunları çalıştır.
 
@@ -149,17 +245,6 @@ sum(rate(beanpon_messenger_push_duration_seconds_count{result="failed"}[5m]))
 ```
 
 ---
-
-## Grafana'sız hızlı bakış
-
-Prometheus/Grafana kurulu değilse ham hâlini de okuyabilirsin:
-
-```bash
-curl -s http://10.10.0.5:5082/metrics | grep beanpon_messenger_dm_send
-curl -s http://10.10.0.5:5082/metrics | grep -E "ws_clients|ws_evicted|cluster_"
-```
-
-Histogramlarda `_sum` ve `_count` var; ortalama = `_sum / _count`.
 
 > `/metrics` şu an kimlik doğrulaması olmadan açık ama konteyner portu iç IP'ye
 > (`10.10.0.5`) bağlı, yani dışarıdan erişilmiyor. Dışarı açarsan
