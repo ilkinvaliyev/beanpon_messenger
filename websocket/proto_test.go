@@ -135,3 +135,110 @@ func TestCloseSend_Idempotent(t *testing.T) {
 		t.Fatal("done bağlanmadı")
 	}
 }
+
+// ── C3 / DM-C1: tək instansda yayım etməmə ─────────────────────────────────
+
+func withClusterState(started time.Time, lastPeer time.Time, solo bool, fn func()) {
+	oldStarted, oldPeer, oldSolo := clusterStartedAt, clusterLastPeerAt.Load(), clusterSoloSkip
+	defer func() {
+		clusterStartedAt = oldStarted
+		clusterLastPeerAt.Store(oldPeer)
+		clusterSoloSkip = oldSolo
+	}()
+	clusterStartedAt = started
+	if lastPeer.IsZero() {
+		clusterLastPeerAt.Store(0)
+	} else {
+		clusterLastPeerAt.Store(lastPeer.UnixNano())
+	}
+	clusterSoloSkip = solo
+	fn()
+}
+
+// Açılış pəncərəsində (ilk 60 sn) HƏMİŞƏ yayım edilməlidir — rolling deploy
+// zamanı yeni instans köhnəni hələ görməmiş ola bilər.
+func TestClusterHasPeers_BootWindowAlwaysPublishes(t *testing.T) {
+	withClusterState(time.Now(), time.Time{}, true, func() {
+		if !clusterHasPeers() {
+			t.Fatal("açılış pəncərəsində yayım dayandırıldı — frame itkisi riski")
+		}
+	})
+}
+
+// Açılış pəncərəsi bitib, heç bir peer görülməyibsə yayım dayanır.
+func TestClusterHasPeers_SoloStopsPublishing(t *testing.T) {
+	withClusterState(time.Now().Add(-10*time.Minute), time.Time{}, true, func() {
+		if clusterHasPeers() {
+			t.Fatal("tək instansda yayım hələ də edilir")
+		}
+	})
+}
+
+// Peer TƏZƏ görülübsə yayım açıq olmalıdır.
+func TestClusterHasPeers_FreshPeerPublishes(t *testing.T) {
+	withClusterState(time.Now().Add(-10*time.Minute), time.Now().Add(-5*time.Second), true, func() {
+		if !clusterHasPeers() {
+			t.Fatal("təzə peer görüldüyü halda yayım dayandırıldı — MESAJ İTKİSİ")
+		}
+	})
+}
+
+// Peer damgası köhnəlibsə (TTL keçib) yayım yenidən dayanır.
+func TestClusterHasPeers_StalePeerStops(t *testing.T) {
+	withClusterState(time.Now().Add(-10*time.Minute), time.Now().Add(-2*clusterPeerTTL), true, func() {
+		if clusterHasPeers() {
+			t.Fatal("köhnəlmiş peer damgası ilə yayım davam edir")
+		}
+	})
+}
+
+// Kill-switch: `WS_CLUSTER_SOLO_SKIP=false` → HƏMİŞƏ köhnə davranış.
+func TestClusterHasPeers_KillSwitchRestoresOldBehaviour(t *testing.T) {
+	withClusterState(time.Now().Add(-10*time.Minute), time.Time{}, false, func() {
+		if !clusterHasPeers() {
+			t.Fatal("kill-switch açıq olduğu halda yayım dayandırıldı")
+		}
+	})
+}
+
+// `notePeerFrame` damgayı yeniləyir → yayım açılır.
+func TestNotePeerFrameEnablesPublishing(t *testing.T) {
+	withClusterState(time.Now().Add(-10*time.Minute), time.Time{}, true, func() {
+		if clusterHasPeers() {
+			t.Fatal("başlanğıc vəziyyət səhv")
+		}
+		notePeerFrame()
+		if !clusterHasPeers() {
+			t.Fatal("peer frame-indən sonra yayım açılmadı")
+		}
+	})
+}
+
+// ── C3 / DM-C2: `conversation_update` v2-yə göndərilmir ────────────────────
+
+func TestNeedsConversationUpdate(t *testing.T) {
+	h := &Hub{clients: map[uint]*Client{
+		1: {UserID: 1, ProtoVersion: protoV2},     // yeni iOS
+		2: {UserID: 2, ProtoVersion: protoLegacy}, // Flutter / köhnə iOS
+	}}
+
+	old := convUpdateMode
+	defer func() { convUpdateMode = old }()
+
+	convUpdateMode = "v2skip"
+	if h.needsConversationUpdate(1) {
+		t.Fatal("v2 istemçiyə hələ də conversation_update gedir")
+	}
+	if !h.needsConversationUpdate(2) {
+		t.Fatal("KÖHNƏ İSTEMÇİ SINDI: legacy client-ə conversation_update getmir")
+	}
+	if !h.needsConversationUpdate(999) {
+		t.Fatal("bilinməyən/uzaq istifadəçiyə göndərilmir — fail-open pozulub")
+	}
+
+	// Kill-switch: hamıya göndər.
+	convUpdateMode = "all"
+	if !h.needsConversationUpdate(1) {
+		t.Fatal("WS_CONV_UPDATE=all olduğu halda v2-yə göndərilmir")
+	}
+}

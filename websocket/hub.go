@@ -896,6 +896,28 @@ func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, ms
 }
 
 // Bu yeni fonksiyonu ekle
+// ── C3 / DM-C2: `conversation_update` v2 İSTEMÇİYƏ GÖNDƏRİLMİR ─────────────
+//
+// ÖNCE: hər mesaj üçün `new_message`-dən SONRA bir də `conversation_update`
+// göndərilirdi — həm göndərənə, həm alıcıya. Bu frame `message_data` sahəsində
+// MESAJIN TAMAMINI bir daha daşıyır, yəni mesaj başına tel trafiki təxminən
+// İKİ QAT olurdu (üstəlik 2 əlavə Redis PUBLISH).
+//
+// SONRA: `?cv=2` ilə qoşulan istemçiyə göndərilmir. Yoxlanıldı — iOS söhbət
+// siyahısı `new_message`-i onsuz da tam emal edir
+// (`ConversationsViewModel.processNewMessage`: önizləmə, zaman, okunmamış
+// sayğacı, son mesaj id-si, `isLastFromMe`; siyahıda olmayan söhbətdə tam
+// yeniləmə). `conversation_update` yalnız "authoritative" sayılırdı, MƏCBURİ
+// deyildi.
+//
+// KÖHNƏ İSTEMÇİ TAM QORUNUR: Flutter və App Store-dakı köhnə iOS `cv`
+// göndərmir → `protoLegacy` → frame ƏVVƏLKİ KİMİ gedir.
+//
+// ⚠️ Bu YALNIZ yeni-mesaj kaynaklı `conversation_update`-ə aiddir. Reaksiya
+// event-ləri (`hub.go` reaksiya yolu) ayrı frame-dir və TOXUNULMAYIB — orada
+// `new_message` yoxdur, yəni istemçinin başqa məlumat qaynağı yoxdur.
+//
+// `WS_CONV_UPDATE=all` ilə köhnə davranışa qayıdılır (deploy-suz geri alma).
 func (h *Hub) sendConversationUpdate(senderID, receiverID uint, messageData map[string]interface{}) {
 	// Gönderen ve alıcının conversation listelerini güncelle
 	conversationData := map[string]interface{}{
@@ -908,7 +930,9 @@ func (h *Hub) sendConversationUpdate(senderID, receiverID uint, messageData map[
 	}
 
 	// Gönderene
-	h.SendToUser(senderID, "conversation_update", conversationData)
+	if h.needsConversationUpdate(senderID) {
+		h.SendToUser(senderID, "conversation_update", conversationData)
+	}
 
 	// Alıcıya (onun için other_user_id sender olacak)
 	conversationDataForReceiver := map[string]interface{}{
@@ -920,7 +944,39 @@ func (h *Hub) sendConversationUpdate(senderID, receiverID uint, messageData map[
 		"is_from_me":        false,
 	}
 
-	h.SendToUser(receiverID, "conversation_update", conversationDataForReceiver)
+	if h.needsConversationUpdate(receiverID) {
+		h.SendToUser(receiverID, "conversation_update", conversationDataForReceiver)
+	}
+}
+
+// convUpdateMode — `WS_CONV_UPDATE`: "v2skip" (default) | "all" (köhnə).
+var convUpdateMode = func() string {
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("WS_CONV_UPDATE")), "all") {
+		return "all"
+	}
+	return "v2skip"
+}()
+
+// needsConversationUpdate — bu istifadəçiyə yeni-mesaj `conversation_update`-i
+// göndərilməlidirmi?
+//
+// FAIL-OPEN: istifadəçi bu instansda TAPILMASA (offline, ya da BAŞQA instansda)
+// `true` qaytarılır — yəni frame gedir. Bilinməyən halda KÖHNƏ davranış.
+func (h *Hub) needsConversationUpdate(userID uint) bool {
+	if convUpdateMode == "all" {
+		return true
+	}
+	h.mutex.RLock()
+	client, ok := h.clients[userID]
+	var proto int
+	if ok {
+		proto = client.ProtoVersion
+	}
+	h.mutex.RUnlock()
+	if !ok {
+		return true // lokal deyil → bilinmir → göndər
+	}
+	return proto < protoV2
 }
 
 // HandleMessageRead mesaj okundu durumunu handle et

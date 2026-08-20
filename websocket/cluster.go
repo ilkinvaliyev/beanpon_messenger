@@ -184,9 +184,109 @@ func startClusterPublishers() {
 	})
 }
 
+// ── C3 / DM-C1: TƏK İNSTANSDA YAYIM ETMƏ ───────────────────────────────────
+//
+// ÖNCE: hər mesaj üçün 5 Redis PUBLISH edilirdi (new_message,
+// conversation_update ×2, unread, message_delivered). Tək instans işləyəndə
+// bunların HAMISI boşa gedirdi: frame JSON-a çevrilir, Redis-ə yazılır,
+// Redis onu bizə geri verir, açılır və `frame.Origin == instanceID` yoxlaması
+// ilə ATILIR (bax `StartClusterSubscriber`).
+//
+// SONRA: başqa instans OLDUĞU BİLİNMİRSƏ data yayımı edilmir.
+//
+// "Başqa instans var mı?" sualı PASİF öyrənilir — əlavə Redis əmri yoxdur:
+//   - Hər instans eyni kanala 10 saniyədə bir kiçik bir "heartbeat" frame-i
+//     yazır (tək kiçik PUBLISH, mesaj sayısından ASILI DEYİL).
+//   - Başqa bir instansdan HƏR HANSI frame gəldikdə (heartbeat və ya data)
+//     "peer var" damgası yenilənir.
+//   - Damga 45 saniyə köhnəlirsə peer yoxdur sayılır.
+//
+// YARIŞ YOXDUR: yeni instans qalxan kimi ilk heartbeat-ini DƏRHAL yazır, yəni
+// köhnə instans onu millisaniyələr içində görür. Yeni instans isə ilk 60
+// saniyə "peer var" fərz edir. Beləliklə rolling deploy zamanı frame itmir.
+//
+// `WS_CLUSTER_SOLO_SKIP=false` ilə tamamilə söndürülə bilər (köhnə davranış).
+const (
+	clusterHeartbeatEvery = 10 * time.Second
+	clusterPeerTTL        = 45 * time.Second
+	clusterAssumePeersFor = 60 * time.Second
+	clusterHeartbeatType  = "__cluster_hb"
+)
+
+var (
+	clusterStartedAt  = time.Now()
+	clusterLastPeerAt atomic.Int64 // unix nano; 0 = heç görülməyib
+	clusterSoloLogged atomic.Bool
+
+	// clusterSoloSkip — optimizasiya açıqdırmı (default: açıq).
+	clusterSoloSkip = func() bool {
+		switch strings.ToLower(strings.TrimSpace(os.Getenv("WS_CLUSTER_SOLO_SKIP"))) {
+		case "false", "0", "no":
+			return false
+		}
+		return true
+	}()
+)
+
+// notePeerFrame — uzaq instansdan frame gəldi.
+func notePeerFrame() {
+	if clusterLastPeerAt.Swap(time.Now().UnixNano()) == 0 {
+		log.Printf("ws-cluster: başqa instans göründü — yayım açıq")
+		clusterSoloLogged.Store(false)
+	}
+}
+
+// clusterHasPeers — data yayımı etmək lazımdırmı?
+func clusterHasPeers() bool {
+	if !clusterSoloSkip {
+		return true // optimizasiya söndürülüb → köhnə davranış
+	}
+	if time.Since(clusterStartedAt) < clusterAssumePeersFor {
+		return true // açılış pəncərəsi — heç nə itməsin
+	}
+	last := clusterLastPeerAt.Load()
+	if last != 0 && time.Since(time.Unix(0, last)) < clusterPeerTTL {
+		return true
+	}
+	if clusterSoloLogged.CompareAndSwap(false, true) {
+		log.Printf("ws-cluster: başqa instans yoxdur — data yayımı dayandırıldı (heartbeat davam edir)")
+	}
+	return false
+}
+
+// startClusterHeartbeat — kanala kiçik bir "buradayam" frame-i yazır.
+// Mesaj trafikindən ASILI DEYİL: saniyədə 0.1 PUBLISH.
+func (h *Hub) startClusterHeartbeat(ctx context.Context) {
+	publish := func() {
+		frame := clusterFrame{Origin: instanceID, Type: clusterHeartbeatType}
+		payload, err := json.Marshal(frame)
+		if err != nil {
+			return
+		}
+		select {
+		case clusterPublishCh <- string(payload):
+		default:
+		}
+	}
+	publish() // dərhal: yeni instans köhnəyə özünü ANINDA tanıdır
+	ticker := time.NewTicker(clusterHeartbeatEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			publish()
+		}
+	}
+}
+
 // publishCluster — mesajı digər instanslara ötürür. Lokal çatdırma ÇAĞIRAN
 // tərəfdə artıq edilib.
 func (h *Hub) publishCluster(userIDs []uint, messageType string, data interface{}) {
+	if !clusterHasPeers() {
+		return
+	}
 	if !clusterReady.Load() || !clusterActive() || len(userIDs) == 0 {
 		return
 	}
@@ -228,6 +328,10 @@ func (h *Hub) publishClusterBroadcast(except []uint, messageType string, data in
 // istifadəçinin söhbəti AÇIQ olan client-lərinə verir (bax `WS_STATUS_FANOUT`).
 // `chatSubject == 0` → köhnə davranış (hamıya).
 func (h *Hub) publishClusterBroadcastScoped(except []uint, messageType string, data interface{}, chatSubject uint) {
+	// C3 / DM-C1: tək instansda yayım etmə (bax `clusterHasPeers`).
+	if !clusterHasPeers() {
+		return
+	}
 	if !clusterReady.Load() || !clusterActive() {
 		return
 	}
@@ -268,6 +372,9 @@ func (h *Hub) StartClusterSubscriber(ctx context.Context) {
 	defer clusterReady.Store(false)
 
 	log.Printf("ws-cluster: instans kimliyi %s", instanceID)
+	// C3 / DM-C1: "buradayam" frame-i — başqa instansların bizi görməsi üçün.
+	go h.startClusterHeartbeat(ctx)
+
 	c.SubscribeLoop(ctx, c.LocalKey(cache.WSFanout()), func(payload string) {
 		var frame clusterFrame
 		if err := json.Unmarshal([]byte(payload), &frame); err != nil {
@@ -275,6 +382,12 @@ func (h *Hub) StartClusterSubscriber(ctx context.Context) {
 		}
 		// Öz yayımımız — lokal çatdırma artıq olub.
 		if frame.Origin == instanceID {
+			return
+		}
+		// C3 / DM-C1: başqa instansdan frame gəldi → peer damgasını yenilə.
+		// Heartbeat frame-inin BAŞQA işi yoxdur, burada bitir.
+		notePeerFrame()
+		if frame.Type == clusterHeartbeatType {
 			return
 		}
 		// Issue 4: presence frame-i hədəfsizdir — bütün lokal client-lərə.
