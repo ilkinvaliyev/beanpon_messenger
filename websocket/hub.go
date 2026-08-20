@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -2909,25 +2910,30 @@ func (h *Hub) getOrCreateConversationWithPermission(senderID, receiverID uint) (
 func applyConversationMessageUpdateDB(db *gorm.DB, conversation *models.Conversation, senderID uint) error {
 	now := time.Now().UTC()
 
-	updates := map[string]interface{}{
-		"last_message_at":      now,
-		"total_messages_count": gorm.Expr("total_messages_count + 1"),
-		"first_message_at":     gorm.Expr("COALESCE(first_message_at, ?)", now),
-	}
+	// C2 / DM-Q1: UPDATE + SELECT → tək `UPDATE ... RETURNING` (REST əkizi ilə
+	// eyni — bax handlers.applyConversationMessageUpdate). Bir DB turu az.
+	senderCol := "user2_message_count"
 	if senderID == conversation.User1ID {
-		updates["user1_message_count"] = gorm.Expr("user1_message_count + 1")
-	} else {
-		updates["user2_message_count"] = gorm.Expr("user2_message_count + 1")
+		senderCol = "user1_message_count"
 	}
-	if err := db.Model(&models.Conversation{}).
-		Where("id = ?", conversation.ID).
-		Updates(updates).Error; err != nil {
-		return err
-	}
+	updateSQL := fmt.Sprintf(`
+        UPDATE conversations
+        SET last_message_at = ?,
+            total_messages_count = total_messages_count + 1,
+            first_message_at = COALESCE(first_message_at, ?),
+            %s = %s + 1
+        WHERE id = ? AND deleted_at IS NULL
+        RETURNING status, user1_message_count, user2_message_count,
+                  max_pending_messages, has_previous_conversation
+    `, senderCol, senderCol)
 
 	var fresh models.Conversation
-	if err := db.Select("id", "status", "user1_message_count", "user2_message_count", "max_pending_messages", "has_previous_conversation").
-		Where("id = ?", conversation.ID).First(&fresh).Error; err != nil {
+	if err := db.Raw(updateSQL, now, now, conversation.ID).Scan(&fresh).Error; err != nil {
+		return err
+	}
+	if fresh.Status == "" {
+		// Sətir yoxdur / yenilənmədi — KÖHNƏ DAVRANIŞ: status keçidini növbəti
+		// mesaj tətbiq edər.
 		return nil
 	}
 	conversation.User1MessageCount = fresh.User1MessageCount

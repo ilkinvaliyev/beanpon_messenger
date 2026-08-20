@@ -4,6 +4,7 @@ import (
 	"beanpon_messenger/database"
 	"beanpon_messenger/models"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -239,17 +240,42 @@ func (h *ConversationHandler) CanSendMessage(senderID, receiverID uint) (bool, s
 
 // GetOrCreateConversationWithPermission conversation'ı getirir veya oluşturur ve izin kontrolü yapar
 func (h *ConversationHandler) GetOrCreateConversationWithPermission(senderID, receiverID uint) (*models.Conversation, bool, string, error) {
-	// Block kontrolü
-	if models.IsBlocked(database.DB, senderID, receiverID) {
-		return nil, false, "Bu istifadəçiyə mesaj göndərə bilməzsiniz (blokladınız)", nil
-	}
+	return h.getOrCreateConversationWithPermission(senderID, receiverID, false)
+}
 
-	// Gizli Mod: gizli kullanıcıya (close-friend olmayan) DM engellenir; gizli
-	// kullanıcı da yalnız close-friends'e yazabilir. Bu, bütün REST göndərmə
-	// yollarının keçdiyi ortaq nöqtədir (CanSendMessage → burası). "Bulunamadı"
-	// kimi davranırıq ki, gizli durum sızmasın.
-	if models.DMHiddenBlocked(database.DB, senderID, receiverID) {
-		return nil, false, "İstifadəçi tapılmadı", nil
+// GetOrCreateConversationWithPermissionPrechecked — C2 / DM-Q3.
+//
+// ÖNCE: `MessageHandler.SendMessage` daha ilk satırlarda `models.IsBlocked` ve
+// `models.DMHiddenBlocked` çağırıyor, engellenmişse 403/404 dönüyordu. Hemen
+// ardından çağrılan `CanSendMessage` → bu fonksiyon AYNI İKİ KONTROLÜ bir daha
+// yapıyordu. İkinci çağrı hiçbir zaman farklı sonuç veremez (aynı argümanlar,
+// milisaniyeler içinde) — sadece fazladan veritabanı gidiş-dönüşü.
+//
+// SONRA: çağıran "bu ikisini ben zaten yaptım" diyebiliyor. Diğer bütün çağrı
+// yerleri (`CanSendMessage`, broadcast yolu, `:1219`) DEĞİŞMİYOR — kontroller
+// onlarda eskisi gibi burada yapılıyor.
+func (h *ConversationHandler) GetOrCreateConversationWithPermissionPrechecked(
+	senderID, receiverID uint,
+) (*models.Conversation, bool, string, error) {
+	return h.getOrCreateConversationWithPermission(senderID, receiverID, true)
+}
+
+func (h *ConversationHandler) getOrCreateConversationWithPermission(
+	senderID, receiverID uint, blockChecksDone bool,
+) (*models.Conversation, bool, string, error) {
+	if !blockChecksDone {
+		// Block kontrolü
+		if models.IsBlocked(database.DB, senderID, receiverID) {
+			return nil, false, "Bu istifadəçiyə mesaj göndərə bilməzsiniz (blokladınız)", nil
+		}
+
+		// Gizli Mod: gizli kullanıcıya (close-friend olmayan) DM engellenir; gizli
+		// kullanıcı da yalnız close-friends'e yazabilir. Bu, bütün REST göndərmə
+		// yollarının keçdiyi ortaq nöqtədir (CanSendMessage → burası). "Bulunamadı"
+		// kimi davranırıq ki, gizli durum sızmasın.
+		if models.DMHiddenBlocked(database.DB, senderID, receiverID) {
+			return nil, false, "İstifadəçi tapılmadı", nil
+		}
 	}
 
 	// Conversation'ı bul
@@ -356,6 +382,18 @@ func (h *ConversationHandler) UpdateConversationOnMessage(senderID, receiverID u
 // transaction-dan ƏVVƏL çağırır və nəticəni ötürür.
 //
 // `true` → söhbət YOXDURSA yaratma (banlı istifadəçi yeni söhbət aça bilməz).
+// ShouldSkipConversationCreateWith — C2 / DM-Q4: söhbət ARTIQ VARSA cavab
+// həmişə `false`-dur (bu qapı yalnız YENİ söhbət yaradılmasını dayandırır).
+// Çağıranın əlində söhbət varsa nə Redis, nə DB sorğusu edilir.
+func (h *ConversationHandler) ShouldSkipConversationCreateWith(
+	senderID, receiverID uint, known *models.Conversation,
+) bool {
+	if known != nil && known.ID != 0 {
+		return false
+	}
+	return h.ShouldSkipConversationCreate(senderID, receiverID)
+}
+
 func (h *ConversationHandler) ShouldSkipConversationCreate(senderID, receiverID uint) bool {
 	if !models.IsMessagingBanned(database.DB, senderID) {
 		return false
@@ -389,6 +427,27 @@ func (h *ConversationHandler) ShouldSkipConversationCreate(senderID, receiverID 
 //
 // İndi hər iki yol eyni mənbədən (`conversation.Status`) qidalanır.
 func (h *ConversationHandler) UpdateConversationOnMessageTx(db *gorm.DB, senderID, receiverID uint, skipCreate bool) (string, error) {
+	return h.UpdateConversationOnMessageTxWith(db, senderID, receiverID, skipCreate, nil)
+}
+
+// UpdateConversationOnMessageTxWith — C2 / DM-Q2: `known` verilirse söhbət
+// sətri TƏKRAR OXUNMUR.
+//
+// ÖNCE: `SendMessage` icazə yoxlaması üçün söhbəti onsuz da oxuyurdu
+// (`CanSendMessage` → `GetOrCreateConversationWithPermission`), amma nəticəni
+// ATIRDI. Transaction içində eyni sətir bir daha SELECT olunurdu.
+//
+// SONRA: çağıran əlindəki sətri ötürür. Yalnız `ID` və `User1ID` istifadə
+// olunur — hər ikisi dəyişməz. Sayğaclar `col = col + 1` ilə DB tərəfində
+// artdığı və təzə dəyərlər `RETURNING` ilə geri gəldiyi üçün bayat nüsxə
+// problemi YOXDUR.
+//
+// Sətir arada silinibsə (praktikada olmur) `RETURNING` boş qayıdır və köhnə
+// yola — `getOrCreateConversationTx` — düşülür, yəni davranış heç bir halda
+// pisləşmir.
+func (h *ConversationHandler) UpdateConversationOnMessageTxWith(
+	db *gorm.DB, senderID, receiverID uint, skipCreate bool, known *models.Conversation,
+) (string, error) {
 	// 🚫 SPAM KORUMASI: mesaj banlı kullanıcı YENİ conversation başlatamaz.
 	// Conversation yoksa ve gönderenin mesaj banı varsa sessizce çık
 	// (conversation oluşturulmaz, hata da dönülmez). Conversation zaten
@@ -398,12 +457,23 @@ func (h *ConversationHandler) UpdateConversationOnMessageTx(db *gorm.DB, senderI
 		return "", nil
 	}
 
+	if known != nil && known.ID != 0 {
+		applied, err := applyConversationMessageUpdate(db, known, senderID)
+		if err != nil {
+			return "", err
+		}
+		if applied {
+			return known.Status, nil
+		}
+		// Sətir tapılmadı → aşağıdakı köhnə yola düş.
+	}
+
 	conversation, err := h.getOrCreateConversationTx(db, senderID, receiverID)
 	if err != nil {
 		return "", err
 	}
 
-	if err := applyConversationMessageUpdate(db, conversation, senderID); err != nil {
+	if _, err := applyConversationMessageUpdate(db, conversation, senderID); err != nil {
 		return "", err
 	}
 	return conversation.Status, nil
@@ -422,32 +492,40 @@ func (h *ConversationHandler) UpdateConversationOnMessageTx(db *gorm.DB, senderI
 // İndi: sayğaclar `col = col + 1` ilə DB tərəfində artır; status keçidləri
 // KOMİT OLUNMUŞ dəyərlər yenidən oxunaraq, yalnız status sütunları yenilənərək
 // tətbiq olunur. `db` transaction ola bilər (Issue 40).
-func applyConversationMessageUpdate(db *gorm.DB, conversation *models.Conversation, senderID uint) error {
+func applyConversationMessageUpdate(db *gorm.DB, conversation *models.Conversation, senderID uint) (bool, error) {
 	now := time.Now().UTC()
 
-	updates := map[string]interface{}{
-		"last_message_at":      now,
-		"total_messages_count": gorm.Expr("total_messages_count + 1"),
-		// COALESCE → yalnız ilk dəfə yazılır (yarışa dayanıqlı).
-		"first_message_at": gorm.Expr("COALESCE(first_message_at, ?)", now),
-	}
+	// ── C2 / DM-Q1: UPDATE + SELECT → TEK `UPDATE ... RETURNING` ───────────
+	//
+	// ÖNCE: önce sayaçlar UPDATE ediliyor, sonra status geçişi için AYNI satır
+	// bir kez daha SELECT ediliyordu — iki ayrı veritabanı gidiş-dönüşü.
+	// SONRA: `RETURNING` güncellenmiş değerleri aynı sorguda geri veriyor.
+	// Değerler birebir aynı (aynı transaction, aynı satır); sadece bir tur az.
+	//
+	// Sütun adı Go tarafında SABİT iki seçenekten geliyor (kullanıcı girdisi
+	// değil) — SQL enjeksiyonu yolu yok.
+	senderCol := "user2_message_count"
 	if senderID == conversation.User1ID {
-		updates["user1_message_count"] = gorm.Expr("user1_message_count + 1")
-	} else {
-		updates["user2_message_count"] = gorm.Expr("user2_message_count + 1")
+		senderCol = "user1_message_count"
 	}
-	if err := db.Model(&models.Conversation{}).
-		Where("id = ?", conversation.ID).
-		Updates(updates).Error; err != nil {
-		return err
-	}
+	updateSQL := fmt.Sprintf(`
+        UPDATE conversations
+        SET last_message_at = ?,
+            total_messages_count = total_messages_count + 1,
+            first_message_at = COALESCE(first_message_at, ?),
+            %s = %s + 1
+        WHERE id = ? AND deleted_at IS NULL
+        RETURNING status, user1_message_count, user2_message_count,
+                  max_pending_messages, total_messages_count, has_previous_conversation
+    `, senderCol, senderCol)
 
-	// Status keçidi üçün KOMİT OLUNMUŞ dəyərləri oxu (yaddaşdakı nüsxə köhnədir).
 	var fresh models.Conversation
-	if err := db.Select("id", "status", "user1_message_count", "user2_message_count", "max_pending_messages", "total_messages_count", "has_previous_conversation").
-		Where("id = ?", conversation.ID).First(&fresh).Error; err != nil {
-		// Sayğaclar artıq yazıldı — status keçidini növbəti mesaj tətbiq edər.
-		return nil
+	if err := db.Raw(updateSQL, now, now, conversation.ID).Scan(&fresh).Error; err != nil {
+		return false, err
+	}
+	if fresh.Status == "" {
+		// Satır güncellenmedi (yok). Çağıran bunu görüp eski yola düşer.
+		return false, nil
 	}
 
 	// Çağıranın nüsxəsi də təzələnsin (push qapısı statusu oxuyur — Issue 10).
@@ -468,7 +546,7 @@ func applyConversationMessageUpdate(db *gorm.DB, conversation *models.Conversati
 		if err := db.Model(&models.Conversation{}).
 			Where("id = ? AND has_previous_conversation = ?", conversation.ID, false).
 			Update("has_previous_conversation", true).Error; err != nil {
-			return err
+			return false, err
 		}
 		conversation.HasPreviousConversation = true
 	}
@@ -483,7 +561,7 @@ func applyConversationMessageUpdate(db *gorm.DB, conversation *models.Conversati
 				"has_previous_conversation": true,
 				"status_changed_at":         now,
 			}).Error; err != nil {
-			return err
+			return false, err
 		}
 		conversation.Status = "active"
 
@@ -501,12 +579,12 @@ func applyConversationMessageUpdate(db *gorm.DB, conversation *models.Conversati
 					"status_changed_at":  now,
 					"restriction_reason": "Tek taraflı mesaj limiti aşıldı",
 				}).Error; err != nil {
-				return err
+				return false, err
 			}
 			conversation.Status = "restricted"
 		}
 	}
-	return nil
+	return true, nil
 }
 
 // updateConversationStatus conversation durumunu güncelle

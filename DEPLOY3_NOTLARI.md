@@ -152,6 +152,89 @@ Env verilmezse **bugünkü davranışın aynısı**.
 
 ---
 
+## 4. Gönderim yolundaki tekrarlanan sorgular (denetim: C2)
+
+**Dosyalar:** `handlers/message_handler.go`, `handlers/conversation_handler.go`,
+`websocket/hub.go`
+
+### Neydi
+
+Bir mesaj karşı tarafa yayınlanmadan önce bitmesi gereken sorgular:
+
+```
+REST yolu (Flutter)                      WS yolu (iOS)
+────────────────────────────             ────────────────────────
+1. IsBlocked                             1. IsMessagingBanned (Redis)
+2. IsMessagingBanned      (Redis)        2. IsBlocked
+3. IsBlocked            ← TEKRAR         3. conversation SELECT
+4. conversation SELECT                   4. INSERT
+5. ShouldSkipConvCreate   (Redis)        5. conversation UPDATE
+6. INSERT                                6. SELECT fresh    ← RETURNING'e girer
+7. conversation SELECT  ← TEKRAR
+8. conversation UPDATE
+9. SELECT fresh
+```
+
+Üç ayrı israf vardı:
+
+1. **`IsBlocked` iki kez.** `SendMessage` daha ilk satırlarda çağırıyor,
+   engellenmişse 403 dönüyor. Hemen ardından `CanSendMessage` aynı kontrolü
+   bir daha yapıyordu. İkinci çağrı hiçbir zaman farklı sonuç veremez.
+   (Gizli mod kontrolü de aynı şekilde ikizdi — ama `hiddenModeEnabled = false`
+   olduğu için bugün zaten sorgu yapmıyor.)
+
+2. **Söhbət satırı iki kez okunuyordu.** İzin kontrolü satırı okuyor ama
+   sonucu **atıyordu**; transaction aynı satırı bir daha SELECT ediyordu.
+
+3. **`ShouldSkipConversationCreate` gereksiz.** Bu kapı yalnızca *yeni*
+   söhbət açılmasını durdurur. Söhbət zaten varsa cevabı her zaman `false` —
+   yine de bir Redis çağrısı (ve ban varsa bir SELECT daha) yapılıyordu.
+
+Ayrıca sayaç güncellemesi **UPDATE + ayrı SELECT** şeklindeydi: durum geçişi
+(`pending → active` / `restricted`) için aynı satır ikinci kez okunuyordu.
+
+### Ne oldu
+
+- Çağıran "blok kontrolünü ben yaptım" diyebiliyor
+  (`GetOrCreateConversationWithPermissionPrechecked`).
+  Diğer bütün çağrı yerleri **değişmedi** — onlarda kontroller eskisi gibi.
+- İzin kontrolünde okunan söhbət satırı transaction'a **devrediliyor**.
+  Satır arada silinmişse eski yola (`getOrCreateConversationTx`) düşülüyor,
+  yani davranış hiçbir halde kötüleşmiyor.
+- Söhbət elimizdeyse `ShouldSkipConversationCreate` hiç çağrılmıyor.
+- `UPDATE + SELECT` → tek **`UPDATE ... RETURNING`** (her iki yolda).
+
+**Kritik yoldaki sorgu sayısı: REST 7–8 → 4, WS 5 → 4.**
+Aynı makinede sorgu başına ~0,3–2 ms; asıl kazanç bağlantı havuzunun daha az
+meşgul edilmesi, yani eşzamanlı mesaj kapasitesinin artması.
+
+### Ham SQL'e geçerken yakalanan gerçek bir hata
+
+`models.Conversation` yumuşak silme (`gorm.DeletedAt`) kullanıyor. GORM her
+sorguya otomatik olarak `deleted_at IS NULL` ekliyor — ham SQL'de bu **kayboldu**
+ve silinmiş bir söhbətin sayaçları güncellenebilir hâle geldi. Test bunu yakaladı;
+ham `UPDATE`'e `AND deleted_at IS NULL` eklendi ve regresyon testle kilitlendi.
+
+### Testler
+
+Gerçek PostgreSQL üzerinde 10 test (`handlers/conversation_update_test.go`,
+`websocket/conversation_update_test.go`) — her iki ikiz için ayrı ayrı:
+
+- sayaç artışı + `first_message_at` yalnız ilk mesajda yazılıyor (COALESCE)
+- `pending → active` geçişi
+- `pending → restricted` geçişi (tek taraflı limit)
+- limit aşılmadıysa `pending` kalıyor
+- satır yoksa hata değil, `applied=false` (çağıran eski yola düşer)
+- yumuşak silinmiş satır güncellenmiyor
+
+```bash
+CONV_TEST_DSN="host=... user=... dbname=..." go test ./...
+```
+
+DSN verilmezse veritabanı testleri atlanır (CI'da veritabanı gerekmez).
+
+---
+
 ## Deploy sırası
 
 ```bash
@@ -172,6 +255,7 @@ Ters sırada da bir şey kırılmaz — o aralıkta sadece sorgu kazancı olmaz.
 | Sohbet listesi sorgusu | git revert. Index'ler zararsızdır, kalabilir. |
 | Düzgün kapanış | git revert. |
 | Presence sıfırlaması | env'i kaldırın (varsayılan eski davranış). |
+| Tekrarlanan sorgular (C2) | git revert. Şema değişikliği yok. |
 
 ---
 

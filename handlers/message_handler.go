@@ -176,8 +176,13 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 	// verified, follow, limit, restricted) tətbiq olunmur — mesaj həmişə gedir.
 	conversationHandler := NewConversationHandler(wsHubForConv, h.encryptionService)
 	canSend, reason, err := true, "", error(nil)
+	// C2 / DM-Q2+Q3: söhbət sətri BURADA oxunur və AŞAĞIYA ötürülür (əvvəl
+	// oxunub atılırdı, transaction eyni sətri bir daha oxuyurdu). Blok/gizli
+	// mod yoxlamaları da yuxarıda (:117, :127) artıq edildi — təkrarlanmır.
+	var knownConv *models.Conversation
 	if req.ReceiverID != 1 {
-		canSend, reason, err = conversationHandler.CanSendMessage(senderID.(uint), req.ReceiverID)
+		knownConv, canSend, reason, err = conversationHandler.GetOrCreateConversationWithPermissionPrechecked(
+			senderID.(uint), req.ReceiverID)
 	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Conversation kontrolü başarısız"})
@@ -256,7 +261,10 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 	// siyahı yenilənmir, pending→active keçmir. İndi ya hər ikisi, ya heç biri.
 	// Redis I/O (mesaj banı yoxlaması) transaction-dan KƏNARDA — açıq bir
 	// transaction-ı şəbəkə gözləməsi ilə saxlamaq hovuzu kilidləyir.
-	skipConvCreate := conversationHandler.ShouldSkipConversationCreate(senderID.(uint), req.ReceiverID)
+	// C2 / DM-Q4: söhbət artıq varsa bu qapı həmişə `false` verir — nə Redis,
+	// nə DB sorğusu.
+	skipConvCreate := conversationHandler.ShouldSkipConversationCreateWith(
+		senderID.(uint), req.ReceiverID, knownConv)
 
 	// Issue 9: `duplicate` — istemçi eyni `client_message_id` ilə TƏKRAR
 	// göndərdi. Sətir onsuz da var; sayğac/yayım/push TƏKRARLANMAMALIDIR.
@@ -284,7 +292,10 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 			duplicate = &existing
 			return nil
 		}
-		status, uErr := conversationHandler.UpdateConversationOnMessageTx(tx, senderID.(uint), req.ReceiverID, skipConvCreate)
+		// C2 / DM-Q2: `knownConv` yuxarıdakı icazə yoxlamasından gəlir —
+		// transaction söhbət sətrini TƏKRAR OXUMUR. (nil isə köhnə yol.)
+		status, uErr := conversationHandler.UpdateConversationOnMessageTxWith(
+			tx, senderID.(uint), req.ReceiverID, skipConvCreate, knownConv)
 		if uErr != nil {
 			return uErr
 		}
