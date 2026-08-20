@@ -27,7 +27,15 @@ import urllib.request
 from collections import defaultdict
 
 P = "beanpon_messenger_"
-DEFAULT_URL = "http://127.0.0.1:5082/metrics"
+
+# Adres verilmezse sırayla denenir. `docker-compose.yml` portu iç arayüze
+# (`10.10.0.5`) bağlıyor, yani `127.0.0.1` ÇALIŞMAZ — bu liste o tuzağı
+# ortadan kaldırıyor.
+DEFAULT_URLS = [
+    "http://10.10.0.5:5082/metrics",
+    "http://127.0.0.1:5082/metrics",
+    "http://localhost:5082/metrics",
+]
 
 
 # ── Prometheus metin formatı ayrıştırıcı ───────────────────────────────────
@@ -275,6 +283,26 @@ def fetch(src):
         return f.read()
 
 
+def autodetect():
+    """Çalışan adresi bul. Hepsi başarısızsa hepsinin hatasını göster."""
+    errors = []
+    for url in DEFAULT_URLS:
+        try:
+            text = fetch(url)
+            if P in text:
+                return url, text
+            errors.append(f"  {url}: cevap verdi ama ölçüm yok (eski sürüm mü?)")
+        except Exception as e:
+            errors.append(f"  {url}: {e}")
+    print("HATA: /metrics hiçbir adreste okunamadı.", file=sys.stderr)
+    print("\n".join(errors), file=sys.stderr)
+    print("\n  • Konteyner ayakta mı?   docker ps | grep beanpon", file=sys.stderr)
+    print("  • Yayınlanan port nedir? docker compose ps", file=sys.stderr)
+    print("  • Adresi elle ver:       ./scripts/chat-metrics.py http://<ip>:5082/metrics",
+          file=sys.stderr)
+    sys.exit(1)
+
+
 def main():
     args = sys.argv[1:]
     window = None
@@ -282,16 +310,18 @@ def main():
         i = args.index("--watch")
         window = float(args[i + 1]) if len(args) > i + 1 else 60.0
         del args[i:i + 2]
-    src = args[0] if args else DEFAULT_URL
-
-    try:
-        text = fetch(src)
-    except Exception as e:
-        print(f"HATA: {src} okunamadı: {e}", file=sys.stderr)
-        print("  • Sunucu ayakta mı?  docker ps | grep beanpon", file=sys.stderr)
-        print("  • Adres:  ./scripts/chat-metrics.py http://10.10.0.5:5082/metrics",
-              file=sys.stderr)
-        sys.exit(1)
+    if args:
+        src = args[0]
+        try:
+            text = fetch(src)
+        except Exception as e:
+            print(f"HATA: {src} okunamadı: {e}", file=sys.stderr)
+            print("  • Konteyner ayakta mı?  docker ps | grep beanpon", file=sys.stderr)
+            print("  • Yayınlanan port:      docker compose ps", file=sys.stderr)
+            sys.exit(1)
+    else:
+        src, text = autodetect()
+        print(f"kaynak: {src}", file=sys.stderr)
 
     if window is None:
         report(*parse(text))
