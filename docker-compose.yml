@@ -5,6 +5,16 @@ services:
     restart: always
     ports:
       - "10.10.0.5:5082:5082"
+    # ── DEPLOY 3 / DM-S2: DÜZGÜN KAPANIŞ İÇİN SÜRE ─────────────────────────
+    # Docker Compose varsayılanı 10 saniyedir: SIGTERM gönderir, 10 sn sonra
+    # SIGKILL ile öldürür. Uygulamanın kapanış işi (her WebSocket'e close
+    # frame + presence yazımı) varsayılan 15 saniyeye kadar sürebiliyor
+    # (GRACEFUL_SHUTDOWN_SECONDS). 10 sn'de kesilirse kapanış yarıda kalır ve
+    # istemciler yine sert kopma yaşar.
+    #
+    # 30 sn = 15 sn kapanış işi + rahat pay.
+    # GRACEFUL_SHUTDOWN_SECONDS değiştirilirse bu değer ONDAN BÜYÜK kalmalı.
+    stop_grace_period: 30s
     environment:
       - ENV=production
     networks:
