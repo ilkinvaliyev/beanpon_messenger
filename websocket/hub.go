@@ -2,6 +2,7 @@ package websocket
 
 import (
 	"beanpon_messenger/config"
+	"beanpon_messenger/metrics"
 	"beanpon_messenger/models"
 	"beanpon_messenger/services"
 	"beanpon_messenger/utils"
@@ -142,6 +143,9 @@ func (c *Client) enqueueEvict(h *Hub) {
 	if c.evicting.Swap(true) {
 		return // artıq növbədədir
 	}
+	// ÖLÇÜM: bu sayğac 0-dan böyükdürsə istifadəçi "bağlantı qopur" yaşayır
+	// (denetim maddəsi W3 — yavaş istemçidə backpressure yoxdur).
+	metrics.WSEvictedTotal.Inc()
 	go func() {
 		h.unregister <- c
 	}()
@@ -1077,6 +1081,35 @@ func (h *Hub) Shutdown(ctx context.Context) {
 	}
 }
 
+// StartMetricsSampler — periyodik ölçüm. `go` ilə çağırılır.
+//
+// Bağlı istemçi sayısı ve en dolu gönderim kuyruğu HER MESAJDA deyil, 15
+// saniyədə bir örnəklənir: bunlar "anlık durum" göstəriciləridir, sıcak yolda
+// kilid almağa dəyməz.
+func (h *Hub) StartMetricsSampler(ctx context.Context) {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			h.mutex.RLock()
+			n := len(h.clients)
+			maxQueue := 0
+			for _, c := range h.clients {
+				if d := len(c.Send); d > maxQueue {
+					maxQueue = d
+				}
+			}
+			h.mutex.RUnlock()
+			metrics.WSClients.Set(float64(n))
+			metrics.WSSendQueueMax.Set(float64(maxQueue))
+			metrics.ClusterDroppedTotal.Set(float64(clusterDropped.Load()))
+		}
+	}
+}
+
 // GetConnectedUsersCount bağlı kullanıcı sayısı
 func (h *Hub) GetConnectedUsersCount() int {
 	h.mutex.RLock()
@@ -1433,6 +1466,16 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 
 		c.Hub.handleRemoveReaction(c.UserID, messageID)
 	case "send_message":
+		// ── ÖLÇÜM (DM-M1) ───────────────────────────────────────────────────
+		// Bu bloğun toplam süresi = kullanıcının "gönder"e basmasından sonra
+		// sunucunun harcadığı zaman. `sendOutcome` çıkış yoluna göre
+		// etiketlenir; hiçbir dala dokunmadan `defer` ile yazılır.
+		sendStart := time.Now()
+		sendOutcome := "error"
+		defer func() {
+			metrics.ObserveSince(metrics.DMSendDuration, sendStart, "ws", sendOutcome)
+		}()
+
 		dataMap, ok := msg.Data.(map[string]interface{})
 		if !ok {
 			log.Printf("Mesaj data parse edilemedi")
@@ -1493,9 +1536,12 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 		//conversationHandler := handlers.NewConversationHandler(c.Hub, c.Hub.encryptionService)
 		//conversation, canSend, errorMsg, err := conversationHandler.GetOrCreateConversationWithPermission(c.UserID, receiverID)
 
+		permStart := time.Now()
 		conversation, canSend, errorMsg, err := c.Hub.getOrCreateConversationWithPermission(c.UserID, receiverID)
+		metrics.ObserveSince(metrics.DMSendStep, permStart, "ws", "perm")
 
 		if err != nil || !canSend {
+			sendOutcome = "rejected"
 			// 🚫 SPAM: spam'lı kullanıcıya hata bile gösterme — sessizce yut.
 			// Mesaj DB'ye yazılmaz, karşı tarafa gitmez, gönderene message_error
 			// dönülmez (shadow-ban davranışı).
@@ -1584,6 +1630,7 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 		// artmır. `duplicate` olduqda yayım/moderasiya da təkrarlanmır;
 		// göndərənə `message_duplicate` gedir ki, öz outbox-unu təmizləsin.
 		duplicate := false
+		persistStart := time.Now()
 		if err := c.Hub.db.Transaction(func(tx *gorm.DB) error {
 			res := tx.Clauses(clause.OnConflict{
 				Columns:   []clause.Column{{Name: "id"}},
@@ -1644,8 +1691,10 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 			})
 			return
 		}
+		metrics.ObserveSince(metrics.DMSendStep, persistStart, "ws", "persist")
 
 		if duplicate {
+			sendOutcome = "duplicate"
 			// v2 üçün ƏLAVƏ `message_ack` (duplicate=true). `message_duplicate`
 			// AYNEN qalır — köhnə istemçilər onu gözləyir.
 			c.sendAckIfV2(messageID, clientMsgID, receiverID, createdAt, true)
@@ -1685,7 +1734,10 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 		}
 
 		// Artıq commit olunub — indi yay (silent yalnız REST-də var → false).
+		fanoutStart := time.Now()
 		c.Hub.HandleNewMessage(c.UserID, receiverID, messageID, content, msgType, createdAt, replyToMessageID, storyID, conversationStatus, false)
+		metrics.ObserveSince(metrics.DMSendStep, fanoutStart, "ws", "fanout")
+		sendOutcome = "ok"
 
 		// 🔍 MODERASIYA — qeyri-bloklayıcı, arxa planda qalır.
 		if c.Hub.moderationEnqueue != nil && (msgType == "" || msgType == "text") {
@@ -2267,12 +2319,19 @@ func (h *Hub) sendPushNotification(senderID, receiverID uint, message, msgType s
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("x-api-key", h.config.CloudToken)
 
+		pushStart := time.Now()
 		resp, err := h.httpClient.Do(req)
 		if err != nil {
+			metrics.ObserveSince(metrics.PushDuration, pushStart, "failed")
 			log.Printf("❌ Push notification gönderme hatası: %v", err)
 			return
 		}
 		defer resp.Body.Close()
+		if resp.StatusCode == 200 {
+			metrics.ObserveSince(metrics.PushDuration, pushStart, "sent")
+		} else {
+			metrics.ObserveSince(metrics.PushDuration, pushStart, "failed")
+		}
 
 		if resp.StatusCode == 200 {
 			// UĞUR sətri artıq default-da YAZILMIR (`PUSH_LOG=true` ilə açılır).
@@ -2306,6 +2365,7 @@ func (h *Hub) sendPushNotification(senderID, receiverID uint, message, msgType s
 func (h *Hub) GetUnreadCount(userID uint) int {
 	var count int64
 
+	defer metrics.ObserveSince(metrics.QueryDuration, time.Now(), "unread")
 	err := h.db.Model(&models.Message{}).
 		Joins("JOIN users ON users.id = messages.sender_id").
 		// Issue 59: `conversation_id IS NULL` — yalnız DM. Qrup mesajları ayrı

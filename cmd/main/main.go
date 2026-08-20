@@ -175,6 +175,9 @@ func main() {
 	// qalır). Bax websocket/cluster.go.
 	go wsHub.StartClusterSubscriber(context.Background())
 	go wsHub.StartPresenceHeartbeat(context.Background())
+	// ÖLÇÜM: bağlı istemci sayısı / kuyruk derinliği / atılan yayın frame'i —
+	// 15 saniyede bir örneklenir, `/metrics` ucundan okunur.
+	go wsHub.StartMetricsSampler(context.Background())
 
 	// 1b. XMPP BRIDGE (transport migration for chat_page / group_chat_page).
 	// No-op unless XMPP_ENABLED=true. The Hub implements both xmpp.LegacyDelivery

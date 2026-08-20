@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"beanpon_messenger/database"
+	"beanpon_messenger/metrics"
 	"beanpon_messenger/models"
 	"beanpon_messenger/services"
 	"beanpon_messenger/utils"
@@ -72,6 +73,15 @@ type wsHubForConversation interface {
 
 // SendMessage mesaj gönder
 func (h *MessageHandler) SendMessage(c *gin.Context) {
+	// ── ÖLÇÜM (DM-M1) ───────────────────────────────────────────────────────
+	// WS ikizi ilə eyni naxış: toplam süre + adım süreleri. `sendOutcome`
+	// çıxış yoluna görə etiketlənir, `defer` ilə tək yerdə yazılır.
+	sendStart := time.Now()
+	sendOutcome := "rejected"
+	defer func() {
+		metrics.ObserveSince(metrics.DMSendDuration, sendStart, "rest", sendOutcome)
+	}()
+
 	// JWT'den user ID al
 	senderID, exists := c.Get("user_id")
 	if !exists {
@@ -112,6 +122,8 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 	//	c.JSON(http.StatusBadRequest, gin.H{"error": "Kendi kendinize mesaj gönderemezsiniz"})
 	//	return
 	//}
+
+	permStart := time.Now()
 
 	// Block kontrolü ekle
 	if models.IsBlocked(database.DB, senderID.(uint), req.ReceiverID) {
@@ -184,7 +196,9 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 		knownConv, canSend, reason, err = conversationHandler.GetOrCreateConversationWithPermissionPrechecked(
 			senderID.(uint), req.ReceiverID)
 	}
+	metrics.ObserveSince(metrics.DMSendStep, permStart, "rest", "perm")
 	if err != nil {
+		sendOutcome = "error"
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Conversation kontrolü başarısız"})
 		return
 	}
@@ -274,6 +288,7 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 	// həqiqi statusu ötürür. Bu uyğunsuzluq eyni mesajın nəqliyyatdan asılı
 	// olaraq push doğurub-doğurmamasına səbəb olurdu.
 	conversationStatus := ""
+	persistStart := time.Now()
 	if err := database.DB.Transaction(func(tx *gorm.DB) error {
 		res := tx.Clauses(clause.OnConflict{
 			Columns:   []clause.Column{{Name: "id"}},
@@ -312,10 +327,12 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 		services.MarkMediaReferenced(tx, req.Text)
 		return nil
 	}); err != nil {
+		sendOutcome = "error"
 		log.Printf("Mesaj/conversation transaction xətası: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Mesaj kaydedilemedi"})
 		return
 	}
+	metrics.ObserveSince(metrics.DMSendStep, persistStart, "rest", "persist")
 
 	if duplicate != nil {
 		// ── Təkrar cəhdin ƏSL təkrar olduğunu TAM YOXLA ────────────────────
@@ -345,6 +362,7 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 		if decErr != nil {
 			dupText = req.Text
 		}
+		sendOutcome = "duplicate"
 		c.JSON(http.StatusOK, gin.H{
 			"message":   "Mesaj başarıyla gönderildi",
 			"duplicate": true,
@@ -363,6 +381,7 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 	}
 
 	// WebSocket üzerinden real-time yayınla (hem gönderen hem alıcıya)
+	fanoutStart := time.Now()
 	h.wsHub.HandleNewMessage(
 		message.SenderID,
 		*message.ReceiverID,
@@ -375,6 +394,9 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 		conversationStatus, // Issue 10: sabit "active" DEYİL, gerçək status
 		req.Silent,         // səssiz göndərmə → push getməsin
 	)
+
+	metrics.ObserveSince(metrics.DMSendStep, fanoutStart, "rest", "fanout")
+	sendOutcome = "ok"
 
 	// 🔍 MODERASIYA — mesaj şifrələnib göndərildi, indi arxa planda analizə
 	// qoyuruq. Enqueue() qeyri-bloklayıcıdır: bu sətir mesaj göndərmə
@@ -848,6 +870,7 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
         ORDER BY m.created_at DESC, m.id DESC
     `
 
+	histStart := time.Now()
 	if useFastPath {
 		err = database.DB.Raw(fastQuery,
 			userID, otherUserID, // dal 1: mən → o
@@ -864,6 +887,7 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 			limit, offset,
 		).Scan(&messages).Error
 	}
+	metrics.ObserveSince(metrics.QueryDuration, histStart, "history")
 
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Mesajlar alınamadı"})
@@ -1534,6 +1558,7 @@ func (h *MessageHandler) SyncMessages(c *gin.Context) {
     `
 
 	var syncErr error
+	syncStart := time.Now()
 	if chatQueryLegacy {
 		syncErr = database.DB.Raw(legacySyncQuery, userID, userID, since, sinceID, limit+1).Scan(&rows).Error
 	} else {
@@ -1543,6 +1568,7 @@ func (h *MessageHandler) SyncMessages(c *gin.Context) {
 			limit+1,
 		).Scan(&rows).Error
 	}
+	metrics.ObserveSince(metrics.QueryDuration, syncStart, "sync")
 	if syncErr != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Mesajlar alınamadı"})
 		return
@@ -2349,7 +2375,9 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 	// ORDER BY parametrləri (WHERE/extraParams-dan SONRA query mətnində gəlir).
 	params = append(params, userID, userID, userID, userID)
 
+	convQueryStart := time.Now()
 	err := database.DB.Raw(query, params...).Scan(&conversations).Error
+	metrics.ObserveSince(metrics.QueryDuration, convQueryStart, "conversations")
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Konuşmalar alınamadı"})
 		return

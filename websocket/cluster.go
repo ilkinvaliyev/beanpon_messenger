@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"beanpon_messenger/cache"
+	"beanpon_messenger/metrics"
 	"beanpon_messenger/models"
 )
 
@@ -251,6 +252,8 @@ func clusterHasPeers() bool {
 	if clusterSoloLogged.CompareAndSwap(false, true) {
 		log.Printf("ws-cluster: başqa instans yoxdur — data yayımı dayandırıldı (heartbeat davam edir)")
 	}
+	// ÖLÇÜM: C3 qazancı birbaşa burada görünür.
+	metrics.ClusterSkippedSoloTotal.Inc()
 	return false
 }
 
@@ -308,6 +311,7 @@ func (h *Hub) publishCluster(userIDs []uint, messageType string, data interface{
 
 	select {
 	case clusterPublishCh <- string(payload):
+		metrics.ClusterPublishedTotal.Inc()
 	default:
 		clusterDropped.Add(1)
 	}
