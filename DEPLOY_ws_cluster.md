@@ -6,6 +6,7 @@
 sırf ona baxırdı. `cache/redis.go`-da `Publish` / `Subscribe` **ümumiyyətlə
 yox idi**. Tək replica ilə hər şey işləyir; **ikinci replica qalxdığı an**:
 
+
 | Sındıran şey | Nəticə |
 |---|---|
 | A-dakı göndərən → B-dəki alıcı | Canlı mesaj **heç vaxt** çatmır (yalnız DB-də; alıcı çatı yenidən açanda görür) |
