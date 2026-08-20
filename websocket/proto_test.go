@@ -225,6 +225,11 @@ func TestNeedsConversationUpdate(t *testing.T) {
 	old := convUpdateMode
 	defer func() { convUpdateMode = old }()
 
+	// VARSAYILAN "all" olmalı — canlıda yaşanan regresyondan sonra.
+	if convUpdateMode != "all" {
+		t.Fatalf("varsayılan mod %q — `all` olmalı (WS_CONV_UPDATE regresyonu)", convUpdateMode)
+	}
+
 	convUpdateMode = "v2skip"
 	if h.needsConversationUpdate(1) {
 		t.Fatal("v2 istemçiyə hələ də conversation_update gedir")

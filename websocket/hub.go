@@ -1002,12 +1002,32 @@ func (h *Hub) sendConversationUpdate(senderID, receiverID uint, messageData map[
 	}
 }
 
-// convUpdateMode — `WS_CONV_UPDATE`: "v2skip" (default) | "all" (köhnə).
+// convUpdateMode — `WS_CONV_UPDATE`: "all" (VARSAYILAN) | "v2skip".
+//
+// ── ⚠️ VARSAYILAN "all"a ÇEVRİLDİ — CANLIDA YAŞANMIŞ REGRESYON ─────────────
+//
+// İlk sürümde varsayılan "v2skip" idi: v2 istemciye `conversation_update`
+// gönderilmiyordu, çünkü iOS sohbet listesi `new_message`'ı da tam işliyor
+// (`ConversationsViewModel.processNewMessage`). Kod okuması doğruydu ama
+// EKSİKTİ: iOS tarafında `new_message` yolunun İKİ kırılganlığı var —
+//
+//  1. toplu işleme zamanlayıcısı `.default` run-loop modunda; kullanıcı
+//     listeyi kaydırırken DURUYOR ("kaydırırken mesajlar gelmiyor"),
+//  2. karşı tarafı çözmek için `currentUserId` gerekiyor; o nil olduğu
+//     pencerede olay SESSİZCE düşüyor.
+//
+// `conversation_update` bu iki tuzağın ikisinden de etkilenmiyordu, yani
+// sessiz bir emniyet ağıydı. Kesilince ağ da gitti: mesaj geliyor ama sohbet
+// listesi elle yenilenmeden güncellenmiyordu.
+//
+// KARAR: varsayılan ESKİ davranış. Kesme yalnızca iOS'taki iki hata düzelmiş
+// bir sürüm yayınlandıktan SONRA, açıkça `WS_CONV_UPDATE=v2skip` ile açılır.
+// (Kesmenin kazancı mesaj başına 1 frame — bu riski hak etmiyor.)
 var convUpdateMode = func() string {
-	if strings.EqualFold(strings.TrimSpace(os.Getenv("WS_CONV_UPDATE")), "all") {
-		return "all"
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("WS_CONV_UPDATE")), "v2skip") {
+		return "v2skip"
 	}
-	return "v2skip"
+	return "all"
 }()
 
 // needsConversationUpdate — bu istifadəçiyə yeni-mesaj `conversation_update`-i
