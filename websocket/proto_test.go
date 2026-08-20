@@ -1,6 +1,7 @@
 package websocket
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -73,3 +74,64 @@ func contains(s, sub string) bool {
 }
 
 func timeZero() time.Time { return time.Unix(0, 0).UTC() }
+
+// ── DEPLOY 3 / DM-S2: düzgün kapanış testləri ──────────────────────────────
+
+// Bağlı client yoxdursa `Shutdown` DB-yə heç toxunmamalı və dərhal qayıtmalıdır.
+// (`db` nil-dir: DB-yə gedən hər hansı yol panic verər — test onu tutar.)
+func TestShutdown_NoClients(t *testing.T) {
+	h := &Hub{clients: make(map[uint]*Client)}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.Shutdown(context.Background())
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Shutdown bağlantısız halda asıldı")
+	}
+}
+
+// Hər client-in `done` kanalı bağlanmalıdır — `writePump` close frame-i
+// məhz bu siqnalla göndərir. `ctx` müddəti dolsa belə bu addım tamamlanır,
+// çünki frame göndərmə DB yazımından ƏVVƏL edilir.
+func TestShutdown_ClosesEveryClient(t *testing.T) {
+	h := &Hub{clients: make(map[uint]*Client)}
+	for i := uint(1); i <= 5; i++ {
+		h.clients[i] = &Client{UserID: i, Send: make(chan []byte, 1), done: make(chan struct{})}
+	}
+	// Süresi ÇOXDAN dolmuş ctx: DB addımı atlansa da close frame-lər getməlidir.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	fin := make(chan struct{})
+	go func() { defer close(fin); h.Shutdown(ctx) }()
+	select {
+	case <-fin:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Shutdown asıldı")
+	}
+
+	for id, c := range h.clients {
+		select {
+		case <-c.done:
+		default:
+			t.Fatalf("client %d üçün done bağlanmadı (close frame getməzdi)", id)
+		}
+	}
+}
+
+// `closeSend` idempotentdir: `Shutdown` ilə `unregisterClient` eyni anda
+// çağırsa belə ikinci `close(done)` panic verməməlidir.
+func TestCloseSend_Idempotent(t *testing.T) {
+	c := &Client{UserID: 1, Send: make(chan []byte, 1), done: make(chan struct{})}
+	for i := 0; i < 3; i++ {
+		c.closeSend()
+	}
+	select {
+	case <-c.done:
+	default:
+		t.Fatal("done bağlanmadı")
+	}
+}

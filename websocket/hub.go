@@ -7,6 +7,7 @@ import (
 	"beanpon_messenger/utils"
 	"beanpon_messenger/xmpp"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"log"
@@ -952,6 +953,71 @@ func (h *Hub) IsUserOnline(userID uint) bool {
 	}
 	_, remote := remotePresence(userID)
 	return remote
+}
+
+// ── DEPLOY 3 / DM-S2: DÜZGÜN KAPANIŞ (graceful shutdown) ───────────────────
+//
+// ÖNCE: deploy sırasında proses öldürülüyordu. Bağlı her istemci için TCP
+// aniden kopuyor, close frame HİÇ gitmiyordu. İstemci tarafında bu "beklenmedik
+// hata" olarak görünür ve yeniden bağlanma merdiveni (backoff) devreye girer —
+// yani kullanıcı her deploy'da 1-5 saniye "bağlanıyor" durumunda kalır.
+// Ayrıca `user_presences` satırları `is_online = true` kalıyor, oturum süresi
+// muhasebesi kayboluyordu (bak `setUsersOfflineBulk`).
+//
+// SONRA: SIGTERM alındığında her istemciye normal WebSocket close frame'i
+// gönderilir. İstemci bunu "sunucu kapandı" olarak görür ve BEKLEMEDEN yeniden
+// bağlanır (backoff'a düşmez) — deploy kesintisi saniyeler yerine milisaniyeler
+// olur. Presence de tek SQL ile doğru şekilde kapatılır.
+//
+// `ctx` süresi dolarsa yarıda kesilir; kapanış hiçbir zaman asılı kalmaz.
+func (h *Hub) Shutdown(ctx context.Context) {
+	h.mutex.RLock()
+	clients := make([]*Client, 0, len(h.clients))
+	userIDs := make([]uint, 0, len(h.clients))
+	for userID, c := range h.clients {
+		clients = append(clients, c)
+		userIDs = append(userIDs, userID)
+	}
+	h.mutex.RUnlock()
+
+	if len(clients) == 0 {
+		log.Printf("🛑 Kapanış: bağlı WebSocket yok")
+		return
+	}
+	log.Printf("🛑 Kapanış: %d WebSocket bağlantısına close frame gönderiliyor", len(clients))
+
+	// 1) Close frame. `closeSend` yalnız `done` kanalını kapatır; frame'i
+	//    `writePump` yazar (bak writePump'ın `case <-c.done` dalı). İdempotent.
+	for _, c := range clients {
+		c.closeSend()
+	}
+
+	// 2) Paylaşılan (Redis) presence kayıtları — yalnız BİZE ait olanlar silinir
+	//    (`clearPresence` instance kimliğini kontrol eder).
+	for _, userID := range userIDs {
+		h.clearPresence(userID)
+	}
+
+	// 3) SQL presence — tek sorgu, süre muhasebesi doğru.
+	done := make(chan struct{})
+	go func() {
+		// `ctx` dolarsa `Shutdown` qayıdır, amma BU goroutine işləməyə davam
+		// edir. Burada bir panic prosesi məhz kapanış anında çökdürərdi
+		// (`readPump`/`writePump` ilə eyni müdafiə xətti).
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("⚠️ Kapanış presence yazımında panic: %v", r)
+			}
+		}()
+		defer close(done)
+		h.setUsersOfflineBulk(userIDs)
+	}()
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+		log.Printf("⚠️ Kapanış süresi doldu — presence yazımı tamamlanmadı")
+	}
 }
 
 // GetConnectedUsersCount bağlı kullanıcı sayısı

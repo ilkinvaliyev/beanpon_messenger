@@ -16,8 +16,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Depado/ginprom"
@@ -144,7 +146,28 @@ func main() {
 
 	// 1. MEVCUT SİSTEM: Özel Mesajlaşma (Chat) Hub'ı
 	wsHub := websocket.NewHub(database.DB, encryptionService, cfg)
-	database.DB.Exec("UPDATE user_presences SET is_online = false, last_seen_at = NOW() WHERE is_online = true")
+
+	// ── DEPLOY 3 / DM-S3: AÇILIŞTAKİ GLOBAL PRESENCE SIFIRLAMASI ────────────
+	//
+	// ÖNCE: her açılışta koşulsuz `UPDATE user_presences SET is_online = false
+	// ... WHERE is_online = true`. Tek instans varken makul, ama:
+	//   • ÇOK INSTANS varsa yeni açılan replica DİĞER replica'lardaki online
+	//     kullanıcıları da offline yazıyor → "online görünmüyorum" şikayeti;
+	//   • `total_online_seconds` hiç işlenmiyor → her deploy'da o anki bütün
+	//     oturum süreleri kayboluyor (bak `setUsersOfflineBulk`).
+	//
+	// SONRA: düzgün kapanış (`wsHub.Shutdown`) presence'i ZATEN doğru şekilde
+	// kapatıyor. Bu satır yalnızca "proses SIGKILL yedi / OOM oldu" hâli için
+	// bir emniyet ağı olarak kalıyor ve KAPATILABİLİR hâle geldi.
+	//
+	// PRESENCE_RESET_ON_BOOT=false  → çok instanslı kurulumda bunu kullanın.
+	// Varsayılan (env yoksa) bugünkü davranışın AYNISIDIR.
+	if os.Getenv("PRESENCE_RESET_ON_BOOT") != "false" {
+		database.DB.Exec("UPDATE user_presences SET is_online = false, last_seen_at = NOW() WHERE is_online = true")
+	} else {
+		log.Printf("ℹ️ PRESENCE_RESET_ON_BOOT=false — açılışta global presence sıfırlaması atlandı")
+	}
+
 	go wsHub.Run()
 
 	// Issue 4: instance-lar arası canlı yayım + paylaşılan presence.
@@ -604,7 +627,49 @@ func main() {
 		IdleTimeout:       120 * time.Second,
 	}
 
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatalf("Sunucu başlatma hatası: %v", err)
+	// ── DEPLOY 3 / DM-S2: DÜZGÜN KAPANIŞ ───────────────────────────────────
+	//
+	// ÖNCE: `ListenAndServe` ana goroutine'i bloke ediyordu; SIGTERM gelince
+	// proses ANINDA ölüyordu. Sonuç: her deploy'da bağlı olan HERKESİN soketi
+	// close frame'siz kopuyor, istemci bunu hata sayıp yeniden bağlanma
+	// merdivenine (backoff) giriyordu — kullanıcı 1-5 saniye "bağlanıyor"
+	// görüyordu. Uçuştaki HTTP istekleri de yarıda kesiliyordu.
+	//
+	// SONRA: sunucu ayrı goroutine'de koşar, ana goroutine sinyali bekler.
+	// Sinyalde önce WebSocket'ler düzgün kapatılır (close frame + presence),
+	// sonra HTTP sunucusu uçuştaki istekleri bitirir.
+	//
+	// GRACEFUL_SHUTDOWN_SECONDS ile süre ayarlanabilir (varsayılan 15 sn).
+	// Orkestratörünüzün `terminationGracePeriodSeconds`/`stop_grace_period`
+	// değerinin BUNDAN BÜYÜK olması gerekir, yoksa SIGKILL araya girer.
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("Sunucu başlatma hatası: %v", err)
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	sig := <-quit
+	log.Printf("🛑 %s alındı — düzgün kapanış başlıyor", sig)
+
+	graceSeconds := 15
+	if v := os.Getenv("GRACEFUL_SHUTDOWN_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			graceSeconds = n
+		}
 	}
+	shutdownCtx, cancelShutdown := context.WithTimeout(
+		context.Background(), time.Duration(graceSeconds)*time.Second)
+	defer cancelShutdown()
+
+	// 1) WebSocket'ler: close frame + presence. (Hijack edilmiş bağlantılar
+	//    `http.Server` tarafından izlenmez, bu yüzden ÖNCE burası kapatılır.)
+	wsHub.Shutdown(shutdownCtx)
+
+	// 2) HTTP: yeni bağlantı kabul etme, uçuştakileri bitir.
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("⚠️ HTTP kapanışı temiz bitmedi: %v", err)
+	}
+	log.Printf("✅ Kapanış tamamlandı")
 }

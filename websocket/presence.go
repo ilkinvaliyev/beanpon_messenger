@@ -26,7 +26,14 @@ func (h *Hub) setUserOnline(userID uint) {
 }
 
 func (h *Hub) setUserOffline(userID uint) {
-	go func() {
+	go h.setUserOfflineNow(userID)
+}
+
+// setUserOfflineNow — `setUserOffline`-ın SİNXRON gövdəsi. Graceful shutdown
+// (bax `Hub.Shutdown`) yazımın bitməsini gözləməli olduğu üçün ayrıldı;
+// davranış eynidir.
+func (h *Hub) setUserOfflineNow(userID uint) {
+	{
 		now := time.Now().UTC()
 
 		// Bu sessiya-nın başlanğıcı (online_at) — həm ümumi total, həm də
@@ -58,7 +65,43 @@ func (h *Hub) setUserOffline(userID uint) {
 		if onlineAt != nil {
 			h.addDailyScreenTime(userID, onlineAt.UTC(), now)
 		}
-	}()
+	}
+}
+
+// ── DEPLOY 3 / DM-S2: TOPLU OFFLINE (graceful shutdown) ────────────────────
+//
+// ÖNCE: sunucu her başladığında `main.go` şunu çalıştırıyordu:
+//
+//	UPDATE user_presences SET is_online=false, last_seen_at=NOW() WHERE is_online=true
+//
+// İki sorun:
+//  1. `total_online_seconds` HİÇ işlenmiyordu. Yani her deploy'da o anda
+//     bağlı olan HERKESİN oturum süresi kayboluyordu ("Günün Kartı" ekran
+//     süresi dahil).
+//  2. Birden fazla instance varsa, YENİ açılan instance DİĞER instance'ların
+//     online kullanıcılarını da offline yazıyordu.
+//
+// SONRA: kapanış sinyalinde YALNIZ bu instance'ın bağlı kullanıcıları, tek
+// bir SQL ile, süre muhasebesi DOĞRU yapılarak offline'a çekilir.
+func (h *Hub) setUsersOfflineBulk(userIDs []uint) {
+	if len(userIDs) == 0 || h.db == nil {
+		return
+	}
+	now := time.Now().UTC()
+	sql := `
+        UPDATE user_presences
+        SET is_online = false,
+            last_seen_at = ?,
+            updated_at = ?,
+            total_online_seconds = total_online_seconds +
+                GREATEST(0, EXTRACT(EPOCH FROM (?::timestamptz - online_at))::bigint)
+        WHERE user_id IN ? AND is_online = true
+    `
+	if err := h.db.Exec(sql, now, now, now, userIDs).Error; err != nil {
+		log.Printf("⚠️ Toplu presence offline yazılamadı (%d user): %v", len(userIDs), err)
+		return
+	}
+	log.Printf("✅ Kapanış: %d kullanıcı offline işaretlendi", len(userIDs))
 }
 
 // bakuLocation — Azərbaycan sabit UTC+4 (2016-dan sonra DST yoxdur).
