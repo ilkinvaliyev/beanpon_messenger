@@ -88,6 +88,14 @@ var (
 	WSEvictedTotal = newCounter("ws_evicted_total",
 		"Gönderim kuyruğu dolduğu için kopartılan bağlantı sayısı")
 
+	// WSFrameDroppedTotal — kuyruk dolduğu için ATILAN geçici frame sayısı
+	// (W3). Bunlar atılmasaydı bağlantı kopartılacaktı; yani bu sayaç
+	// "kurtarılan bağlantı" demektir. `type` etiketi sabit, küçük bir küme
+	// (bak `isDroppableFrame`).
+	WSFrameDroppedTotal = newCounterVec("ws_frame_dropped_total",
+		"Kuyruk dolduğu için atılan geçici frame sayısı",
+		[]string{"type"})
+
 	// ClusterPublishedTotal — diğer instanslara yayınlanan frame sayısı.
 	ClusterPublishedTotal = newCounter("cluster_published_total",
 		"Diğer instanslara yayınlanan frame sayısı")
@@ -114,6 +122,14 @@ func newHistogramVec(name, help string, labels []string) *prometheus.HistogramVe
 	v := prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace: namespace, Subsystem: subsystem,
 		Name: name, Help: help, Buckets: msBuckets,
+	}, labels)
+	register(v)
+	return v
+}
+
+func newCounterVec(name, help string, labels []string) *prometheus.CounterVec {
+	v := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: name, Help: help,
 	}, labels)
 	register(v)
 	return v

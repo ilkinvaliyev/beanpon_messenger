@@ -443,11 +443,8 @@ func (h *Hub) broadcastLocalRaw(except []uint, messageType string, data json.Raw
 	h.mutex.RUnlock()
 
 	for _, client := range targets {
-		select {
-		case client.Send <- payload:
-		default:
-			client.enqueueEvict(h)
-		}
+		// W3 / DM-B1: geçici frame kuyruk doluysa atılır, bağlantı yaşar.
+		client.trySend(h, messageType, payload)
 	}
 }
 
@@ -482,11 +479,9 @@ func (h *Hub) deliverLocalRaw(userIDs []uint, messageType string, data json.RawM
 
 	delivered := false
 	for _, client := range targets {
-		select {
-		case client.Send <- payload:
+		// W3 / DM-B1: geçici frame kuyruk doluysa atılır, bağlantı yaşar.
+		if client.trySend(h, messageType, payload) {
 			delivered = true
-		default:
-			client.enqueueEvict(h)
 		}
 	}
 

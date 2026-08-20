@@ -151,6 +151,61 @@ func (c *Client) enqueueEvict(h *Hub) {
 	}()
 }
 
+// ── W3 / DM-B1: YAVAŞ İSTEMCİDE ARTIK BAĞLANTI KOPARTILMIYOR ───────────────
+//
+// ÖNCE: `Send` kuyruğu (256) dolduğu an bağlantı KOPARTILIYORDU. Karşı tarafın
+// şebekesi bir an yavaşladığında, telefon arka plandan uyanırken ya da bir
+// grup selinde kuyruk dolabiliyor ve kullanıcı bağlantıyı kaybediyordu —
+// kullanıcı gözünde "bağlantı sürekli kopuyor".
+//
+// Oysa kuyruğu dolduranların çoğu GEÇİCİ frame: "yazıyor…", online durumu,
+// okunmamış sayacı. Bunların eskisi zaten değersizdir; yenisi geldiğinde
+// eskisinin bir anlamı kalmaz.
+//
+// SONRA:
+//   - geçici frame + kuyruk dolu → FRAME atılır, bağlantı YAŞAR
+//   - kritik frame + kuyruk dolu → bağlantı kopartılır (eski davranış)
+//
+// Kritik frame'i sessizce atmak GERÇEK kayıp olurdu. Kopartmak ise değil:
+// istemci yeniden bağlanıp delta-sync ile kaçırdığını toplar. Yani kural
+// "kaybetmektense kopart, ama gereksiz yere kopartma".
+//
+// `WS_DROP_TRANSIENT=false` ile eski davranışa dönülür.
+func isDroppableFrame(messageType string) bool {
+	switch messageType {
+	case "user_typing", "group_typing", "user_status",
+		"unread_count_update", "online_users":
+		return true
+	}
+	return false
+}
+
+var dropTransientFrames = func() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("WS_DROP_TRANSIENT"))) {
+	case "false", "0", "no":
+		return false
+	}
+	return true
+}()
+
+// trySend — frame'i istemcinin kuyruğuna koymayı dener.
+//
+// `true`  → kuyruğa girdi.
+// `false` → giremedi; ya geçici olduğu için atıldı ya da bağlantı kopartıldı.
+func (c *Client) trySend(h *Hub, messageType string, payload []byte) bool {
+	select {
+	case c.Send <- payload:
+		return true
+	default:
+	}
+	if dropTransientFrames && isDroppableFrame(messageType) {
+		metrics.WSFrameDroppedTotal.WithLabelValues(messageType).Inc()
+		return false
+	}
+	c.enqueueEvict(h)
+	return false
+}
+
 // closeSend client-i təhlükəsiz (idempotent) bağlayır: `Send`-i DEYİL, `done`-u
 // bağlayır. İstənilən qədər çağırıla bilər, yalnız ilki effekt edir. `Send`
 // heç vaxt bağlanmadığı üçün ona paralel yazımlar panic verə bilməz.
@@ -484,11 +539,9 @@ func (h *Hub) broadcastUserStatus(userID uint, status string, targets []*Client)
 		return
 	}
 	for _, client := range targets {
-		select {
-		case client.Send <- payload:
-		default:
-			client.enqueueEvict(h)
-		}
+		// W3 / DM-B1: `user_status` geçici bir frame — kuyruk doluysa
+		// bağlantıyı kopartmak yerine frame atılır.
+		client.trySend(h, "user_status", payload)
 	}
 
 	// Issue 4: presence-i də instanslar ARASI et. Bura qədər yalnız BU
@@ -535,14 +588,13 @@ func (h *Hub) deliver(message *Message) {
 		return
 	}
 
-	select {
-	case client.Send <- payload:
+	// W3 / DM-B1: kuyruk doluysa geçici frame atılır, kritik frame'de
+	// bağlantı kopartılır (bak `trySend`).
+	if client.trySend(h, message.Type, payload) {
 		// Canlı new_message push-u BAĞLI alıcıya çatdısa (kanala yazıla
 		// bildi) → server tərəfdə dərhal delivered=true (WhatsApp davranışı,
-		// ani iki tick). Uğursuz göndərmə (default branch) bura düşmür.
+		// ani iki tick).
 		h.maybeMarkLivePushDelivered(message)
-	default:
-		client.enqueueEvict(h)
 	}
 }
 
@@ -681,11 +733,8 @@ func (h *Hub) SendToMultipleUsers(userIDs []uint, messageType string, data inter
 	h.mutex.RUnlock()
 
 	for _, client := range targets {
-		select {
-		case client.Send <- payload:
-		default:
-			client.enqueueEvict(h)
-		}
+		// W3 / DM-B1: geçici frame kuyruk doluysa atılır, bağlantı yaşar.
+		client.trySend(h, messageType, payload)
 	}
 
 	// Issue 4: lokal olmayan alıcılar üçün digər instanslara TƏK yayım.

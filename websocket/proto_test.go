@@ -242,3 +242,102 @@ func TestNeedsConversationUpdate(t *testing.T) {
 		t.Fatal("WS_CONV_UPDATE=all olduğu halda v2-yə göndərilmir")
 	}
 }
+
+// ── W3 / DM-B1: yavaş istemcide bağlantı kopartılmaması ────────────────────
+
+// Geçici frame listesi KİLİTLİ. Buraya kritik bir tip sızarsa mesaj sessizce
+// atılır — gerçek veri kaybı olur.
+func TestIsDroppableFrame(t *testing.T) {
+	for _, ok := range []string{"user_typing", "group_typing", "user_status",
+		"unread_count_update", "online_users"} {
+		if !isDroppableFrame(ok) {
+			t.Fatalf("%q geçici sayılmalıydı", ok)
+		}
+	}
+	// Bunlar ASLA atılamaz: atılırsa kullanıcı mesajı/onayı kaybeder.
+	for _, critical := range []string{
+		"new_message", "message_ack", "message_error", "message_duplicate",
+		"message_delivered", "message_read", "message_edited", "message_deleted",
+		"new_group_message", "conversation_update", "reaction_updated",
+	} {
+		if isDroppableFrame(critical) {
+			t.Fatalf("KRİTİK FRAME ATILABİLİR İŞARETLENMİŞ: %q — veri kaybı", critical)
+		}
+	}
+}
+
+// Kuyruk doluyken: geçici frame atılır, bağlantı YAŞAR.
+func TestTrySend_TransientDoesNotEvict(t *testing.T) {
+	h := &Hub{clients: make(map[uint]*Client), unregister: make(chan *Client, 4)}
+	c := &Client{UserID: 1, Send: make(chan []byte, 1), done: make(chan struct{})}
+	c.Send <- []byte("dolu") // kuyruk dolu
+
+	if c.trySend(h, "user_typing", []byte("x")) {
+		t.Fatal("dolu kuyruğa yazıldı?")
+	}
+	if c.evicting.Load() {
+		t.Fatal("geçici frame yüzünden bağlantı kopartıldı (W3 düzeltmesi çalışmıyor)")
+	}
+	select {
+	case <-h.unregister:
+		t.Fatal("unregister'a düştü — bağlantı kopartılıyor")
+	default:
+	}
+}
+
+// Kuyruk doluyken: kritik frame'de bağlantı kopartılır (eski davranış).
+// Sessizce atmak gerçek kayıp olurdu; kopan istemci delta-sync ile toparlar.
+func TestTrySend_CriticalEvicts(t *testing.T) {
+	h := &Hub{clients: make(map[uint]*Client), unregister: make(chan *Client, 4)}
+	c := &Client{UserID: 1, Send: make(chan []byte, 1), done: make(chan struct{})}
+	c.Send <- []byte("dolu")
+
+	if c.trySend(h, "new_message", []byte("x")) {
+		t.Fatal("dolu kuyruğa yazıldı?")
+	}
+	if !c.evicting.Load() {
+		t.Fatal("kritik frame kaybedildiği halde bağlantı kopartılmadı")
+	}
+	select {
+	case got := <-h.unregister:
+		if got != c {
+			t.Fatal("yanlış client unregister edildi")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("unregister'a hiç düşmedi")
+	}
+}
+
+// Kuyrukta yer varsa her iki tip de normal şekilde yazılır.
+func TestTrySend_HappyPath(t *testing.T) {
+	h := &Hub{clients: make(map[uint]*Client), unregister: make(chan *Client, 4)}
+	c := &Client{UserID: 1, Send: make(chan []byte, 4), done: make(chan struct{})}
+	for _, typ := range []string{"new_message", "user_typing"} {
+		if !c.trySend(h, typ, []byte("x")) {
+			t.Fatalf("%q yazılamadı", typ)
+		}
+	}
+	if c.evicting.Load() {
+		t.Fatal("boş kuyrukta bağlantı kopartıldı")
+	}
+	if len(c.Send) != 2 {
+		t.Fatalf("kuyrukta %d frame var, 2 bekleniyordu", len(c.Send))
+	}
+}
+
+// Kill-switch: `WS_DROP_TRANSIENT=false` → eski davranış (geçici frame de kopartır).
+func TestTrySend_KillSwitchRestoresOldBehaviour(t *testing.T) {
+	old := dropTransientFrames
+	dropTransientFrames = false
+	defer func() { dropTransientFrames = old }()
+
+	h := &Hub{clients: make(map[uint]*Client), unregister: make(chan *Client, 4)}
+	c := &Client{UserID: 1, Send: make(chan []byte, 1), done: make(chan struct{})}
+	c.Send <- []byte("dolu")
+
+	c.trySend(h, "user_typing", []byte("x"))
+	if !c.evicting.Load() {
+		t.Fatal("kill-switch açıkken eski davranış (kopartma) uygulanmadı")
+	}
+	<-h.unregister
+}
