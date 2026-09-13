@@ -182,6 +182,25 @@ func (h *GroupMessageHandler) SendGroupMessage(c *gin.Context) {
 		return
 	}
 
+	// 🎵 PIOUND (səs) spam-banı — YALNIZ səs mesajları. Mesaj tipi req.Text
+	// JSON-undan təyin olunur (icazə blokundakı ilə eyni məntiq). Piound-banlı
+	// istifadəçi qrupda da səs göndərə bilməz; backend-dən keçmir.
+	if models.IsPioundBannedByActions(database.DB, senderID) {
+		trimmedType := req.Text
+		if len(trimmedType) > 0 && trimmedType[0] == '{' {
+			var payload map[string]interface{}
+			if err := json.Unmarshal([]byte(trimmedType), &payload); err == nil && payload["type"] == "sound" {
+				log.Printf("🚫 PIOUND-BAN (group): sender_id=%d → conversation_id=%d səs mesajı bloklandı",
+					senderID, conversationID)
+				c.JSON(http.StatusTooManyRequests, gin.H{
+					"success": false,
+					"message": "Your account has been temporarily restricted for spam activity",
+				})
+				return
+			}
+		}
+	}
+
 	// 🔒 QRUP İCAZƏLƏRİ (admin ayarları) — bağlı əməliyyatı yalnız
 	// admin/owner edə bilər, digərləri 403 + permission_denied kodu alır.
 	// Mesaj tipi şifrələnməmiş req.Text JSON-undan təyin olunur.

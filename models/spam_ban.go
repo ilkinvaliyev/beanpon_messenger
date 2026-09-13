@@ -148,6 +148,66 @@ func IsMessagingBannedByActions(db *gorm.DB, userID uint) bool {
 	return blocked
 }
 
+// IsPioundBannedByActions — istifadəçi piound (səs) action-ı üçün banlıdırsa true.
+// Mesajlarda piound (səs) göndərməni bloklamaq üçün istifadə olunur: yalnız
+// message type == "sound" olan mesajlarda çağırılır (adi mətn mesajı bloklanmır).
+// Cache-first (paylaşılan spam_ban payload), miss halında yüngül DB fallback.
+func IsPioundBannedByActions(db *gorm.DB, userID uint) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	if payload, hit, _ := cache.GetSpamBan(ctx, userID); hit && payload != nil {
+		return payload.BlocksAction("piound")
+	}
+
+	// DB FALLBACK — cache yazmadan (kanonik messaging cache-i pozmamaq üçün).
+	type spamRow struct {
+		Actions *string `gorm:"column:actions"`
+	}
+	var rows []spamRow
+	err := db.Table("spam_bans").
+		Select("actions").
+		Where("user_id = ?", userID).
+		Where("deleted_at IS NULL").
+		Scan(&rows).Error
+	if err != nil {
+		log.Printf("IsPioundBannedByActions: spam_bans sorgusu başarısız (user_id=%d): %v", userID, err)
+		return false
+	}
+	for _, r := range rows {
+		if actionsBlocksAction(r.Actions, "piound") {
+			return true
+		}
+	}
+	return false
+}
+
+// actionsBlocksAction — `actions` JSON dəyəri verilən action-ı qadağan edirmi?
+//
+//	nil / "" / "null"        → true  (hamısı banlı)
+//	JSON массiv, action var  → true
+//	JSON массiv, action yox  → false
+func actionsBlocksAction(raw *string, action string) bool {
+	if raw == nil {
+		return true
+	}
+	trimmed := strings.TrimSpace(*raw)
+	if trimmed == "" || trimmed == "null" {
+		return true
+	}
+	var actions []string
+	if err := json.Unmarshal([]byte(trimmed), &actions); err != nil {
+		log.Printf("actionsBlocksAction: actions parse edilə bilmədi (%q): %v", trimmed, err)
+		return true
+	}
+	for _, a := range actions {
+		if strings.EqualFold(strings.TrimSpace(a), action) {
+			return true
+		}
+	}
+	return false
+}
+
 // writeSpamBanCache — DB-dən oxunan nəticəni paylaşılan Redis-ə yazır.
 // Yazma uğursuz olsa belə əsas funksionallıq pozulmur — bu sadəcə optimizasiyadır.
 func writeSpamBanCache(userID uint, payload cache.SpamBanPayload) {

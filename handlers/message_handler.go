@@ -141,6 +141,20 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 		return
 	}
 
+	// 🎵 PIOUND (səs) spam-banı — YALNIZ səs mesajları. "message" banı deyil:
+	// istifadəçi mətn/şəkil yaza bilər, amma piound (səs) göndərə bilməz.
+	// Backend-dən keçmir (DB-yə yazılmır, WS/push yox).
+	if req.Type == "sound" && req.ReceiverID != 1 &&
+		models.IsPioundBannedByActions(database.DB, senderID.(uint)) {
+		log.Printf("🚫 PIOUND-BAN: sender_id=%d → receiver_id=%d səs mesajı bloklandı",
+			senderID.(uint), req.ReceiverID)
+		c.JSON(http.StatusTooManyRequests, gin.H{
+			"success": false,
+			"message": "Your account has been temporarily restricted for spam activity",
+		})
+		return
+	}
+
 	// 🚫 SPAM SHADOW-BAN — GLOBAL (yeni VƏ mövcud conversation üçün).
 	//
 	// Yalnız `actions` sütununa baxılır. Qaydalar:
@@ -479,6 +493,10 @@ func (h *MessageHandler) BroadcastMessage(c *gin.Context) {
 		}
 		if receiverID != 1 && models.IsMessagingBannedByActions(database.DB, senderID) {
 			continue // shadow-ban: səssizcə atla
+		}
+		// 🎵 Piound (səs) spam-banı — yalnız səs mesajları bloklanır.
+		if receiverID != 1 && req.Type == "sound" && models.IsPioundBannedByActions(database.DB, senderID) {
+			continue
 		}
 		if receiverID != 1 {
 			canSend, _, cErr := conversationHandler.CanSendMessage(senderID, receiverID)

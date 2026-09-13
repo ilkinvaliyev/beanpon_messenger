@@ -37,6 +37,27 @@ func (p *SpamBanPayload) BlocksMessaging() bool {
 	return false
 }
 
+// BlocksAction — bu ban kayıt verilən action-ı (məs. "piound") qadağan edirmi?
+//
+//	banned=false                       → false
+//	banned=true, actions=nil           → true  (hamısı banlı)
+//	banned=true, actions[action var]   → true
+//	banned=true, actions var, yoxdur   → false
+func (p *SpamBanPayload) BlocksAction(action string) bool {
+	if p == nil || !p.Banned {
+		return false
+	}
+	if p.Actions == nil {
+		return true
+	}
+	for _, a := range *p.Actions {
+		if a == action {
+			return true
+		}
+	}
+	return false
+}
+
 // GetSpamBan — paylaşılan cache-dən istifadəçinin spam_ban statusunu oxuyur.
 //
 // Qaytarış semantikası:
