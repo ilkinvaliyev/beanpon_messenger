@@ -510,6 +510,16 @@ func main() {
 		// olan client-lər dərhal yenilənsin (reconnect gözləmədən).
 		internal.POST("/users/:user_id/live-spam", liveHub.SetLiveSpam)
 
+		// TƏK-CANLI-PER-USER + cihaz köçürməsi (piokio_live Join bunları çağırır).
+		// precheck: user başqa cihazda canlıdırmı (allow/transfer/blocked);
+		// transfer/request: aktiv cihaza 4-rəqəmli kod göndər;
+		// transfer/confirm: kodu doğrula → köhnə cihazı çıxar, rolu qaytar;
+		// switch: cari canlını məcburən bağla ("bağlayıb keç").
+		internal.POST("/live/precheck", liveHub.PrecheckLive)
+		internal.POST("/live/transfer/request", liveHub.RequestXfer)
+		internal.POST("/live/transfer/confirm", liveHub.ConfirmXferInternal)
+		internal.POST("/live/switch", liveHub.SwitchLiveInternal)
+
 		// 1:1 sesli arama sinyali (Laravel → online callee/caller WS).
 		internal.POST("/calls/signal", wsHub.HandleCallSignal)
 		// Çağrı bitdikdə conversation-a kalıcı "call" mesajı.

@@ -103,6 +103,12 @@ func (h *LiveHub) HandleWebSocket(c *gin.Context) {
 		Where("users.id = ?", userID).
 		Scan(&senderInfo)
 
+	// Cihaz kimliyi + platforma — tək-canlı-per-user reyestri üçün. Query-dən
+	// oxunur (?device_id=…&platform=…). DeviceID boş ola bilər (köhnə app) —
+	// belədə eyni-cihaz təyini işləməz, amma köçürmə axını yenə də təhlükəsizdir.
+	deviceID := c.Query("device_id")
+	platform := c.Query("platform")
+
 	client := &LiveRoomClient{
 		Hub:        h,
 		Conn:       conn,
@@ -116,6 +122,8 @@ func (h *LiveHub) HandleWebSocket(c *gin.Context) {
 		IsGhost:    senderInfo.IsGhost,
 		LiveSpam:   senderInfo.LiveSpam,
 		IsAdmin:    isAdmin,
+		DeviceID:   deviceID,
+		Platform:   platform,
 		Send:       make(chan []byte, 256),
 		// `done` bağlanma siqnalıdır (`Send` heç vaxt bağlanmır) — bax
 		// LiveRoomClient.closeSend.

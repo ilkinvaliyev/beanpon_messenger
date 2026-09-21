@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -68,6 +69,18 @@ type LiveRoomClient struct {
 	// otaq DƏRHAL bağlanır; qeyri-normal qopma (zəif internet / 1006 / timeout)
 	// → grace tətbiq olunur (bax scheduleHostGraceEnd). Default false = grace.
 	deliberateClose bool
+
+	// DeviceID / Platform — canlı sessiya reyestrini (tək-canlı-per-user) idarə
+	// etmək üçün: WS-ə qoşulanda query-dən oxunur (?device_id=…&platform=…).
+	// DeviceID eyni cihazın yenidən-qoşulmasını YENİ cihazdan ayırır — köçürmə
+	// (transfer) yalnız FƏRQLİ cihaz gələndə tələb olunur.
+	DeviceID string
+	Platform string
+
+	// transferring — bu client cihaz-köçürməsi (transfer) səbəbilə bağlanır.
+	// true olduqda Unregister host üçün otağı DƏRHAL bağlamır (deliberate close
+	// olsa belə) — grace planlayır ki, yeni cihaz host kimi qoşulub davam etsin.
+	transferring atomic.Bool
 }
 
 // closeSend — client-i təhlükəsiz (idempotent) bağlayır: `Send`-i DEYİL,
@@ -146,6 +159,26 @@ type LiveHub struct {
 	// `graceMu` ilə qorunur (h.mu-dan AYRI — grace callback h.mu-nu tutur).
 	hostGrace map[uint]*time.Timer
 	graceMu   sync.Mutex
+
+	// liveUsers — TƏK-CANLI-PER-USER reyestri: userID → onun cari canlı client-i
+	// (hansı otaq/rol/cihaz). `h.mu` ilə qorunur (rooms ilə eyni ömür: Register
+	// yazır, Unregister silir). piokio_live Join precheck bunu daxili API ilə
+	// oxuyur: user başqa cihazda canlıdırsa → köçürmə / blok.
+	liveUsers map[uint]*LiveRoomClient
+
+	// xfers — gözləyən cihaz-köçürmə kodları: userID → 4-rəqəmli kod qeydi.
+	// Yeni cihaz köçürmə istəyəndə yaranır (120s), təsdiqdə/ləğvdə silinir.
+	// `xferMu` ilə qorunur (h.mu-dan AYRI — qısa ömürlü, hot-path deyil).
+	xfers  map[uint]*xferEntry
+	xferMu sync.Mutex
+}
+
+// xferEntry — bir istifadəçi üçün gözləyən canlı-köçürmə kodu.
+type xferEntry struct {
+	Code      string    // 4 rəqəm
+	RoomID    uint      // hansı otağa köçürülür (cari aktiv otaq)
+	Role      string    // köçürmə anındakı rol (host/broadcaster/audience)
+	ExpiresAt time.Time // 120s
 }
 
 type LiveMessageEvent struct {
@@ -164,6 +197,8 @@ func NewLiveHub() *LiveHub {
 		Unregister:     make(chan *LiveRoomClient),
 		Broadcast:      make(chan *LiveMessageEvent),
 		hostGrace:      make(map[uint]*time.Timer),
+		liveUsers:      make(map[uint]*LiveRoomClient),
+		xfers:          make(map[uint]*xferEntry),
 	}
 }
 
@@ -277,6 +312,10 @@ func (h *LiveHub) Run() {
 				h.rooms[client.RoomID] = make(map[uint]*LiveRoomClient)
 			}
 			h.rooms[client.RoomID][client.UserID] = client
+			// Tək-canlı reyestri: bu user-in cari canlı client-i indi budur.
+			// (Cihaz köçürməsində köhnə client-i əvəz edir; onun sonrakı
+			// Unregister-i `== client` yoxlaması ilə bunu silməyəcək.)
+			h.liveUsers[client.UserID] = client
 			count := h.visibleCount(client.RoomID)
 			h.mu.Unlock()
 
@@ -367,11 +406,17 @@ func (h *LiveHub) Run() {
 			h.mu.Lock()
 			var count int
 			roomExists := false
+			// stillActive — bu client HƏQİQƏTƏN otaqdan silindimi? Cihaz
+			// köçürməsində yeni client köhnəni əvəz edir (rooms[user] artıq yeni
+			// pointer-dir); belə halda köhnə client-in gec gələn Unregister-i nə
+			// otaqdan (yenini) silməli, nə də otaq həyat dövrünə toxunmalıdır.
+			stillActive := false
 
 			if room, ok := h.rooms[client.RoomID]; ok {
-				if _, ok := room[client.UserID]; ok {
+				if cur, ok := room[client.UserID]; ok && cur == client {
 					delete(room, client.UserID)
 					client.closeSend()
+					stillActive = true
 					log.Printf("User %d left Live Room %d", client.UserID, client.RoomID)
 					// Günün Kartı: bu canlı sessiyanın müddətini istifadəçinin
 					// günlük live_seconds-una əlavə et (Bakı günlərinə bölərək).
@@ -386,7 +431,18 @@ func (h *LiveHub) Run() {
 					roomExists = false
 				}
 			}
+			// Tək-canlı reyestrindən yalnız bu client cari qeyddirsə sil (yeni
+			// cihaz artıq özünü yazıbsa toxunma).
+			if h.liveUsers[client.UserID] == client {
+				delete(h.liveUsers, client.UserID)
+			}
 			h.mu.Unlock()
+
+			// Əvəz edilmiş köhnə client-in çıxışı otaq həyat dövrünə təsir
+			// etməməlidir — yalnız həqiqətən aktiv client çıxanda davam et.
+			if !stillActive {
+				continue
+			}
 
 			// Ghost / live_spam user otaqdan ayrılanda viewer count yenilənməsi
 			// broadcast olunmur — onun olub-olmaması heç kim üçün
@@ -426,15 +482,16 @@ func (h *LiveHub) Run() {
 			}
 
 			if isRoomHost {
-				if client.deliberateClose {
+				if client.deliberateClose && !client.transferring.Load() {
 					// Host QƏSDƏN çıxdı (WS goingAway/normal close) → otağı DƏRHAL
 					// bağla, hamı çıxsın.
 					h.endLiveRoom(client.RoomID, "host_ended")
 				} else {
-					// QEYRI-NORMAL qopma (zəif internet / 1006 / ping timeout) →
-					// otağı DƏRHAL bağlama. hostGraceWindow gözlə: host geri qayıtsa
-					// (Register) grace ləğv olunur və yayın davam edir; qayıtmasa
-					// otaq bağlanır. Zəif internet artıq yayını öldürmür.
+					// QEYRI-NORMAL qopma (zəif internet / 1006 / ping timeout) VƏ YA
+					// cihaz köçürməsi (transferring) → otağı DƏRHAL bağlama.
+					// hostGraceWindow gözlə: host (köçürmədə YENİ cihaz) geri qoşulsa
+					// (Register) grace ləğv olunur və yayın davam edir; qoşulmasa
+					// otaq bağlanır. Zəif internet / cihaz keçidi yayını öldürmür.
 					h.scheduleHostGraceEnd(client.RoomID, client.UserID)
 				}
 			}
@@ -535,6 +592,14 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 	case "mafia_ready", "mafia_night_action", "mafia_vote",
 		"mafia_defense_end", "mafia_cancel":
 		h.handleMafiaEvent(event)
+		return
+	}
+
+	// Cihaz köçürməsi: aktiv cihaz "X" ilə kodu bağladı → gözləyən kodu ləğv et
+	// (yeni cihaz artıq o kodu istifadə edə bilməsin). Yalnız serverdə silinir;
+	// broadcast yoxdur (yerli UI onsuz da bağlandı).
+	if event.Type == "live_xfer_cancel" {
+		h.CancelXfer(event.SenderID)
 		return
 	}
 
