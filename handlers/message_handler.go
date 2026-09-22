@@ -32,7 +32,7 @@ type MessageHandler struct {
 		DecryptMessage(encryptedText string) (string, error)
 	}
 	wsHub interface {
-		HandleNewMessage(senderID, receiverID uint, messageID, content, msgType string, createdAt time.Time, replyToMessageID *string, storyID *uint, conversationStatus string, silent bool) // conversationStatus + silent eklendi
+		HandleNewMessage(senderID, receiverID uint, messageID, content, msgType string, createdAt time.Time, replyToMessageID *string, storyID *uint, conversationStatus string, silent bool, flashID *uint, flashThumb *string, flashExpiresAt *time.Time) // conversationStatus + silent + flash snapshot eklendi
 		HandleMessageRead(messageID string, senderID, readerID uint)
 		IsUserOnline(userID uint) bool
 		SendToUser(userID uint, messageType string, data interface{})
@@ -47,7 +47,7 @@ func NewMessageHandler(encryptionService interface {
 	EncryptMessage(plainText string) (string, error)
 	DecryptMessage(encryptedText string) (string, error)
 }, wsHub interface {
-	HandleNewMessage(senderID, receiverID uint, messageID, content, msgType string, createdAt time.Time, replyToMessageID *string, storyID *uint, conversationStatus string, silent bool) // conversationStatus + silent eklendi
+	HandleNewMessage(senderID, receiverID uint, messageID, content, msgType string, createdAt time.Time, replyToMessageID *string, storyID *uint, conversationStatus string, silent bool, flashID *uint, flashThumb *string, flashExpiresAt *time.Time) // conversationStatus + silent + flash snapshot eklendi
 	HandleMessageRead(messageID string, senderID, readerID uint)
 	IsUserOnline(userID uint) bool
 	SendToUser(userID uint, messageType string, data interface{})
@@ -90,10 +90,14 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 	}
 
 	var req struct {
-		ReceiverID       uint    `json:"receiver_id" binding:"required"`
-		Text             string  `json:"text" binding:"required"`
-		Type             string  `json:"type,omitempty"`
-		StoryID          *uint   `json:"story_id,omitempty"` // BU SATIRI EKLE
+		ReceiverID uint   `json:"receiver_id" binding:"required"`
+		Text       string `json:"text" binding:"required"`
+		Type       string `json:"type,omitempty"`
+		StoryID    *uint  `json:"story_id,omitempty"` // BU SATIRI EKLE
+		// PiPoP (Flash) cevabı — snapshot (flash messenger DB'sinde değil).
+		FlashID          *uint   `json:"flash_id,omitempty"`
+		FlashThumb       *string `json:"flash_thumb,omitempty"`
+		FlashExpiresAt   *string `json:"flash_expires_at,omitempty"` // ISO8601
 		ReplyToMessageID *string `json:"reply_to_message_id,omitempty"`
 		// Səssiz göndərmə: true olduqda qarşı tərəfə push notification GETMİR
 		// (mesaj normal çatır, WS yayılır). Opsional — köhnə client-lər
@@ -269,6 +273,14 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 		}
 	}
 
+	// PiPoP (Flash) cevabı — snapshot. expires_at ISO8601 string → time.
+	var flashExpiresAt *time.Time
+	if req.FlashExpiresAt != nil && *req.FlashExpiresAt != "" {
+		if t, e := time.Parse(time.RFC3339, *req.FlashExpiresAt); e == nil {
+			flashExpiresAt = &t
+		}
+	}
+
 	// Veritabanına kaydet
 	message := models.Message{
 		ID:               messageID,
@@ -277,6 +289,9 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 		EncryptedText:    encryptedText,
 		ReplyToMessageID: req.ReplyToMessageID,
 		StoryID:          req.StoryID,
+		FlashID:          req.FlashID,
+		FlashThumb:       req.FlashThumb,
+		FlashExpiresAt:   flashExpiresAt,
 		Read:             false,
 		CreatedAt:        time.Now().UTC(),
 		UpdatedAt:        time.Now().UTC(),
@@ -405,8 +420,9 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 		message.CreatedAt,
 		req.ReplyToMessageID, // YENİ parametre
 		req.StoryID,
-		conversationStatus, // Issue 10: sabit "active" DEYİL, gerçək status
-		req.Silent,         // səssiz göndərmə → push getməsin
+		conversationStatus,                                          // Issue 10: sabit "active" DEYİL, gerçək status
+		req.Silent,                                                  // səssiz göndərmə → push getməsin
+		message.FlashID, message.FlashThumb, message.FlashExpiresAt, // PiPoP cevabı snapshot
 	)
 
 	metrics.ObserveSince(metrics.DMSendStep, fanoutStart, "rest", "fanout")
@@ -438,8 +454,30 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 			"read":                message.Read,
 			"created_at":          message.CreatedAt,
 			"is_online":           h.wsHub.IsUserOnline(req.ReceiverID),
+			"flash":               flashObject(message.FlashID, message.FlashThumb, message.FlashExpiresAt),
 		},
 	})
+}
+
+// flashObject — PiPoP cevabı için nested `flash` gövdesi (client'a). Snapshot'tan
+// kurulur; süresi geçtiyse available=false → client yalnız "PiPoP" kartı gösterir.
+// flash_id yoksa nil (JSON'da alan çıkmaz).
+func flashObject(flashID *uint, thumb *string, expiresAt *time.Time) interface{} {
+	if flashID == nil {
+		return nil
+	}
+	available := true
+	if expiresAt != nil {
+		available = time.Now().Before(*expiresAt)
+	}
+	obj := gin.H{"id": *flashID, "available": available}
+	if thumb != nil {
+		obj["thumbnail_url"] = *thumb
+	}
+	if expiresAt != nil {
+		obj["expires_at"] = *expiresAt
+	}
+	return obj
 }
 
 // BroadcastMessage — eyni mətni bir neçə (maks 20) istifadəçiyə TOPLU göndərir.
@@ -577,6 +615,7 @@ func (h *MessageHandler) BroadcastMessage(c *gin.Context) {
 			nil,
 			convStatus,
 			req.Silent,
+			nil, nil, nil, // broadcast'ta flash yok
 		)
 
 		if h.moderationQueue != nil && (req.Type == "" || req.Type == "text") {
@@ -768,6 +807,10 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 		StoryContent         *string    `gorm:"column:story_content"`
 		StoryUserID          *uint      `gorm:"column:story_user_id"`
 		StoryCreatedAt       *time.Time `gorm:"column:story_created_at"`
+		// PiPoP (Flash) cavabı — mesaj üstündə SNAPSHOT (m.* ilə gəlir).
+		FlashID        *uint      `gorm:"column:flash_id"`
+		FlashThumb     *string    `gorm:"column:flash_thumb"`
+		FlashExpiresAt *time.Time `gorm:"column:flash_expires_at"`
 	}
 
 	// ── SORĞU FORMASI: `OR` → `UNION ALL` ───────────────────────────────────
@@ -969,6 +1012,10 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
 					"message":   "Bu story artık mevcut değil",
 				}
 			}
+		}
+
+		if msg.FlashID != nil {
+			responseMessage["flash"] = flashObject(msg.FlashID, msg.FlashThumb, msg.FlashExpiresAt)
 		}
 
 		if msg.ReplyToMessageID != nil && msg.ReplyToMessageText != nil {
@@ -1190,6 +1237,9 @@ func (h *MessageHandler) SearchMessages(c *gin.Context) {
 		StoryContent         *string    `gorm:"column:story_content"`
 		StoryUserID          *uint      `gorm:"column:story_user_id"`
 		StoryCreatedAt       *time.Time `gorm:"column:story_created_at"`
+		FlashID              *uint      `gorm:"column:flash_id"`
+		FlashThumb           *string    `gorm:"column:flash_thumb"`
+		FlashExpiresAt       *time.Time `gorm:"column:flash_expires_at"`
 	}
 
 	// VISIBILITY: pair + is_deleted_by_* CASE copied verbatim from GetMessages,
@@ -1324,6 +1374,10 @@ func (h *MessageHandler) SearchMessages(c *gin.Context) {
 						"message":   "Bu story artık mevcut değil",
 					}
 				}
+			}
+
+			if msg.FlashID != nil {
+				responseMessage["flash"] = flashObject(msg.FlashID, msg.FlashThumb, msg.FlashExpiresAt)
 			}
 
 			if msg.ReplyToMessageID != nil && msg.ReplyToMessageText != nil {
@@ -1480,6 +1534,9 @@ func (h *MessageHandler) SyncMessages(c *gin.Context) {
 		StoryContent         *string    `gorm:"column:story_content"`
 		StoryUserID          *uint      `gorm:"column:story_user_id"`
 		StoryCreatedAt       *time.Time `gorm:"column:story_created_at"`
+		FlashID              *uint      `gorm:"column:flash_id"`
+		FlashThumb           *string    `gorm:"column:flash_thumb"`
+		FlashExpiresAt       *time.Time `gorm:"column:flash_expires_at"`
 	}
 
 	// conversation_id IS NULL → yalnız DM (qrup mesajları ayrı axındır).
@@ -1676,6 +1733,10 @@ func (h *MessageHandler) SyncMessages(c *gin.Context) {
 					"message":   "Bu story artık mevcut değil",
 				}
 			}
+		}
+
+		if msg.FlashID != nil {
+			responseMessage["flash"] = flashObject(msg.FlashID, msg.FlashThumb, msg.FlashExpiresAt)
 		}
 
 		if msg.ReplyToMessageID != nil && msg.ReplyToMessageText != nil {

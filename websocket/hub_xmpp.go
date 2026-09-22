@@ -147,7 +147,7 @@ func (h *Hub) IngestDM(senderID, receiverID uint, text, kind, replyToID, storyID
 	}
 
 	// Komit olundu — indi yay. silent=false.
-	h.HandleNewMessage(senderID, receiverID, messageID, text, kind, createdAt, replyPtr, nil, conversationStatus, false)
+	h.HandleNewMessage(senderID, receiverID, messageID, text, kind, createdAt, replyPtr, nil, conversationStatus, false, nil, nil, nil)
 
 	if h.moderationEnqueue != nil && kind == "text" {
 		h.moderationEnqueue(messageID, senderID, receiverID, text, createdAt)

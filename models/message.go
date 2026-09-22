@@ -8,13 +8,20 @@ import (
 
 // Message mesaj tablosu
 type Message struct {
-	ID               string  `json:"id" gorm:"type:uuid;primary_key"`
-	SenderID         uint    `json:"sender_id" gorm:"not null;index"`
-	ReceiverID       *uint   `json:"receiver_id" gorm:"not null;index"`
-	StoryID          *uint   `json:"story_id" gorm:"index"` // BU SATIRI EKLE
-	ReplyToMessageID *string `json:"reply_to_message_id" gorm:"type:uuid;index"`
-	EncryptedText    string  `json:"encrypted_text" gorm:"type:text;not null"`
-	EncryptedAESKey  *string `json:"encrypted_aes_key" gorm:"type:text"`
+	ID         string `json:"id" gorm:"type:uuid;primary_key"`
+	SenderID   uint   `json:"sender_id" gorm:"not null;index"`
+	ReceiverID *uint  `json:"receiver_id" gorm:"not null;index"`
+	StoryID    *uint  `json:"story_id" gorm:"index"` // BU SATIRI EKLE
+	// PiPoP (Flash) cevabı — flash'lar messenger DB'sinde DEĞİL (rs_feed/maingolang)
+	// olduğu için JOIN yapılamaz; gönderim anında SNAPSHOT saklanır. Süresi
+	// (flash_expires_at) geçince client "PiPoP" kartı gösterir. Kolonlar Laravel
+	// migration ile eklenir (bu repoda AutoMigrate yok).
+	FlashID          *uint      `json:"flash_id" gorm:"index"`
+	FlashThumb       *string    `json:"flash_thumb" gorm:"type:text"`
+	FlashExpiresAt   *time.Time `json:"flash_expires_at"`
+	ReplyToMessageID *string    `json:"reply_to_message_id" gorm:"type:uuid;index"`
+	EncryptedText    string     `json:"encrypted_text" gorm:"type:text;not null"`
+	EncryptedAESKey  *string    `json:"encrypted_aes_key" gorm:"type:text"`
 	//Type             string     `json:"type" gorm:"default:'text'"`
 	IsEdited            bool       `json:"is_edited" gorm:"default:false"`
 	IsDeletedBySender   bool       `json:"is_deleted_by_sender" gorm:"default:false"`

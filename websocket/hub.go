@@ -781,7 +781,7 @@ func (h *Hub) FilterUsersInGroupChat(userIDs []uint, conversationID uint) []uint
 }
 
 // HandleNewMessage yeni mesajı handle et ve WebSocket üzerinden yayınla
-func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, msgType string, createdAt time.Time, replyToMessageID *string, storyID *uint, conversationStatus string, silent bool) {
+func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, msgType string, createdAt time.Time, replyToMessageID *string, storyID *uint, conversationStatus string, silent bool, flashID *uint, flashThumb *string, flashExpiresAt *time.Time) {
 	messageData := map[string]interface{}{
 		"id":                  messageID,
 		"sender_id":           senderID,
@@ -793,6 +793,22 @@ func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, ms
 		"read":                false,
 		"created_at":          createdAt.UTC().Format(time.RFC3339),
 		"is_history":          false,
+	}
+
+	// PiPoP (Flash) cevabı snapshot — mesajla birlikte real-time gider. Süresi
+	// (flash_expires_at) geçince client "PiPoP" kartı gösterir.
+	if flashID != nil {
+		flash := map[string]interface{}{
+			"id":        *flashID,
+			"available": flashExpiresAt == nil || time.Now().Before(*flashExpiresAt),
+		}
+		if flashThumb != nil {
+			flash["thumbnail_url"] = *flashThumb
+		}
+		if flashExpiresAt != nil {
+			flash["expires_at"] = flashExpiresAt.UTC().Format(time.RFC3339)
+		}
+		messageData["flash"] = flash
 	}
 
 	// Reply mesajı kontrolü
@@ -1804,7 +1820,7 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 
 		// Artıq commit olunub — indi yay (silent yalnız REST-də var → false).
 		fanoutStart := time.Now()
-		c.Hub.HandleNewMessage(c.UserID, receiverID, messageID, content, msgType, createdAt, replyToMessageID, storyID, conversationStatus, false)
+		c.Hub.HandleNewMessage(c.UserID, receiverID, messageID, content, msgType, createdAt, replyToMessageID, storyID, conversationStatus, false, nil, nil, nil)
 		metrics.ObserveSince(metrics.DMSendStep, fanoutStart, "ws", "fanout")
 		sendOutcome = "ok"
 

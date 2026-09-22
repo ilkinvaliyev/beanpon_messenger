@@ -130,6 +130,7 @@ func (h *Hub) HandleCallMessage(c *gin.Context) {
 		nil,
 		"active",
 		true,
+		nil, nil, nil,
 	)
 
 	c.JSON(http.StatusOK, gin.H{"message_id": message.ID})
