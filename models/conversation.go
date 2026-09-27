@@ -42,6 +42,12 @@ type Conversation struct {
 	User2MutedAt         *time.Time `json:"user2_muted_at"`
 	User1MutedUntil      *time.Time `json:"user1_muted_until"`
 	User2MutedUntil      *time.Time `json:"user2_muted_until"`
+	// Zəng səssiz (calls DnD) — per-user. A söhbətdə zəngləri səssizə alanda
+	// B A-ya zəng edəndə A-nın cihazı çalınmır (ring signal + push kəsilir);
+	// zəng "buraxılmış" kimi qeydə düşür. Laravel CallController::start bu
+	// bayrağı oxuyur.
+	User1CallsMuted bool `json:"user1_calls_muted" gorm:"default:false"`
+	User2CallsMuted bool `json:"user2_calls_muted" gorm:"default:false"`
 	// Arxiv — per-user (mute pattern-i ilə eyni). A söhbəti arxivləyəndə
 	// yalnız A-nın siyahısından gizlənir, B-də normal qalır. Üstəlik,
 	// arxivləyən şəxsə (məs. A) gələn mesajlar üçün push notification

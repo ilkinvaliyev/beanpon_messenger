@@ -319,10 +319,17 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 	conversationStatus := ""
 	persistStart := time.Now()
 	if err := database.DB.Transaction(func(tx *gorm.DB) error {
+		// PiPoP (Flash) snapshot kolonları INSERT-dən ÇIXARILIR: `messages`
+		// tablosunda bu kolonlar (flash_id/flash_thumb/flash_expires_at) hələ
+		// migration ilə əlavə olunmaya bilər. Əgər model onları hər INSERT-ə
+		// qatsa və kolon YOXDURSA, BÜTÜN mesaj göndərmələri SQL xətası ilə
+		// çökür. Ona görə əsas INSERT bu kolonlara TOXUNMUR; flash cavabı
+		// varsa aşağıda best-effort UPDATE ilə yazılır (kolon yoxdursa səssizcə
+		// atlanır — mesaj yenə də gedir).
 		res := tx.Clauses(clause.OnConflict{
 			Columns:   []clause.Column{{Name: "id"}},
 			DoNothing: true,
-		}).Create(&message)
+		}).Omit("FlashID", "FlashThumb", "FlashExpiresAt").Create(&message)
 		if res.Error != nil {
 			return res.Error
 		}
@@ -362,6 +369,22 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 		return
 	}
 	metrics.ObserveSince(metrics.DMSendStep, persistStart, "rest", "persist")
+
+	// PiPoP (Flash) snapshot — best-effort. YALNIZ yeni (təkrar olmayan) mesajda
+	// və flash cavabı varsa. Kolonlar migration ilə əlavə olunmayıbsa UPDATE
+	// xəta verir, UDULUR — mesaj onsuz da göndərildi, cavab/WS flash obyektini
+	// req dəyərlərindən onsuz da daşıyır. (Migration tətbiq olunandan sonra tam
+	// işləyir; bax MIGRATION_flash_reply.md.)
+	if duplicate == nil && req.FlashID != nil {
+		if uErr := database.DB.Model(&models.Message{}).Where("id = ?", message.ID).
+			Updates(map[string]interface{}{
+				"flash_id":         req.FlashID,
+				"flash_thumb":      req.FlashThumb,
+				"flash_expires_at": flashExpiresAt,
+			}).Error; uErr != nil {
+			log.Printf("Flash snapshot yazıla bilmədi (kolon yox ola bilər, atlanır): %v", uErr)
+		}
+	}
 
 	if duplicate != nil {
 		// ── Təkrar cəhdin ƏSL təkrar olduğunu TAM YOXLA ────────────────────
@@ -580,7 +603,9 @@ func (h *MessageHandler) BroadcastMessage(c *gin.Context) {
 		skipConvCreate := conversationHandler.ShouldSkipConversationCreate(senderID, receiverID)
 		convStatus := ""
 		if txErr := database.DB.Transaction(func(tx *gorm.DB) error {
-			if err := tx.Create(&message).Error; err != nil {
+			// Flash snapshot kolonları INSERT-dən çıxarılır (broadcast'ta flash
+			// yoxdur; kolon migration ilə əlavə olunmayıbsa çökməsin).
+			if err := tx.Omit("FlashID", "FlashThumb", "FlashExpiresAt").Create(&message).Error; err != nil {
 				return err
 			}
 			status, uErr := conversationHandler.UpdateConversationOnMessageTx(

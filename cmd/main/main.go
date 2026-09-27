@@ -76,6 +76,19 @@ func main() {
 		log.Printf("✅ conversations arxiv sütunları hazırdır")
 	}
 
+	// ✅ Conversations cədvəlinə ZƏNG SƏSSİZ (calls DnD) sütunları (idempotent,
+	// per-user). A söhbətdə zəngləri səssizə alanda B A-ya zəng edəndə A-nın
+	// cihazı çalınmır. Laravel CallController::start bu bayrağı oxuyur.
+	if err := database.DB.Exec(`
+		ALTER TABLE conversations
+		ADD COLUMN IF NOT EXISTS user1_calls_muted BOOLEAN NOT NULL DEFAULT FALSE,
+		ADD COLUMN IF NOT EXISTS user2_calls_muted BOOLEAN NOT NULL DEFAULT FALSE
+	`).Error; err != nil {
+		log.Printf("⚠️ conversations zəng-səssiz sütunları əlavə edilə bilmədi: %v", err)
+	} else {
+		log.Printf("✅ conversations zəng-səssiz sütunları hazırdır")
+	}
+
 	// ✅ Conversations cədvəlinə pin (sabitləmə) sütunlarını əlavə et
 	// (idempotent, per-user). Pin olunmuş söhbət istifadəçinin siyahısında ən
 	// yuxarı gəlir; bir neçə söhbət pin oluna bilər, pinned_at-a görə sıralanır.
@@ -374,6 +387,9 @@ func main() {
 		api.POST("/conversations/:other_user_id/mute", conversationHandler.MuteConversation)
 
 		api.POST("/conversations/:other_user_id/unmute", conversationHandler.UnmuteConversation)
+		// Zəng səssiz (calls DnD) — mesaj mute-dən ayrı.
+		api.POST("/conversations/:other_user_id/calls-mute", conversationHandler.CallsMuteConversation)
+		api.POST("/conversations/:other_user_id/calls-unmute", conversationHandler.CallsUnmuteConversation)
 		api.POST("/conversations/:other_user_id/screenshot-protection", conversationHandler.ToggleScreenshotProtection)
 		api.GET("/conversations/:other_user_id/screenshot-protection", conversationHandler.GetScreenshotProtectionStatus)
 

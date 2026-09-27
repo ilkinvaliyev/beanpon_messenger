@@ -716,6 +716,83 @@ func (h *ConversationHandler) UnmuteConversation(c *gin.Context) {
 	})
 }
 
+// CallsMuteConversation — bu söhbətdə ZƏNGLƏRİ istifadəçinin ÖZÜ üçün səssizə alır
+// (per-user DnD). A səssizə alanda B A-ya zəng edəndə A-nın cihazı çalınmır
+// (Laravel CallController::start bu bayrağı oxuyub ring signal + push kəsir).
+// Mesajların səssizə alınmasından (mute) ayrıdır.
+func (h *ConversationHandler) CallsMuteConversation(c *gin.Context) {
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	otherUserID, err := strconv.ParseUint(c.Param("other_user_id"), 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz kullanıcı ID"})
+		return
+	}
+
+	conversation, err := h.GetOrCreateConversation(userID.(uint), uint(otherUserID))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Conversation bulunamadı"})
+		return
+	}
+
+	if userID.(uint) == conversation.User1ID {
+		conversation.User1CallsMuted = true
+	} else {
+		conversation.User2CallsMuted = true
+	}
+
+	if err := database.DB.Save(conversation).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "İşlem başarısız"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":     "Bu söhbətdə zənglər səssizə alındı",
+		"calls_muted": true,
+	})
+}
+
+// CallsUnmuteConversation — bu söhbətdə zəng səsini açır (per-user).
+func (h *ConversationHandler) CallsUnmuteConversation(c *gin.Context) {
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	otherUserID, err := strconv.ParseUint(c.Param("other_user_id"), 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Geçersiz kullanıcı ID"})
+		return
+	}
+
+	conversation, err := h.GetOrCreateConversation(userID.(uint), uint(otherUserID))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Conversation bulunamadı"})
+		return
+	}
+
+	if userID.(uint) == conversation.User1ID {
+		conversation.User1CallsMuted = false
+	} else {
+		conversation.User2CallsMuted = false
+	}
+
+	if err := database.DB.Save(conversation).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "İşlem başarısız"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":     "Bu söhbətdə zəng səsi açıldı",
+		"calls_muted": false,
+	})
+}
+
 // ArchiveConversation — söhbəti istifadəçinin ÖZÜ üçün arxivləyir (per-user).
 // A arxivləyəndə yalnız A-nın siyahısından gizlənir; B-də normal qalır.
 // Arxivləyən şəxsə gələn mesajlar üçün push notification göndərilmir
@@ -1117,6 +1194,7 @@ func (h *ConversationHandler) GetConversationDetails(c *gin.Context) {
 
 	var myMessageCount, otherMessageCount int
 	var isMutedByMe, amIRestricted, isOtherMuted, isOtherRestricted bool
+	var callsMutedByMe bool // bu söhbətdə zənglər mənim üçün səssizdir (DnD)
 
 	if userID.(uint) == conversation.User1ID {
 		myMessageCount = conversation.User1MessageCount
@@ -1125,6 +1203,7 @@ func (h *ConversationHandler) GetConversationDetails(c *gin.Context) {
 		amIRestricted = conversation.User1Restricted
 		isOtherMuted = conversation.User2Muted
 		isOtherRestricted = conversation.User2Restricted
+		callsMutedByMe = conversation.User1CallsMuted
 	} else {
 		myMessageCount = conversation.User2MessageCount
 		otherMessageCount = conversation.User1MessageCount
@@ -1132,6 +1211,7 @@ func (h *ConversationHandler) GetConversationDetails(c *gin.Context) {
 		amIRestricted = conversation.User2Restricted
 		isOtherMuted = conversation.User1Muted
 		isOtherRestricted = conversation.User1Restricted
+		callsMutedByMe = conversation.User2CallsMuted
 	}
 
 	if amIRestricted {
@@ -1243,6 +1323,7 @@ func (h *ConversationHandler) GetConversationDetails(c *gin.Context) {
 			"can_send_message":     canSendMessage,
 			"stop_message_reason":  stopMessageReason,
 			"is_muted_by_me":       isMutedByMe,
+			"calls_muted_by_me":    callsMutedByMe,
 			"am_i_restricted":      amIRestricted,
 			"is_other_muted":       isOtherMuted,
 			"is_other_restricted":  isOtherRestricted,
