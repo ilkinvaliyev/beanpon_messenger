@@ -251,6 +251,14 @@ type Hub struct {
 	// NEW (XMPP) recipients while OLD recipients keep the legacy WS path. See
 	// xmpp/WIRING.md.
 	xmpp *xmpp.Bridge
+
+	// callMsgIDs — çağrı balonu mesajları üçün call_id → message_id xəritəsi.
+	// Zəng BAŞLAYANDA (start) bir "call" mesajı yaranır; zəng BİTƏNDƏ (end/
+	// reject/cancel) həmin mesaj call_id ilə tapılıb YENİLƏNİR (yeni sətir yox).
+	// Qısa-ömürlü (bir zəng sessiyası boyu). messenger yenidən başlasa mapping
+	// itər → end insert edər (nadir kənar hal, zərərsiz).
+	callMsgMu  sync.Mutex
+	callMsgIDs map[string]string
 }
 
 // SetModerationEnqueue — WS axını üçün moderasiya enqueue callback-ini bağlayır.
@@ -304,6 +312,7 @@ func NewHub(db *gorm.DB, encryptionService interface {
 		encryptionService: encryptionService,
 		httpClient:        &http.Client{Timeout: 10 * time.Second}, // ← YENI
 		config:            config,                                  // ← YENI
+		callMsgIDs:        make(map[string]string),                 // call_id → message_id
 	}
 }
 
