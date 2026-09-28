@@ -1828,8 +1828,13 @@ func (c *Client) handleIncomingMessage(msg *IncomingMessage) {
 		}
 
 		// Artıq commit olunub — indi yay (silent yalnız REST-də var → false).
+		// İSTİSNA: `type=call` (zəng balonu mesajı) üçün ASLA push GETMƏSİN —
+		// zəngin öz bildirişi (call_incoming VoIP/FCM) onsuz da gedir; ayrıca
+		// "yeni mesaj" push-u (içində {type:call,...} JSON görünən) getməməlidir.
+		// silent=true → DB + WS + conversation update olur, amma push YOX.
+		silentSend := (msgType == "call")
 		fanoutStart := time.Now()
-		c.Hub.HandleNewMessage(c.UserID, receiverID, messageID, content, msgType, createdAt, replyToMessageID, storyID, conversationStatus, false, nil, nil, nil)
+		c.Hub.HandleNewMessage(c.UserID, receiverID, messageID, content, msgType, createdAt, replyToMessageID, storyID, conversationStatus, silentSend, nil, nil, nil)
 		metrics.ObserveSince(metrics.DMSendStep, fanoutStart, "ws", "fanout")
 		sendOutcome = "ok"
 
