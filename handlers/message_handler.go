@@ -2604,6 +2604,9 @@ func (h *MessageHandler) GetConversations(c *gin.Context) {
 				"allow_voice_messages": conv.AllowVoiceMessages,
 				"show_read_receipts":   conv.ShowReadReceipts,
 				"blocked":              isBlocked,
+				// Qarşı tərəf (peer, çağırılan) zəngləri MƏNDƏN qəbul edirmi —
+				// client zəng düyməsini bura görə gizlədir (chat açılanda oxuyur).
+				"peer_receive_calls": effectivePeerReceiveCalls(database.DB, conv.OtherUserID, userID.(uint)),
 			},
 		}
 

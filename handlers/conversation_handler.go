@@ -1315,6 +1315,10 @@ func (h *ConversationHandler) GetConversationDetails(c *gin.Context) {
 	}
 	voicePermissionForOther := EffectiveAllowVoice(userID.(uint), uint(otherUserID), myVoiceGlobal)
 
+	// Qarşı tərəf (peer=B, çağırılan) zəngləri MƏNDƏN (caller=A) qəbul edirmi.
+	// Client bunu false görəndə çat ekranında zəng düyməsini gizlədir.
+	peerReceiveCalls := effectivePeerReceiveCalls(database.DB, uint(otherUserID), userID.(uint))
+
 	responseData := gin.H{
 		"conversation": gin.H{
 			"id":                   conversation.ID,
@@ -1324,6 +1328,7 @@ func (h *ConversationHandler) GetConversationDetails(c *gin.Context) {
 			"stop_message_reason":  stopMessageReason,
 			"is_muted_by_me":       isMutedByMe,
 			"calls_muted_by_me":    callsMutedByMe,
+			"peer_receive_calls":   peerReceiveCalls,
 			"am_i_restricted":      amIRestricted,
 			"is_other_muted":       isOtherMuted,
 			"is_other_restricted":  isOtherRestricted,
