@@ -43,11 +43,10 @@ func (h *RoomHandler) SendRoomMessage(c *gin.Context) {
 		return
 	}
 
-	// Tək-klik join: yazan avtomatik üzv.
-	if err := h.ensureMember(roomID, userID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Qoşulma alınmadı"})
-		return
-	}
+	// Tək-klik join: yazan avtomatik üzv. BEST-EFFORT — mesaj göndərməni
+	// bloklamır. Üzvlük yazısı alınmasa belə mesaj gedir (ensureMember özü
+	// uğursuzluğu loglayır). Owner/mövcud üzv üçün onsuz da no-op-dur.
+	_ = h.ensureMember(roomID, userID)
 
 	encryptedText, err := h.encryptionService.EncryptMessage(req.Text)
 	if err != nil {

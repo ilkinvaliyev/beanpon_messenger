@@ -79,7 +79,17 @@ func (m RoomMember) HasAdminAccess() bool { return m.Role == "owner" || m.Role =
 type CreateRoomRequest struct {
 	Name           string  `json:"name" binding:"required,min=1,max=255"`
 	Description    *string `json:"description"`
+	Avatar         *string `json:"avatar"`          // S3 yolu (client upload-media ilə yükləyir)
 	HistoryVisible *bool   `json:"history_visible"` // nil → default true
+}
+
+// UpdateRoomRequest — admin otaq redaktəsi (ad/təsvir/avatar/tarixçə).
+// Hər sahə opsionaldır (nil = dəyişmə).
+type UpdateRoomRequest struct {
+	Name           *string `json:"name"`
+	Description    *string `json:"description"`
+	Avatar         *string `json:"avatar"`
+	HistoryVisible *bool   `json:"history_visible"`
 }
 
 type RoomResponse struct {

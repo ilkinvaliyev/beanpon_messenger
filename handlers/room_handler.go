@@ -141,6 +141,7 @@ func (h *RoomHandler) CreateRoom(c *gin.Context) {
 		OwnerID:        userID,
 		Name:           req.Name,
 		Description:    req.Description,
+		Avatar:         req.Avatar,
 		HistoryVisible: historyVisible,
 		JoinCount:      1,
 		LastActivityAt: &now,
@@ -330,6 +331,57 @@ func (h *RoomHandler) FreezeRoom(c *gin.Context) {
 		"room_id": roomID, "frozen": body.Frozen,
 	})
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "frozen": body.Frozen})
+}
+
+// UpdateRoom — PUT /api/v1/rooms/:room_id. Admin otaq redaktəsi (ad/təsvir/
+// avatar/tarixçə). Yalnız göndərilən (non-nil) sahələr dəyişir.
+func (h *RoomHandler) UpdateRoom(c *gin.Context) {
+	userID := c.MustGet("user_id").(uint)
+	roomID := parseRoomID(c)
+	if !h.requireAdmin(c, roomID, userID) {
+		return
+	}
+	var req models.UpdateRoomRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Yanlış məlumat"})
+		return
+	}
+
+	updates := map[string]interface{}{}
+	if req.Name != nil && *req.Name != "" {
+		updates["name"] = *req.Name
+	}
+	if req.Description != nil {
+		updates["description"] = *req.Description
+	}
+	if req.Avatar != nil {
+		updates["avatar"] = *req.Avatar
+	}
+	if req.HistoryVisible != nil {
+		updates["history_visible"] = *req.HistoryVisible
+	}
+	if len(updates) > 0 {
+		database.DB.Model(&models.ChatRoom{}).Where("id = ?", roomID).Updates(updates)
+	}
+
+	var room models.ChatRoom
+	if err := database.DB.First(&room, roomID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Otaq tapılmadı"})
+		return
+	}
+	role := roomMembership(roomID, userID)
+	var rolePtr *string
+	if role != nil {
+		rolePtr = &role.Role
+	}
+	// Üzvlərə WS bildir (client başlıq/avatar yeniləsin).
+	h.wsHub.SendToMultipleUsers(h.roomMemberIDs(roomID), "room_updated", gin.H{
+		"room_id":     roomID,
+		"name":        room.Name,
+		"description": room.Description,
+		"avatar":      room.Avatar,
+	})
+	c.JSON(http.StatusOK, gin.H{"data": h.toRoomResponse(room, rolePtr, role != nil)})
 }
 
 // DELETE /api/v1/rooms/:room_id — otağı sil (yalnız owner).

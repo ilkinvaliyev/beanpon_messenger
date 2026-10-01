@@ -430,6 +430,7 @@ func main() {
 		api.GET("/rooms/my", roomHandler.GetMyRooms) // Söhbətlər siyahısı (join olunmuşlar)
 		api.POST("/rooms", roomHandler.CreateRoom)
 		api.GET("/rooms/:room_id", roomHandler.GetRoom)
+		api.PUT("/rooms/:room_id", roomHandler.UpdateRoom) // admin redaktə (ad/təsvir/avatar)
 		api.POST("/rooms/:room_id/join", roomHandler.JoinRoom)
 		api.POST("/rooms/:room_id/leave", roomHandler.LeaveRoom)
 		api.POST("/rooms/:room_id/freeze", roomHandler.FreezeRoom)
