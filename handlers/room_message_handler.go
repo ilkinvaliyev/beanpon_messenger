@@ -1,0 +1,309 @@
+package handlers
+
+import (
+	"net/http"
+	"time"
+
+	"beanpon_messenger/database"
+	"beanpon_messenger/models"
+
+	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+// SendRoomMessage — POST /api/v1/rooms/:room_id/messages
+// Tək-klik join: yazmaq istəyən avtomatik üzv olur. Guest yaza bilməz, donmuş
+// otağa yazılmaz. Reply + two-way block dəstəklənir.
+func (h *RoomHandler) SendRoomMessage(c *gin.Context) {
+	userID := c.MustGet("user_id").(uint)
+	if isGuest(userID) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Qonaq hesab yaza bilməz", "code": "GUEST_FORBIDDEN"})
+		return
+	}
+	roomID := parseRoomID(c)
+
+	var room models.ChatRoom
+	if err := database.DB.First(&room, roomID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Otaq tapılmadı"})
+		return
+	}
+	if room.IsFrozen {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Otaq dondurulub", "code": "ROOM_FROZEN"})
+		return
+	}
+
+	var req struct {
+		Text             string  `json:"text" binding:"required,min=1"`
+		ReplyToMessageID *string `json:"reply_to_message_id"`
+		ClientMessageID  *string `json:"client_message_id"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Mətn tələb olunur"})
+		return
+	}
+
+	// Tək-klik join: yazan avtomatik üzv.
+	if err := h.ensureMember(roomID, userID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Qoşulma alınmadı"})
+		return
+	}
+
+	encryptedText, err := h.encryptionService.EncryptMessage(req.Text)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Şifrələmə xətası"})
+		return
+	}
+
+	messageID := req.ClientMessageID
+	if messageID == nil || *messageID == "" {
+		id := newRoomMessageID()
+		messageID = &id
+	}
+	now := time.Now()
+
+	message := models.Message{
+		ID:               *messageID,
+		SenderID:         userID,
+		RoomID:           &roomID,
+		ReplyToMessageID: req.ReplyToMessageID,
+		EncryptedText:    encryptedText,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}
+
+	createRes := database.DB.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "id"}},
+		DoNothing: true,
+	}).Create(&message)
+	if createRes.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Mesaj saxlanılmadı"})
+		return
+	}
+	if createRes.RowsAffected == 0 {
+		// Təkrar göndərmə — sayğac/WS təkrarlanmır.
+		c.JSON(http.StatusOK, gin.H{"message": "göndərildi", "duplicate": true, "data": gin.H{"id": *messageID}})
+		return
+	}
+
+	// Sayğac + son aktivlik + skor.
+	database.DB.Model(&models.ChatRoom{}).Where("id = ?", roomID).Updates(map[string]interface{}{
+		"message_count":    gorm.Expr("message_count + 1"),
+		"last_activity_at": now,
+	})
+	h.bumpScore(roomID)
+
+	// Göndərənin məlumatı (WS yük üçün).
+	var sender models.User
+	database.DB.First(&sender, userID)
+
+	// WS fan-out — otaq üzvlərinə. Block filtri alıcı tərəfdə (client) deyil,
+	// burada tətbiq olunur: göndərənlə block əlaqəsi olan üzvə göndərmə.
+	payload := gin.H{
+		"id":                  *messageID,
+		"room_id":             roomID,
+		"sender_id":           userID,
+		"sender_name":         sender.Name,
+		"sender_username":     sender.Username,
+		"sender_avatar":       sender.ProfileImage,
+		"sender_verified":     sender.IsVerified,
+		"text":                req.Text,
+		"reply_to_message_id": req.ReplyToMessageID,
+		"created_at":          now.UTC().Format(time.RFC3339),
+	}
+	for _, mid := range h.roomMemberIDsExcludingBlocked(roomID, userID) {
+		if mid == userID {
+			continue
+		}
+		h.wsHub.SendToUser(mid, "new_room_message", payload)
+	}
+
+	// Push bildirişi — JOIN olmuş, muted OLMAYAN, bloklu olmayan üzvlərə (group
+	// chat paritesi). Qrupun push helper-i təkrar istifadə olunur. Gecikmə ilə
+	// (10s) göndərilir ki, istifadəçi onlayn görübsə təkrar bildiriş olmasın.
+	pushTargets := h.roomPushTargets(roomID, userID)
+	if len(pushTargets) > 0 {
+		h.wsHub.ScheduleGroupPushNotification(
+			roomID, userID, room.Name, req.Text, *messageID,
+			pushTargets, 10*time.Second,
+		)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "göndərildi", "data": payload})
+}
+
+// GetRoomMessages — GET /api/v1/rooms/:room_id/messages
+// Two-way block filtri + reply-erişim kartı + history_visible (yeni üzv köhnə
+// mesajları görməsin seçimi). Guest oxuya bilməz.
+func (h *RoomHandler) GetRoomMessages(c *gin.Context) {
+	userID := c.MustGet("user_id").(uint)
+	if isGuest(userID) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Qonaq hesab", "code": "GUEST_FORBIDDEN"})
+		return
+	}
+	roomID := parseRoomID(c)
+
+	var room models.ChatRoom
+	if err := database.DB.First(&room, roomID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Otaq tapılmadı"})
+		return
+	}
+	if room.IsFrozen {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Otaq dondurulub", "code": "ROOM_FROZEN"})
+		return
+	}
+
+	limit := 40
+	if v := c.Query("limit"); v != "" {
+		if n, e := atoiPos(v); e && n > 0 && n <= 100 {
+			limit = n
+		}
+	}
+	// history_visible=false isə: istifadəçi yalnız öz join-dən sonrakıları görür.
+	joinedFilter := "'1970-01-01'::timestamptz"
+	var joinedArg interface{} = time.Unix(0, 0)
+	if !room.HistoryVisible {
+		if mem := roomMembership(roomID, userID); mem != nil && mem.JoinedAt != nil {
+			joinedArg = *mem.JoinedAt
+		}
+	}
+	_ = joinedFilter
+
+	type row struct {
+		ID             string
+		SenderID       uint
+		SenderName     string
+		SenderUsername string
+		SenderAvatar   *string
+		SenderVerified bool
+		EncryptedText  string
+		ReplyToID      *string
+		ReplyEnc       *string
+		ReplySender    *string
+		ReplyDeleted   *bool
+		ReplyBlocked   *bool
+		CreatedAt      time.Time
+	}
+	var rows []row
+
+	// İki yönlü block: block olan göndərənin mesajları gizlənir.
+	// Reply: reply edilən mesaj block/silinmişsə ReplyBlocked=true.
+	database.DB.Raw(`
+		SELECT
+			m.id,
+			m.sender_id,
+			u.name AS sender_name,
+			u.username AS sender_username,
+			u.profile_image AS sender_avatar,
+			u.is_verified AS sender_verified,
+			m.encrypted_text,
+			m.reply_to_message_id AS reply_to_id,
+			reply.encrypted_text AS reply_enc,
+			reply_u.username AS reply_sender,
+			(reply.id IS NOT NULL AND reply.deleted_at IS NOT NULL) AS reply_deleted,
+			(reply.id IS NOT NULL AND EXISTS (
+				SELECT 1 FROM user_blocks ub
+				WHERE (ub.blocker_id = ? AND ub.blocked_id = reply.sender_id)
+				   OR (ub.blocker_id = reply.sender_id AND ub.blocked_id = ?)
+			)) AS reply_blocked,
+			m.created_at
+		FROM messages m
+		JOIN users u ON u.id = m.sender_id
+		LEFT JOIN messages reply ON reply.id = m.reply_to_message_id
+		LEFT JOIN users reply_u ON reply_u.id = reply.sender_id
+		WHERE m.room_id = ?
+		  AND m.deleted_at IS NULL
+		  AND m.created_at >= ?
+		  AND NOT EXISTS (
+		      SELECT 1 FROM user_blocks ub
+		      WHERE (ub.blocker_id = ? AND ub.blocked_id = m.sender_id)
+		         OR (ub.blocker_id = m.sender_id AND ub.blocked_id = ?)
+		  )
+		ORDER BY m.created_at DESC, m.id DESC
+		LIMIT ?
+	`, userID, userID, roomID, joinedArg, userID, userID, limit).Scan(&rows)
+
+	out := make([]models.RoomMessageResponse, 0, len(rows))
+	for _, r := range rows {
+		text, _ := h.encryptionService.DecryptMessage(r.EncryptedText)
+		item := models.RoomMessageResponse{
+			ID:             r.ID,
+			RoomID:         roomID,
+			SenderID:       r.SenderID,
+			SenderName:     r.SenderName,
+			SenderUsername: r.SenderUsername,
+			SenderAvatar:   r.SenderAvatar,
+			SenderVerified: r.SenderVerified,
+			Text:           text,
+			ReplyToID:      r.ReplyToID,
+			CreatedAt:      r.CreatedAt,
+		}
+		// Reply kartı: block/silinmiş → "erişiminiz yoxdur" (mətn boş, blocked=true).
+		if r.ReplyToID != nil {
+			blocked := (r.ReplyBlocked != nil && *r.ReplyBlocked) || (r.ReplyDeleted != nil && *r.ReplyDeleted)
+			if blocked || r.ReplyEnc == nil {
+				item.ReplyBlocked = true
+			} else {
+				rt, _ := h.encryptionService.DecryptMessage(*r.ReplyEnc)
+				item.ReplyText = &rt
+				item.ReplySender = r.ReplySender
+			}
+		}
+		out = append(out, item)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"data": out})
+}
+
+// DELETE /api/v1/rooms/:room_id/messages/:message_id — mesaj sil
+// (owner|admin hər kəsinkini silə bilər; göndərən özününkünü silə bilər).
+func (h *RoomHandler) DeleteRoomMessage(c *gin.Context) {
+	userID := c.MustGet("user_id").(uint)
+	roomID := parseRoomID(c)
+	messageID := c.Param("message_id")
+
+	var msg models.Message
+	if err := database.DB.Where("id = ? AND room_id = ?", messageID, roomID).First(&msg).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Mesaj tapılmadı"})
+		return
+	}
+	mem := roomMembership(roomID, userID)
+	canDelete := msg.SenderID == userID || (mem != nil && mem.HasAdminAccess())
+	if !canDelete {
+		c.JSON(http.StatusForbidden, gin.H{"error": "İcazə yoxdur"})
+		return
+	}
+	database.DB.Delete(&models.Message{}, "id = ?", messageID)
+	h.wsHub.SendToMultipleUsers(h.roomMemberIDs(roomID), "room_message_deleted", gin.H{
+		"room_id": roomID, "message_id": messageID,
+	})
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+// roomMemberIDsExcludingBlocked — WS fan-out üçün üzvlər; göndərənlə iki yönlü
+// block əlaqəsi olanlar çıxarılır (mesaj onlara çatmasın).
+func (h *RoomHandler) roomMemberIDsExcludingBlocked(roomID, senderID uint) []uint {
+	var ids []uint
+	database.DB.Raw(`
+		SELECT rm.user_id FROM room_members rm
+		WHERE rm.room_id = ?
+		  AND NOT EXISTS (
+		      SELECT 1 FROM user_blocks ub
+		      WHERE (ub.blocker_id = rm.user_id AND ub.blocked_id = ?)
+		         OR (ub.blocker_id = ? AND ub.blocked_id = rm.user_id)
+		  )
+	`, roomID, senderID, senderID).Scan(&ids)
+	return ids
+}
+
+// atoiPos — kiçik köməkçi (strconv importunu bu faylda saxlamamaq üçün).
+func atoiPos(s string) (int, bool) {
+	n := 0
+	for _, ch := range s {
+		if ch < '0' || ch > '9' {
+			return 0, false
+		}
+		n = n*10 + int(ch-'0')
+	}
+	return n, true
+}

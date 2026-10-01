@@ -244,6 +244,7 @@ func main() {
 	conversationHandler := handlers.NewConversationHandler(wsHub, encryptionService)
 	groupHandler := handlers.NewGroupHandler(wsHub, encryptionService)
 	groupMsgHandler := handlers.NewGroupMessageHandler(encryptionService, wsHub)
+	roomHandler := handlers.NewRoomHandler(wsHub, encryptionService)
 	raveHandler := handlers.NewRaveHandler(raveHub) // ← YENİ
 
 	// Voice/media upload — Laravel MessageController::uploadVoice/uploadMedia portu.
@@ -422,6 +423,29 @@ func main() {
 		// Qrup icazələri (admin: mesaj/media/gif/səs/circle-video aç-bağla)
 		api.GET("/groups/:conversation_id/permissions", groupHandler.GetGroupPermissions)
 		api.PUT("/groups/:conversation_id/permissions", groupHandler.UpdateGroupPermissions)
+
+		// ── ROOMS: açıq (public) söhbət otaqları ─────────────────────────
+		// Oxumaq üçün üzvlük yoxdur; yazmaq üçün tək-klik join. Guest olmaz.
+		api.GET("/rooms", roomHandler.ListRooms)
+		api.GET("/rooms/my", roomHandler.GetMyRooms) // Söhbətlər siyahısı (join olunmuşlar)
+		api.POST("/rooms", roomHandler.CreateRoom)
+		api.GET("/rooms/:room_id", roomHandler.GetRoom)
+		api.POST("/rooms/:room_id/join", roomHandler.JoinRoom)
+		api.POST("/rooms/:room_id/leave", roomHandler.LeaveRoom)
+		api.POST("/rooms/:room_id/freeze", roomHandler.FreezeRoom)
+		api.DELETE("/rooms/:room_id", roomHandler.DeleteRoom)
+		api.PUT("/rooms/:room_id/admin/:user_id", roomHandler.SetAdmin)
+		api.GET("/rooms/:room_id/messages", roomHandler.GetRoomMessages)
+		api.POST("/rooms/:room_id/messages", roomHandler.SendRoomMessage)
+		api.DELETE("/rooms/:room_id/messages/:message_id", roomHandler.DeleteRoomMessage)
+		// Per-user Söhbətlər-siyahısı əməliyyatları (group chat paritesi).
+		api.POST("/rooms/:room_id/mark-read", roomHandler.MarkRoomRead)
+		api.POST("/rooms/:room_id/mute", roomHandler.MuteRoom)
+		api.POST("/rooms/:room_id/unmute", roomHandler.UnmuteRoom)
+		api.POST("/rooms/:room_id/archive", roomHandler.ArchiveRoom)
+		api.POST("/rooms/:room_id/unarchive", roomHandler.UnarchiveRoom)
+		api.POST("/rooms/:room_id/pin", roomHandler.PinRoom)
+		api.POST("/rooms/:room_id/unpin", roomHandler.UnpinRoom)
 
 		// ── GROUP: Mesajlar ──────────────────────────────────────────────
 		api.POST("/groups/:conversation_id/messages", groupMsgHandler.SendGroupMessage)
