@@ -76,11 +76,26 @@ func (h *RoomHandler) SendRoomMessage(c *gin.Context) {
 		DoNothing: true,
 	}).Create(&message)
 	if createRes.Error != nil {
+		// GERÇEK DB hatasını logla (room_id kolonu yoxdursa / NOT NULL pozuntusu
+		// burada görünəcək — "mesaj gedir amma qalmır" probleminin kökü).
+		log.Printf("[Room] message INSERT FAILED room=%d user=%d id=%s: %v",
+			roomID, userID, *messageID, createRes.Error)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Mesaj saxlanılmadı"})
 		return
 	}
 	if createRes.RowsAffected == 0 {
-		// Təkrar göndərmə — sayğac/WS təkrarlanmır.
+		// RowsAffected==0: ya həqiqi təkrar (eyni id), ya da conflict target
+		// uyğun gəlmədi. Təkrar olub-olmadığını DB-dən yoxla — əks halda mesaj
+		// "göndərildi" görünür amma əslində YAZILMAYIB (istifadəçinin şikayəti).
+		var exists int64
+		database.DB.Model(&models.Message{}).Where("id = ?", *messageID).Count(&exists)
+		if exists == 0 {
+			log.Printf("[Room] message NOT PERSISTED (0 rows, not a dup) room=%d user=%d id=%s",
+				roomID, userID, *messageID)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Mesaj saxlanılmadı"})
+			return
+		}
+		// Həqiqi təkrar göndərmə — sayğac/WS təkrarlanmır.
 		c.JSON(http.StatusOK, gin.H{"message": "göndərildi", "duplicate": true, "data": gin.H{"id": *messageID}})
 		return
 	}
