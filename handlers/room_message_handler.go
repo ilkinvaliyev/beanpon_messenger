@@ -109,7 +109,9 @@ func (h *RoomHandler) SendRoomMessage(c *gin.Context) {
 		"sender_verified":     sender.IsVerified,
 		"text":                req.Text,
 		"reply_to_message_id": req.ReplyToMessageID,
-		"created_at":          now.UTC().Format(time.RFC3339),
+		// Group chat paritesi — client null-ı pozuq sayır, boş massiv ver.
+		"reactions":  []gin.H{},
+		"created_at": now.UTC().Format(time.RFC3339),
 	}
 	for _, mid := range h.roomMemberIDsExcludingBlocked(roomID, userID) {
 		if mid == userID {
@@ -223,9 +225,37 @@ func (h *RoomHandler) GetRoomMessages(c *gin.Context) {
 		LIMIT ?
 	`, userID, userID, roomID, joinedArg, userID, userID, limit).Scan(&rows)
 
+	// Reaksiyalar — N+1 yox: səhifədəki bütün mesaj id-ləri üçün BİR sorğu,
+	// sonra Go-da map ilə mesajlara paylanır (group GetGroupMessages ikizi).
+	reactionsByMessage := map[string][]models.RoomReaction{}
+	if len(rows) > 0 {
+		msgIDs := make([]string, 0, len(rows))
+		for _, r := range rows {
+			msgIDs = append(msgIDs, r.ID)
+		}
+		var reactionRows []struct {
+			MessageID string `gorm:"column:message_id"`
+			UserID    uint   `gorm:"column:user_id"`
+			Emoji     string `gorm:"column:emoji"`
+		}
+		database.DB.Raw(`
+			SELECT message_id, user_id, emoji
+			FROM room_message_reactions
+			WHERE message_id IN (?)
+		`, msgIDs).Scan(&reactionRows)
+		for _, rr := range reactionRows {
+			reactionsByMessage[rr.MessageID] = append(reactionsByMessage[rr.MessageID],
+				models.RoomReaction{UserID: rr.UserID, Emoji: rr.Emoji})
+		}
+	}
+
 	out := make([]models.RoomMessageResponse, 0, len(rows))
 	for _, r := range rows {
 		text, _ := h.encryptionService.DecryptMessage(r.EncryptedText)
+		reactions := reactionsByMessage[r.ID]
+		if reactions == nil {
+			reactions = []models.RoomReaction{}
+		}
 		item := models.RoomMessageResponse{
 			ID:             r.ID,
 			RoomID:         roomID,
@@ -236,6 +266,7 @@ func (h *RoomHandler) GetRoomMessages(c *gin.Context) {
 			SenderVerified: r.SenderVerified,
 			Text:           text,
 			ReplyToID:      r.ReplyToID,
+			Reactions:      reactions,
 			CreatedAt:      r.CreatedAt,
 		}
 		// Reply kartı: block/silinmiş → "erişiminiz yoxdur" (mətn boş, blocked=true).
@@ -253,6 +284,88 @@ func (h *RoomHandler) GetRoomMessages(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"data": out})
+}
+
+// SetRoomReaction — POST /api/v1/rooms/:room_id/messages/:message_id/reaction
+// Per-user emoji reaksiya toggle (group SetGroupReaction ikizi). Eyni emoji →
+// sil; fərqli → əvəzlə; yoxdursa → əlavə et. Bütün otaq üzvlərinə
+// room_reaction_updated WS event-i (block filtrli — bloklu göndərənə getmir).
+func (h *RoomHandler) SetRoomReaction(c *gin.Context) {
+	userID := c.MustGet("user_id").(uint)
+	if isGuest(userID) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Qonaq hesab", "code": "GUEST_FORBIDDEN"})
+		return
+	}
+	roomID := parseRoomID(c)
+	messageID := c.Param("message_id")
+
+	var body struct {
+		Emoji string `json:"emoji" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "emoji tələb olunur"})
+		return
+	}
+
+	// Mesaj bu otağa aiddirmi?
+	var msg models.Message
+	if err := database.DB.Where("id = ? AND room_id = ?", messageID, roomID).First(&msg).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Mesaj tapılmadı"})
+		return
+	}
+
+	now := time.Now()
+	// Mövcud reaksiyaya bax — eyni emoji isə toggle (sil).
+	var existing struct {
+		Emoji *string `gorm:"column:emoji"`
+	}
+	database.DB.Raw(`
+		SELECT emoji FROM room_message_reactions
+		WHERE message_id = ? AND user_id = ?
+	`, messageID, userID).Scan(&existing)
+
+	// WS fan-out üçün üzvlər (block filtrli, group chat paritesi).
+	targets := h.roomMemberIDsExcludingBlocked(roomID, userID)
+
+	if existing.Emoji != nil && *existing.Emoji == body.Emoji {
+		if err := database.DB.Exec(`
+			DELETE FROM room_message_reactions
+			WHERE message_id = ? AND user_id = ?
+		`, messageID, userID).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Reaksiya silinmədi"})
+			return
+		}
+		removedPayload := gin.H{
+			"room_id":    roomID,
+			"message_id": messageID,
+			"user_id":    userID,
+			"emoji":      nil,
+			"action":     "removed",
+		}
+		h.wsHub.SendToMultipleUsers(targets, "room_reaction_updated", removedPayload)
+		c.JSON(http.StatusOK, gin.H{"message": "Reaksiya silindi", "data": removedPayload})
+		return
+	}
+
+	// Yoxdursa insert, fərqlidirsə yenisi ilə əvəzlə (UPSERT).
+	if err := database.DB.Exec(`
+		INSERT INTO room_message_reactions (message_id, user_id, room_id, emoji, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT (message_id, user_id)
+		DO UPDATE SET emoji = EXCLUDED.emoji, updated_at = EXCLUDED.updated_at
+	`, messageID, userID, roomID, body.Emoji, now, now).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Reaksiya saxlanılmadı"})
+		return
+	}
+	addedPayload := gin.H{
+		"room_id":    roomID,
+		"message_id": messageID,
+		"user_id":    userID,
+		"emoji":      body.Emoji,
+		"action":     "added",
+	}
+	h.wsHub.SendToMultipleUsers(targets, "room_reaction_updated", addedPayload)
+	c.JSON(http.StatusOK, gin.H{"message": "Reaksiya əlavə olundu", "data": addedPayload})
 }
 
 // DELETE /api/v1/rooms/:room_id/messages/:message_id — mesaj sil
@@ -274,6 +387,8 @@ func (h *RoomHandler) DeleteRoomMessage(c *gin.Context) {
 		return
 	}
 	database.DB.Delete(&models.Message{}, "id = ?", messageID)
+	// Silinən mesajın reaksiyalarını da təmizlə (sahibsiz qalmasın).
+	database.DB.Exec(`DELETE FROM room_message_reactions WHERE message_id = ?`, messageID)
 	h.wsHub.SendToMultipleUsers(h.roomMemberIDs(roomID), "room_message_deleted", gin.H{
 		"room_id": roomID, "message_id": messageID,
 	})

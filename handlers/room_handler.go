@@ -282,10 +282,14 @@ func (h *RoomHandler) ensureMember(roomID, userID uint) error {
 		return nil
 	}
 	now := time.Now()
-	res := database.DB.Clauses(clause.OnConflict{DoNothing: true}).Create(&models.RoomMember{
+	res := database.DB.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "room_id"}, {Name: "user_id"}},
+		DoNothing: true,
+	}).Create(&models.RoomMember{
 		RoomID: roomID, UserID: userID, Role: "member", JoinedAt: &now,
 	})
 	if res.Error != nil {
+		log.Printf("[Room] ensureMember insert FAILED room=%d user=%d: %v", roomID, userID, res.Error)
 		return res.Error
 	}
 	if res.RowsAffected > 0 {
@@ -375,6 +379,59 @@ func (h *RoomHandler) SetAdmin(c *gin.Context) {
 		Where("room_id = ? AND user_id = ? AND role <> 'owner'", roomID, targetID).
 		UpdateColumn("role", role)
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "role": role})
+}
+
+// GET /api/v1/rooms/:room_id/members — otaq üzvləri (detay səhifəsi üçün).
+// Group GetMembers ikizi: `{members: [...]}`. İki yönlü block cascade — cari
+// istifadəçi ilə bloklu üzvlər siyahıda görünmür. Üzvlük tələb olunmur (oxuyan
+// da detay aça bilər), amma guest yox.
+func (h *RoomHandler) GetRoomMembers(c *gin.Context) {
+	userID := c.MustGet("user_id").(uint)
+	if isGuest(userID) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Qonaq hesab", "code": "GUEST_FORBIDDEN"})
+		return
+	}
+	roomID := parseRoomID(c)
+
+	type row struct {
+		UserID       uint       `gorm:"column:user_id"`
+		Name         string     `gorm:"column:name"`
+		Username     string     `gorm:"column:username"`
+		IsVerified   bool       `gorm:"column:is_verified"`
+		ProfileImage *string    `gorm:"column:profile_image"`
+		Role         string     `gorm:"column:role"`
+		JoinedAt     *time.Time `gorm:"column:joined_at"`
+	}
+	var rows []row
+	database.DB.Raw(`
+		SELECT rm.user_id, u.name, u.username, u.is_verified,
+		       u.profile_image, rm.role, rm.joined_at
+		FROM room_members rm
+		JOIN users u ON u.id = rm.user_id
+		WHERE rm.room_id = ?
+		  AND NOT EXISTS (
+		      SELECT 1 FROM user_blocks ub
+		      WHERE (ub.blocker_id = ? AND ub.blocked_id = rm.user_id)
+		         OR (ub.blocker_id = rm.user_id AND ub.blocked_id = ?)
+		  )
+		ORDER BY
+			CASE rm.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END,
+			rm.joined_at ASC NULLS LAST
+	`, roomID, userID, userID).Scan(&rows)
+
+	out := make([]models.RoomMemberResponse, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, models.RoomMemberResponse{
+			UserID:       r.UserID,
+			Name:         r.Name,
+			Username:     r.Username,
+			IsVerified:   r.IsVerified,
+			ProfileImage: r.ProfileImage,
+			Role:         r.Role,
+			JoinedAt:     r.JoinedAt,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"members": out})
 }
 
 // requireAdmin — owner|admin deyilsə 403 yazıb false qaytarır.

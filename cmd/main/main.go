@@ -435,9 +435,12 @@ func main() {
 		api.POST("/rooms/:room_id/freeze", roomHandler.FreezeRoom)
 		api.DELETE("/rooms/:room_id", roomHandler.DeleteRoom)
 		api.PUT("/rooms/:room_id/admin/:user_id", roomHandler.SetAdmin)
+		api.GET("/rooms/:room_id/members", roomHandler.GetRoomMembers) // detay səhifəsi (group parite)
 		api.GET("/rooms/:room_id/messages", roomHandler.GetRoomMessages)
 		api.POST("/rooms/:room_id/messages", roomHandler.SendRoomMessage)
 		api.DELETE("/rooms/:room_id/messages/:message_id", roomHandler.DeleteRoomMessage)
+		// Mesaj reaksiyası (emoji) — group chat paritesi.
+		api.POST("/rooms/:room_id/messages/:message_id/reaction", roomHandler.SetRoomReaction)
 		// Per-user Söhbətlər-siyahısı əməliyyatları (group chat paritesi).
 		api.POST("/rooms/:room_id/mark-read", roomHandler.MarkRoomRead)
 		api.POST("/rooms/:room_id/mute", roomHandler.MuteRoom)

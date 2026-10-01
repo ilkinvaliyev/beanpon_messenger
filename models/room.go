@@ -128,9 +128,30 @@ type RoomMessageResponse struct {
 	Text           string  `json:"text"`
 	// Reply — reply edilən mesaj blok/silinmişsə ReplyBlocked=true və mətn boş
 	// (client "erişiminiz yoxdur" kartı göstərir).
-	ReplyToID    *string   `json:"reply_to_message_id"`
-	ReplyText    *string   `json:"reply_text"`
-	ReplySender  *string   `json:"reply_sender_username"`
-	ReplyBlocked bool      `json:"reply_blocked"`
-	CreatedAt    time.Time `json:"created_at"`
+	ReplyToID    *string `json:"reply_to_message_id"`
+	ReplyText    *string `json:"reply_text"`
+	ReplySender  *string `json:"reply_sender_username"`
+	ReplyBlocked bool    `json:"reply_blocked"`
+	// Emoji reaksiyalar (group chat paritesi — group_message_reactions ikizi).
+	// Hər eleman {user_id, emoji}. Boş massiv (null deyil — client null-ı pozuq
+	// sayır) default olaraq verilir.
+	Reactions []RoomReaction `json:"reactions"`
+	CreatedAt time.Time      `json:"created_at"`
+}
+
+// RoomReaction — mesajdakı tək emoji reaksiyası (group GroupReaction ikizi).
+type RoomReaction struct {
+	UserID uint   `json:"user_id"`
+	Emoji  string `json:"emoji"`
+}
+
+// RoomMemberResponse — otaq üzvü (detay səhifəsi üçün, group GroupMember ikizi).
+type RoomMemberResponse struct {
+	UserID       uint       `json:"user_id"`
+	Name         string     `json:"name"`
+	Username     string     `json:"username"`
+	IsVerified   bool       `json:"is_verified"`
+	ProfileImage *string    `json:"profile_image"`
+	Role         string     `json:"role"`
+	JoinedAt     *time.Time `json:"joined_at"`
 }
