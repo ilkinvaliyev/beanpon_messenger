@@ -45,6 +45,11 @@ type Message struct {
 	ReplyToMessage *Message `json:"reply_to_message,omitempty" gorm:"foreignKey:ReplyToMessageID"`
 
 	ConversationID *uint `json:"conversation_id" gorm:"index"`
+
+	// Room (açıq public söhbət otağı) mesajı — DM/grup deyilsə doludur.
+	// receiver_id NULL olur. Kolon Laravel migration ilə əlavə edilir (bu repoda
+	// AutoMigrate yoxdur). Bax: handlers/room_message_handler.go.
+	RoomID *uint `json:"room_id" gorm:"index"`
 }
 
 // MessageEdit mesaj düzenleme geçmişi
