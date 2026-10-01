@@ -33,6 +33,29 @@ func (h *RoomHandler) GetMyRooms(c *gin.Context) {
 		q = q.Where("is_archived = ?", false)
 	}
 	q.Find(&members)
+
+	// SELF-HEAL: yaradan HƏMİŞƏ "Söhbətlər"də görünməlidir. Member satırı hər
+	// hansı səbəbdən yoxdursa (köhnə data / insert xətası) sintetik owner sətri
+	// əlavə et ki, owner öz otağını siyahıda görsün. "only" (arxiv) rejimində
+	// əlavə etmə — owner sətri arxivlənməyib.
+	if archived != "only" {
+		haveRoom := map[uint]bool{}
+		for _, m := range members {
+			haveRoom[m.RoomID] = true
+		}
+		var owned []models.ChatRoom
+		database.DB.Where("owner_id = ?", userID).Find(&owned)
+		now := time.Now()
+		for _, r := range owned {
+			if haveRoom[r.ID] {
+				continue
+			}
+			members = append(members, models.RoomMember{
+				RoomID: r.ID, UserID: userID, Role: "owner", JoinedAt: &now,
+			})
+		}
+	}
+
 	if len(members) == 0 {
 		c.JSON(http.StatusOK, gin.H{"rooms": []models.RoomListItem{}})
 		return

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -151,10 +152,13 @@ func (h *RoomHandler) CreateRoom(c *gin.Context) {
 		return
 	}
 
-	// Owner avtomatik üzv.
-	database.DB.Create(&models.RoomMember{
+	// Owner avtomatik üzv. Xəta yutulmasın — logla (member satırı yazılmasa
+	// otaq "Söhbətlər"də görünməz və owner "üzv deyil" kimi görünər).
+	if err := database.DB.Create(&models.RoomMember{
 		RoomID: room.ID, UserID: userID, Role: "owner", JoinedAt: &now,
-	})
+	}).Error; err != nil {
+		log.Printf("[Room] owner member insert FAILED room=%d user=%d: %v", room.ID, userID, err)
+	}
 
 	c.JSON(http.StatusOK, gin.H{"data": h.toRoomResponse(room, strPtr("owner"), true)})
 }
@@ -206,6 +210,11 @@ func (h *RoomHandler) ListRooms(c *gin.Context) {
 		isMember := false
 		if role, ok := memberRole[r.ID]; ok {
 			rolePtr = strPtr(role)
+			isMember = true
+		} else if r.OwnerID == userID {
+			// Yaradan HƏMİŞƏ üzvdür — member satırı hər hansı səbəbdən yoxdursa
+			// belə owner kimi göstər (self-heal).
+			rolePtr = strPtr("owner")
 			isMember = true
 		}
 		out = append(out, h.toRoomResponse(r, rolePtr, isMember))
