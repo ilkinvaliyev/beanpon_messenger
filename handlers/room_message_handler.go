@@ -7,6 +7,7 @@ import (
 
 	"beanpon_messenger/database"
 	"beanpon_messenger/models"
+	"beanpon_messenger/utils"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -266,7 +267,7 @@ func (h *RoomHandler) GetRoomMessages(c *gin.Context) {
 			SenderID:       r.SenderID,
 			SenderName:     r.SenderName,
 			SenderUsername: r.SenderUsername,
-			SenderAvatar:   r.SenderAvatar,
+			SenderAvatar:   utils.PrependBaseURL(r.SenderAvatar),
 			SenderVerified: r.SenderVerified,
 			Text:           text,
 			ReplyToID:      r.ReplyToID,

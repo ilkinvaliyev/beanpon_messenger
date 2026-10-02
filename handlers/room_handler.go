@@ -9,6 +9,7 @@ import (
 
 	"beanpon_messenger/database"
 	"beanpon_messenger/models"
+	"beanpon_messenger/utils"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -457,9 +458,10 @@ func (h *RoomHandler) GetRoomMembers(c *gin.Context) {
 	var rows []row
 	database.DB.Raw(`
 		SELECT rm.user_id, u.name, u.username, u.is_verified,
-		       u.profile_image, rm.role, rm.joined_at
+		       p.profile_image, rm.role, rm.joined_at
 		FROM room_members rm
 		JOIN users u ON u.id = rm.user_id
+		LEFT JOIN profiles p ON p.user_id = rm.user_id
 		WHERE rm.room_id = ?
 		  AND NOT EXISTS (
 		      SELECT 1 FROM user_blocks ub
@@ -478,7 +480,7 @@ func (h *RoomHandler) GetRoomMembers(c *gin.Context) {
 			Name:         r.Name,
 			Username:     r.Username,
 			IsVerified:   r.IsVerified,
-			ProfileImage: r.ProfileImage,
+			ProfileImage: utils.PrependBaseURL(r.ProfileImage),
 			Role:         r.Role,
 			JoinedAt:     r.JoinedAt,
 		})
