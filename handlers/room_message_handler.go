@@ -226,14 +226,17 @@ func (h *RoomHandler) GetRoomMessages(c *gin.Context) {
 		WHERE m.room_id = ?
 		  AND m.deleted_at IS NULL
 		  AND m.created_at >= ?
-		  AND NOT EXISTS (
+		  -- Block filtri YALNIZ başqasının mesajına tətbiq olunur. İstifadəçi öz
+		  -- mesajını HƏR ZAMAN görür (m.sender_id = userID isə blok yoxlanmır) —
+		  -- əks halda qüsurlu self-block kaydı öz mesajlarını da gizlədirdi.
+		  AND (m.sender_id = ? OR NOT EXISTS (
 		      SELECT 1 FROM user_blocks ub
 		      WHERE (ub.blocker_id = ? AND ub.blocked_id = m.sender_id)
 		         OR (ub.blocker_id = m.sender_id AND ub.blocked_id = ?)
-		  )
+		  ))
 		ORDER BY m.created_at DESC, m.id DESC
 		LIMIT ?
-	`, userID, userID, roomID, joinedArg, userID, userID, limit).Scan(&rows)
+	`, userID, userID, roomID, joinedArg, userID, userID, userID, limit).Scan(&rows)
 
 	// Reaksiyalar — N+1 yox: səhifədəki bütün mesaj id-ləri üçün BİR sorğu,
 	// sonra Go-da map ilə mesajlara paylanır (group GetGroupMessages ikizi).
