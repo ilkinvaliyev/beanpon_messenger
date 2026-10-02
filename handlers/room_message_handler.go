@@ -204,7 +204,7 @@ func (h *RoomHandler) GetRoomMessages(c *gin.Context) {
 			m.sender_id,
 			u.name AS sender_name,
 			u.username AS sender_username,
-			u.profile_image AS sender_avatar,
+			p.profile_image AS sender_avatar,
 			u.is_verified AS sender_verified,
 			m.encrypted_text,
 			m.reply_to_message_id AS reply_to_id,
@@ -219,6 +219,7 @@ func (h *RoomHandler) GetRoomMessages(c *gin.Context) {
 			m.created_at
 		FROM messages m
 		JOIN users u ON u.id = m.sender_id
+		LEFT JOIN profiles p ON p.user_id = m.sender_id
 		LEFT JOIN messages reply ON reply.id = m.reply_to_message_id
 		LEFT JOIN users reply_u ON reply_u.id = reply.sender_id
 		WHERE m.room_id = ?
