@@ -253,8 +253,11 @@ func (h *RoomHandler) JoinRoom(c *gin.Context) {
 		return
 	}
 	roomID := parseRoomID(c)
+	log.Printf("[Room] JoinRoom start room=%d user=%d", roomID, userID)
 	if err := h.ensureMember(roomID, userID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Qoşulma alınmadı"})
+		log.Printf("[Room] JoinRoom ensureMember err room=%d user=%d: %v", roomID, userID, err)
+		// DEBUG: gerçek hatayı response'da da döndür (geçici teşhis için).
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Qoşulma alınmadı", "debug": err.Error()})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
