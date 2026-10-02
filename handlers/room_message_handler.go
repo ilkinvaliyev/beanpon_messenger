@@ -177,9 +177,7 @@ func (h *RoomHandler) GetRoomMessages(c *gin.Context) {
 		}
 	}
 	// Açıq otaq qaydası: HƏR KƏS (join olmayan belə) BÜTÜN mesajları görür.
-	// Join yalnız mesaj yazmaq üçün lazımdır (SendRoomMessage). Ona görə tarixçə
-	// filtri yoxdur — həmişə 1970-dən bəri (yəni bütün mesajlar).
-	var joinedArg interface{} = time.Unix(0, 0)
+	// Join yalnız mesaj yazmaq üçün lazımdır (SendRoomMessage). Filtr yoxdur.
 
 	type row struct {
 		ID             string
@@ -225,23 +223,10 @@ func (h *RoomHandler) GetRoomMessages(c *gin.Context) {
 		LEFT JOIN users reply_u ON reply_u.id = reply.sender_id
 		WHERE m.room_id = ?
 		  AND m.deleted_at IS NULL
-		  AND m.created_at >= ?
-		  -- Block filtri YALNIZ başqasının mesajına tətbiq olunur. İstifadəçi öz
-		  -- mesajını HƏR ZAMAN görür (m.sender_id = userID isə blok yoxlanmır) —
-		  -- əks halda qüsurlu self-block kaydı öz mesajlarını da gizlədirdi.
-		  AND (m.sender_id = ? OR NOT EXISTS (
-		      SELECT 1 FROM user_blocks ub
-		      WHERE (ub.blocker_id = ? AND ub.blocked_id = m.sender_id)
-		         OR (ub.blocker_id = m.sender_id AND ub.blocked_id = ?)
-		  ))
 		ORDER BY m.created_at DESC, m.id DESC
 		LIMIT ?
-	`, userID, userID, roomID, joinedArg, userID, userID, userID, limit)
-	scanRes := database.DB.Raw(`SELECT COUNT(*) FROM messages WHERE room_id = ? AND deleted_at IS NULL`, roomID)
-	var dbgTotal int64
-	scanRes.Scan(&dbgTotal)
-	log.Printf("[Room] GetRoomMessages room=%d userID=%d joinedArg=%v → rows=%d (room_id toplam deleted_at-null=%d)",
-		roomID, userID, joinedArg, len(rows), dbgTotal)
+	`, userID, userID, roomID, limit).Scan(&rows)
+	log.Printf("[Room] GetRoomMessages room=%d userID=%d → rows=%d", roomID, userID, len(rows))
 
 	// Reaksiyalar — N+1 yox: səhifədəki bütün mesaj id-ləri üçün BİR sorğu,
 	// sonra Go-da map ilə mesajlara paylanır (group GetGroupMessages ikizi).
