@@ -176,18 +176,10 @@ func (h *RoomHandler) GetRoomMessages(c *gin.Context) {
 			limit = n
 		}
 	}
-	// history_visible=false isə: SIRADAN üzv yalnız öz join-dən sonrakıları görür.
-	// Owner/admin HƏMİŞƏ bütün tarixçəni görür (öz otağıdır) — history_visible
-	// yalnız sonradan qoşulan adi üzvlərə tətbiq olunur.
-	joinedFilter := "'1970-01-01'::timestamptz"
+	// Açıq otaq qaydası: HƏR KƏS (join olmayan belə) BÜTÜN mesajları görür.
+	// Join yalnız mesaj yazmaq üçün lazımdır (SendRoomMessage). Ona görə tarixçə
+	// filtri yoxdur — həmişə 1970-dən bəri (yəni bütün mesajlar).
 	var joinedArg interface{} = time.Unix(0, 0)
-	if !room.HistoryVisible {
-		if mem := roomMembership(roomID, userID); mem != nil && mem.JoinedAt != nil &&
-			mem.Role != "owner" && mem.Role != "admin" {
-			joinedArg = *mem.JoinedAt
-		}
-	}
-	_ = joinedFilter
 
 	type row struct {
 		ID             string
