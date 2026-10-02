@@ -176,11 +176,14 @@ func (h *RoomHandler) GetRoomMessages(c *gin.Context) {
 			limit = n
 		}
 	}
-	// history_visible=false isə: istifadəçi yalnız öz join-dən sonrakıları görür.
+	// history_visible=false isə: SIRADAN üzv yalnız öz join-dən sonrakıları görür.
+	// Owner/admin HƏMİŞƏ bütün tarixçəni görür (öz otağıdır) — history_visible
+	// yalnız sonradan qoşulan adi üzvlərə tətbiq olunur.
 	joinedFilter := "'1970-01-01'::timestamptz"
 	var joinedArg interface{} = time.Unix(0, 0)
 	if !room.HistoryVisible {
-		if mem := roomMembership(roomID, userID); mem != nil && mem.JoinedAt != nil {
+		if mem := roomMembership(roomID, userID); mem != nil && mem.JoinedAt != nil &&
+			mem.Role != "owner" && mem.Role != "admin" {
 			joinedArg = *mem.JoinedAt
 		}
 	}
