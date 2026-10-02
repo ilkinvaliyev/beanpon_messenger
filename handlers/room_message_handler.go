@@ -236,7 +236,12 @@ func (h *RoomHandler) GetRoomMessages(c *gin.Context) {
 		  ))
 		ORDER BY m.created_at DESC, m.id DESC
 		LIMIT ?
-	`, userID, userID, roomID, joinedArg, userID, userID, userID, limit).Scan(&rows)
+	`, userID, userID, roomID, joinedArg, userID, userID, userID, limit)
+	scanRes := database.DB.Raw(`SELECT COUNT(*) FROM messages WHERE room_id = ? AND deleted_at IS NULL`, roomID)
+	var dbgTotal int64
+	scanRes.Scan(&dbgTotal)
+	log.Printf("[Room] GetRoomMessages room=%d userID=%d joinedArg=%v → rows=%d (room_id toplam deleted_at-null=%d)",
+		roomID, userID, joinedArg, len(rows), dbgTotal)
 
 	// Reaksiyalar — N+1 yox: səhifədəki bütün mesaj id-ləri üçün BİR sorğu,
 	// sonra Go-da map ilə mesajlara paylanır (group GetGroupMessages ikizi).
