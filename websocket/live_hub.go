@@ -1151,6 +1151,54 @@ func (h *LiveHub) handleEvent(event *LiveMessageEvent) {
 			}
 		}
 
+	// viewers_list — istəyən client-ə HAL-HAZIRDA qoşulu olan görünən
+	// iştirakçıların (ghost / shadow-ban xaric) siyahısını qaytarır. Sayğac
+	// (`viewer_count_update`) ilə EYNİ mənbədən (bağlı WS client-ləri) gəldiyi
+	// üçün izləyici pill-i və siyahı həmişə üst-üstə düşür; istəyən özünü də görür.
+	// Anonim yayında səhnədə olmayanlar (staff deyilsə) alias ilə göstərilir.
+	case "viewers_list":
+		h.mu.RLock()
+		requester, exists := roomClients[event.SenderID]
+		viewers := make([]map[string]interface{}, 0, len(roomClients))
+		for _, c := range roomClients {
+			if c.IsGhost || c.LiveSpam {
+				continue
+			}
+			uid, name, isAnon := AnonymizeLiveSender(event.RoomID, c.UserID, event.SenderID, firstNonEmpty(c.Username, c.Name))
+			var avatar *string
+			if !isAnon {
+				if c.AvatarType != nil && *c.AvatarType == "gif" {
+					avatar = c.Avatar
+				} else {
+					avatar = utils.PrependBaseURL(c.Avatar)
+				}
+			}
+			viewers = append(viewers, map[string]interface{}{
+				"user_id":      uid,
+				"user_name":    name,
+				"username":     name,
+				"user_avatar":  avatar,
+				"role":         c.Role,
+				"is_anonymous": isAnon,
+			})
+		}
+		h.mu.RUnlock()
+		if exists {
+			listData, _ := json.Marshal(map[string]interface{}{
+				"count":   len(viewers),
+				"viewers": viewers,
+			})
+			listPayload, _ := json.Marshal(map[string]interface{}{
+				"type":    "viewers_list",
+				"room_id": event.RoomID,
+				"data":    json.RawMessage(listData),
+			})
+			select {
+			case requester.Send <- listPayload:
+			default:
+			}
+		}
+
 	case "viewer_count_update":
 		for _, client := range roomClients {
 			select {
@@ -2037,4 +2085,12 @@ func (h *LiveHub) MuteUser(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "User muted in live room."})
+}
+
+// firstNonEmpty — ilk boş olmayan sətri qaytarır (viewers_list ad seçimi).
+func firstNonEmpty(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
 }
