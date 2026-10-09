@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"errors"
 	"log"
 	"net/http"
 	"os"
@@ -14,7 +15,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 )
 
 // RoomHandler — açıq (public) söhbət otaqları. Qrup çatının public variantı.
@@ -156,9 +156,7 @@ func (h *RoomHandler) CreateRoom(c *gin.Context) {
 
 	// Owner avtomatik üzv. Xəta yutulmasın — logla (member satırı yazılmasa
 	// otaq "Söhbətlər"də görünməz və owner "üzv deyil" kimi görünər).
-	if err := database.DB.Create(&models.RoomMember{
-		RoomID: room.ID, UserID: userID, Role: "owner", JoinedAt: &now,
-	}).Error; err != nil {
+	if _, err := insertRoomMember(room.ID, userID, "owner"); err != nil {
 		log.Printf("[Room] owner member insert FAILED room=%d user=%d: %v", room.ID, userID, err)
 	}
 
@@ -253,6 +251,12 @@ func (h *RoomHandler) JoinRoom(c *gin.Context) {
 		return
 	}
 	roomID := parseRoomID(c)
+	// A deleted / unknown room is a clear 404 instead of a foreign-key 500.
+	var room models.ChatRoom
+	if err := database.DB.Select("id").First(&room, roomID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Otaq tapılmadı", "code": "ROOM_NOT_FOUND"})
+		return
+	}
 	log.Printf("[Room] JoinRoom start room=%d user=%d", roomID, userID)
 	if err := h.ensureMember(roomID, userID); err != nil {
 		log.Printf("[Room] JoinRoom ensureMember err room=%d user=%d: %v", roomID, userID, err)
@@ -281,28 +285,44 @@ func (h *RoomHandler) LeaveRoom(c *gin.Context) {
 }
 
 // ensureMember — üzv deyilsə member kimi əlavə et + join_count artır (tək-klik
-// join). Təkrar çağırış təsirsizdir.
+// join). Təkrar çağırış təsirsizdir. The row is read back after the insert, so a
+// silently skipped insert surfaces as an error instead of a fake "joined".
 func (h *RoomHandler) ensureMember(roomID, userID uint) error {
 	if roomMembership(roomID, userID) != nil {
 		return nil
 	}
-	now := time.Now()
-	res := database.DB.Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "room_id"}, {Name: "user_id"}},
-		DoNothing: true,
-	}).Create(&models.RoomMember{
-		RoomID: roomID, UserID: userID, Role: "member", JoinedAt: &now,
-	})
-	if res.Error != nil {
-		log.Printf("[Room] ensureMember insert FAILED room=%d user=%d: %v", roomID, userID, res.Error)
-		return res.Error
+	inserted, err := insertRoomMember(roomID, userID, "member")
+	if err != nil {
+		log.Printf("[Room] ensureMember insert FAILED room=%d user=%d: %v", roomID, userID, err)
+		return err
 	}
-	if res.RowsAffected > 0 {
+	if roomMembership(roomID, userID) == nil {
+		log.Printf("[Room] ensureMember: no membership row after insert room=%d user=%d", roomID, userID)
+		return errMembershipNotSaved
+	}
+	if inserted {
 		database.DB.Model(&models.ChatRoom{}).Where("id = ?", roomID).
 			UpdateColumn("join_count", gorm.Expr("join_count + 1"))
 		h.bumpScore(roomID)
 	}
 	return nil
+}
+
+var errMembershipNotSaved = errors.New("room membership row was not saved")
+
+// insertRoomMember writes a room_members row with the core columns only — the
+// per-user columns (is_muted, is_archived, is_pinned, …) take their DB defaults,
+// so the insert does not depend on every model column existing. The target-less
+// ON CONFLICT DO NOTHING absorbs a concurrent duplicate and, unlike
+// ON CONFLICT (room_id, user_id), does not require that unique index to exist.
+// inserted=false → the row was already there.
+func insertRoomMember(roomID, userID uint, role string) (inserted bool, err error) {
+	now := time.Now()
+	res := database.DB.Exec(`
+		INSERT INTO room_members (room_id, user_id, role, joined_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT DO NOTHING`, roomID, userID, role, now, now, now)
+	return res.RowsAffected > 0, res.Error
 }
 
 // bumpScore — otağın skorunu təzədən hesabla (sayğac dəyişəndən sonra).
