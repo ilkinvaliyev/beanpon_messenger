@@ -440,10 +440,13 @@ func main() {
 		api.DELETE("/rooms/:room_id", roomHandler.DeleteRoom)
 		api.PUT("/rooms/:room_id/admin/:user_id", roomHandler.SetAdmin)
 		api.GET("/rooms/:room_id/members", roomHandler.GetRoomMembers) // detay səhifəsi (group parite)
-		// Admin moderation: kick, write block, room switches (screenshots, lock).
+		// Admin moderation: kick (= ban), write block, room switches (screenshots, lock).
 		api.DELETE("/rooms/:room_id/members/:user_id", roomHandler.KickRoomMember)
 		api.PUT("/rooms/:room_id/members/:user_id/write-block", roomHandler.SetRoomWriteBlock)
 		api.PUT("/rooms/:room_id/settings", roomHandler.UpdateRoomSettings)
+		// Banned users (admins only): list + lift a ban.
+		api.GET("/rooms/:room_id/bans", roomHandler.GetRoomBans)
+		api.DELETE("/rooms/:room_id/bans/:user_id", roomHandler.UnbanRoomUser)
 		// Per-user hide (the room shows nowhere until unhidden).
 		api.POST("/rooms/:room_id/hide", roomHandler.HideRoom)
 		api.POST("/rooms/:room_id/unhide", roomHandler.UnhideRoom)

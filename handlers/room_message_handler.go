@@ -3,6 +3,7 @@ package handlers
 import (
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"beanpon_messenger/database"
@@ -11,6 +12,7 @@ import (
 	"beanpon_messenger/utils"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -31,6 +33,39 @@ func (h *RoomHandler) SendRoomMessage(c *gin.Context) {
 		return
 	}
 	room := *roomPtr
+
+	var req struct {
+		Text             string  `json:"text" binding:"required,min=1"`
+		ReplyToMessageID *string `json:"reply_to_message_id"`
+		ClientMessageID  *string `json:"client_message_id"`
+		// New clients (durable send queue + room composer): refuse instead of
+		// auto-joining when the sender is not a member — a retry queued before
+		// the user left / was removed must not silently re-join them.
+		RequireMember bool `json:"require_member"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Mətn tələb olunur"})
+		return
+	}
+	// Canonical (lowercase) UUID: the database returns ids lowercase, so the
+	// reply / WS echo must use the same spelling or clients see two messages.
+	messageID, clientGiven, err := resolveMessageID(req.ClientMessageID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error(), "code": "INVALID_CLIENT_MESSAGE_ID"})
+		return
+	}
+	// A retry of a message that is already stored (its first reply was lost)
+	// is answered BEFORE the write gates: a freeze, lock, write block or
+	// removal that came after the original send must not turn a delivered
+	// message into a failure on the sender's screen — nor re-join them.
+	if clientGiven {
+		var existing models.Message
+		if err := database.DB.Unscoped().Where("id = ?", messageID).Limit(1).Find(&existing).Error; err == nil && existing.ID != "" {
+			h.replyRoomDuplicate(c, existing, userID, roomID)
+			return
+		}
+	}
+
 	if room.IsFrozen {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Otaq dondurulub", "code": "ROOM_FROZEN"})
 		return
@@ -39,6 +74,10 @@ func (h *RoomHandler) SendRoomMessage(c *gin.Context) {
 	// blocked from writing. Enforced here so every path (composer, post share,
 	// retries, old clients) is covered.
 	mem := roomMembership(roomID, userID)
+	if req.RequireMember && mem == nil && room.OwnerID != userID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Otağın üzvü deyilsiniz", "code": "ROOM_NOT_MEMBER"})
+		return
+	}
 	senderIsAdmin := (mem != nil && mem.HasAdminAccess()) || room.OwnerID == userID
 	if !senderIsAdmin && room.IsMessagingLocked(time.Now()) {
 		c.JSON(http.StatusForbidden, gin.H{
@@ -53,20 +92,14 @@ func (h *RoomHandler) SendRoomMessage(c *gin.Context) {
 		return
 	}
 
-	var req struct {
-		Text             string  `json:"text" binding:"required,min=1"`
-		ReplyToMessageID *string `json:"reply_to_message_id"`
-		ClientMessageID  *string `json:"client_message_id"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Mətn tələb olunur"})
-		return
-	}
-
 	// Tək-klik join: yazan avtomatik üzv. BEST-EFFORT — mesaj göndərməni
 	// bloklamır. Üzvlük yazısı alınmasa belə mesaj gedir (ensureMember özü
 	// uğursuzluğu loglayır). Owner/mövcud üzv üçün onsuz da no-op-dur.
-	_ = h.ensureMember(roomID, userID)
+	// Exception: a ban that landed while this request was in flight.
+	if err := h.ensureMember(roomID, userID); err == errRoomBanned {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Otaq tapılmadı", "code": "ROOM_NOT_FOUND"})
+		return
+	}
 
 	encryptedText, err := h.encryptionService.EncryptMessage(req.Text)
 	if err != nil {
@@ -74,15 +107,10 @@ func (h *RoomHandler) SendRoomMessage(c *gin.Context) {
 		return
 	}
 
-	messageID := req.ClientMessageID
-	if messageID == nil || *messageID == "" {
-		id := newRoomMessageID()
-		messageID = &id
-	}
 	now := time.Now()
 
 	message := models.Message{
-		ID:               *messageID,
+		ID:               messageID,
 		SenderID:         userID,
 		RoomID:           &roomID,
 		ReplyToMessageID: req.ReplyToMessageID,
@@ -99,7 +127,7 @@ func (h *RoomHandler) SendRoomMessage(c *gin.Context) {
 		// GERÇEK DB hatasını logla (room_id kolonu yoxdursa / NOT NULL pozuntusu
 		// burada görünəcək — "mesaj gedir amma qalmır" probleminin kökü).
 		log.Printf("[Room] message INSERT FAILED room=%d user=%d id=%s: %v",
-			roomID, userID, *messageID, createRes.Error)
+			roomID, userID, messageID, createRes.Error)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Mesaj saxlanılmadı"})
 		return
 	}
@@ -107,16 +135,15 @@ func (h *RoomHandler) SendRoomMessage(c *gin.Context) {
 		// RowsAffected==0: ya həqiqi təkrar (eyni id), ya da conflict target
 		// uyğun gəlmədi. Təkrar olub-olmadığını DB-dən yoxla — əks halda mesaj
 		// "göndərildi" görünür amma əslində YAZILMAYIB (istifadəçinin şikayəti).
-		var exists int64
-		database.DB.Model(&models.Message{}).Where("id = ?", *messageID).Count(&exists)
-		if exists == 0 {
+		// (Two retries racing past the early lookup above end up here.)
+		var existing models.Message
+		if err := database.DB.Unscoped().Where("id = ?", messageID).First(&existing).Error; err != nil {
 			log.Printf("[Room] message NOT PERSISTED (0 rows, not a dup) room=%d user=%d id=%s",
-				roomID, userID, *messageID)
+				roomID, userID, messageID)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Mesaj saxlanılmadı"})
 			return
 		}
-		// Həqiqi təkrar göndərmə — sayğac/WS təkrarlanmır.
-		c.JSON(http.StatusOK, gin.H{"message": "göndərildi", "duplicate": true, "data": gin.H{"id": *messageID}})
+		h.replyRoomDuplicate(c, existing, userID, roomID)
 		return
 	}
 
@@ -137,20 +164,7 @@ func (h *RoomHandler) SendRoomMessage(c *gin.Context) {
 
 	// WS fan-out — otaq üzvlərinə. Block filtri alıcı tərəfdə (client) deyil,
 	// burada tətbiq olunur: göndərənlə block əlaqəsi olan üzvə göndərmə.
-	payload := gin.H{
-		"id":                  *messageID,
-		"room_id":             roomID,
-		"sender_id":           userID,
-		"sender_name":         sender.Name,
-		"sender_username":     sender.Username,
-		"sender_avatar":       sender.ProfileImage,
-		"sender_verified":     sender.IsVerified,
-		"text":                req.Text,
-		"reply_to_message_id": req.ReplyToMessageID,
-		// Group chat paritesi — client null-ı pozuq sayır, boş massiv ver.
-		"reactions":  []gin.H{},
-		"created_at": now.UTC().Format(time.RFC3339),
-	}
+	payload := roomMessagePayload(message, roomID, sender, req.Text)
 	for _, mid := range h.roomMemberIDsExcludingBlocked(roomID, userID) {
 		if mid == userID {
 			continue
@@ -168,12 +182,59 @@ func (h *RoomHandler) SendRoomMessage(c *gin.Context) {
 			avatar = *room.Avatar
 		}
 		h.wsHub.ScheduleRoomPushNotification(
-			roomID, userID, room.Name, avatar, req.Text, *messageID, now,
+			roomID, userID, room.Name, avatar, req.Text, messageID, now,
 			pushTargets, 10*time.Second,
 		)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "göndərildi", "data": payload})
+}
+
+// replyRoomDuplicate answers a send whose id is already stored. Həqiqi təkrar
+// göndərmə — sayğac/WS/push təkrarlanmır. The stored message comes back whole
+// (server time + sender), so a retry whose first reply was lost confirms
+// exactly like the original send.
+func (h *RoomHandler) replyRoomDuplicate(c *gin.Context, existing models.Message, userID, roomID uint) {
+	// The id belongs to someone else's message / another chat: never confirm
+	// a send with a message the sender does not own.
+	if existing.SenderID != userID || existing.RoomID == nil || *existing.RoomID != roomID {
+		c.JSON(http.StatusConflict, gin.H{"error": "client_message_id başqa mesaja aiddir", "code": "CLIENT_MESSAGE_ID_CONFLICT"})
+		return
+	}
+	if existing.DeletedAt.Valid {
+		// Already deleted (moderation / delete for everyone) — only the id: the
+		// client keeps its own copy until the delete reaches it.
+		c.JSON(http.StatusOK, gin.H{"message": "göndərildi", "duplicate": true, "deleted": true,
+			"data": gin.H{"id": existing.ID}})
+		return
+	}
+	var dupSender models.User
+	database.DB.First(&dupSender, userID)
+	storedText, _ := h.encryptionService.DecryptMessage(existing.EncryptedText)
+	c.JSON(http.StatusOK, gin.H{"message": "göndərildi", "duplicate": true,
+		"data": roomMessagePayload(existing, roomID, dupSender, storedText)})
+}
+
+// roomMessagePayload — a just-sent room message as clients receive it (WS
+// `new_room_message` + the send reply, first send and duplicate retry alike).
+func roomMessagePayload(msg models.Message, roomID uint, sender models.User, text string) gin.H {
+	return gin.H{
+		"id":                  msg.ID,
+		"room_id":             roomID,
+		"sender_id":           msg.SenderID,
+		"sender_name":         sender.Name,
+		"sender_username":     sender.Username,
+		"sender_avatar":       sender.ProfileImage,
+		"sender_verified":     sender.IsVerified,
+		"text":                text,
+		"reply_to_message_id": msg.ReplyToMessageID,
+		// Group chat paritesi — client null-ı pozuq sayır, boş massiv ver.
+		"reactions": []gin.H{},
+		// Same value and precision as GET /messages (the column keeps
+		// microseconds): a whole-second time would put a live message inside
+		// a page's time span, where clients treat missing rows as deleted.
+		"created_at": msg.CreatedAt.UTC().Truncate(time.Microsecond),
+	}
 }
 
 // GetRoomMessages — GET /api/v1/rooms/:room_id/messages
@@ -368,7 +429,7 @@ func (h *RoomHandler) SetRoomReaction(c *gin.Context) {
 		return
 	}
 	roomID := parseRoomID(c)
-	messageID := c.Param("message_id")
+	messageID := canonicalMessageID(c.Param("message_id"))
 	if _, ok := loadVisibleRoom(c, roomID, userID); !ok {
 		return
 	}
@@ -447,7 +508,7 @@ func (h *RoomHandler) SetRoomReaction(c *gin.Context) {
 func (h *RoomHandler) DeleteRoomMessage(c *gin.Context) {
 	userID := c.MustGet("user_id").(uint)
 	roomID := parseRoomID(c)
-	messageID := c.Param("message_id")
+	messageID := canonicalMessageID(c.Param("message_id"))
 
 	var msg models.Message
 	if err := database.DB.Where("id = ? AND room_id = ?", messageID, roomID).First(&msg).Error; err != nil {
@@ -489,8 +550,22 @@ func (h *RoomHandler) roomMemberIDsExcludingBlocked(roomID, senderID uint) []uin
 		  AND NOT EXISTS (
 		      SELECT 1 FROM room_hides rh WHERE rh.room_id = rm.room_id AND rh.user_id = rm.user_id
 		  )
+		  AND NOT EXISTS (
+		      SELECT 1 FROM room_bans rb WHERE rb.room_id = rm.room_id AND rb.user_id = rm.user_id
+		  )
 	`, roomID, senderID, senderID).Scan(&ids)
 	return ids
+}
+
+// canonicalMessageID — the lowercase UUID spelling the database returns, so a
+// WS broadcast (reaction / delete) matches the id clients got from history,
+// whatever casing the request used. Non-UUID input is returned unchanged
+// (the lookup then simply finds nothing, as before).
+func canonicalMessageID(raw string) string {
+	if parsed, err := uuid.Parse(strings.TrimSpace(raw)); err == nil {
+		return parsed.String()
+	}
+	return raw
 }
 
 // atoiPos — kiçik köməkçi (strconv importunu bu faylda saxlamamaq üçün).

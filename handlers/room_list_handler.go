@@ -69,11 +69,13 @@ func (h *RoomHandler) GetMyRooms(c *gin.Context) {
 	}
 
 	// Otaqlar (silinmiş/dondurulmuş olmayan — frozen siyahıda görünməsin). Hidden
-	// rooms and rooms whose owner is blocked with the user never show.
+	// rooms, rooms whose owner is blocked with the user and rooms the user is
+	// banned from never show.
 	var rooms []models.ChatRoom
 	database.DB.Where("id IN ? AND is_frozen = ?", roomIDs, false).
 		Where(roomOwnerNotBlockedSQL, userID, userID).
 		Where(roomNotHiddenSQL, userID).
+		Where(roomNotBannedSQL, userID).
 		Find(&rooms)
 
 	// My write blocks in these rooms (one query).
@@ -197,6 +199,9 @@ func (h *RoomHandler) roomPushTargets(roomID, senderID uint) []uint {
 		  )
 		  AND NOT EXISTS (
 		      SELECT 1 FROM room_hides rh WHERE rh.room_id = rm.room_id AND rh.user_id = rm.user_id
+		  )
+		  AND NOT EXISTS (
+		      SELECT 1 FROM room_bans rb WHERE rb.room_id = rm.room_id AND rb.user_id = rm.user_id
 		  )
 		  AND NOT EXISTS (
 		      SELECT 1 FROM user_blocks ob

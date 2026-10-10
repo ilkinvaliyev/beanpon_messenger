@@ -50,12 +50,14 @@ func ownerBlockedWith(ownerID, userID uint) bool {
 	return n > 0
 }
 
-// loadVisibleRoom — loads the room for this viewer. A missing room and a room
-// whose owner is blocked with the viewer both answer 404: for that viewer the
-// room does not exist. Writes the error response and returns ok=false.
+// loadVisibleRoom — loads the room for this viewer. A missing room, a room
+// whose owner is blocked with the viewer and a room the viewer is banned from
+// all answer 404: for that viewer the room does not exist. Writes the error
+// response and returns ok=false.
 func loadVisibleRoom(c *gin.Context, roomID, userID uint) (*models.ChatRoom, bool) {
 	var room models.ChatRoom
-	if err := database.DB.First(&room, roomID).Error; err != nil || ownerBlockedWith(room.OwnerID, userID) {
+	if err := database.DB.First(&room, roomID).Error; err != nil ||
+		ownerBlockedWith(room.OwnerID, userID) || isRoomBanned(roomID, userID) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Otaq tapılmadı", "code": "ROOM_NOT_FOUND"})
 		return nil, false
 	}
@@ -217,7 +219,11 @@ func roomEventsForViewer(roomID, viewerID uint, joinedAt, from, to time.Time) []
 // --- Admin: kick / write block / settings ---
 
 // DELETE /api/v1/rooms/:room_id/members/:user_id — remove a member (admin).
-// The removed user may join again; a write block survives (room_write_blocks).
+// Removal = entry ban (room_bans): the user never sees or joins the room again
+// until an admin lifts the ban (GET/DELETE /rooms/:id/bans). The ban is written
+// BEFORE the membership row goes, so there is no moment in which the user is
+// out but not yet banned (a racing join would slip through). A write block
+// survives either way (room_write_blocks).
 func (h *RoomHandler) KickRoomMember(c *gin.Context) {
 	userID := c.MustGet("user_id").(uint)
 	roomID := parseRoomID(c)
@@ -231,20 +237,38 @@ func (h *RoomHandler) KickRoomMember(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Yanlış istifadəçi"})
 		return
 	}
-	target := roomMembership(roomID, targetID)
-	if target == nil {
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	var room models.ChatRoom
+	if err := database.DB.First(&room, roomID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Otaq tapılmadı", "code": "ROOM_NOT_FOUND"})
 		return
 	}
-	if !canModerate(actor, target) {
+	target := roomMembership(roomID, targetID)
+	if !roomBanTargetAllowed(room, actor, target, targetID) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "İcazə yoxdur"})
 		return
 	}
-	database.DB.Delete(&models.RoomMember{}, target.ID)
-	h.recordRoomEvent(roomID, targetID, "leave", time.Now())
-	// The removed user's open room screen falls back to the reader state.
-	h.wsHub.SendToUser(targetID, "room_member_removed", gin.H{"room_id": roomID})
-	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	if err := banRoomUser(roomID, targetID, userID); err != nil {
+		log.Printf("[Room] ban failed room=%d target=%d: %v", roomID, targetID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Alınmadı"})
+		return
+	}
+	// By (room, user), not by the row read above: a join racing this kick may
+	// have inserted a fresh row (ensureMember re-checks the ban after its own
+	// insert, so one of the two always removes it).
+	res := database.DB.Exec(`DELETE FROM room_members WHERE room_id = ? AND user_id = ?`, roomID, targetID)
+	if res.Error != nil {
+		// The ban is stored (idempotent) — a retry finishes the removal.
+		log.Printf("[Room] kick: membership delete failed room=%d target=%d: %v", roomID, targetID, res.Error)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Alınmadı"})
+		return
+	}
+	if res.RowsAffected > 0 {
+		h.recordRoomEvent(roomID, targetID, "leave", time.Now())
+	}
+	// The removed user's open room screen closes (`banned`: the room is gone
+	// for them); old clients fall back to the reader state and get a 404 next.
+	h.wsHub.SendToUser(targetID, "room_member_removed", gin.H{"room_id": roomID, "banned": true})
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "banned": true})
 }
 
 // PUT /api/v1/rooms/:room_id/members/:user_id/write-block — body {blocked}.
@@ -390,6 +414,7 @@ func (h *RoomHandler) GetHiddenRooms(c *gin.Context) {
 	database.DB.
 		Joins("JOIN room_hides rh ON rh.room_id = rooms.id AND rh.user_id = ?", userID).
 		Where(roomOwnerNotBlockedSQL, userID, userID).
+		Where(roomNotBannedSQL, userID).
 		Order("rh.created_at DESC").
 		Limit(200).
 		Find(&rooms)
@@ -459,6 +484,7 @@ func (h *RoomHandler) GetRoomShareTargets(c *gin.Context) {
 		  AND r.deleted_at IS NULL
 		  AND r.is_frozen = false
 		  AND NOT EXISTS (SELECT 1 FROM room_hides rh WHERE rh.room_id = r.id AND rh.user_id = rm.user_id)
+		  AND NOT EXISTS (SELECT 1 FROM room_bans rb WHERE rb.room_id = r.id AND rb.user_id = rm.user_id)
 		  AND NOT EXISTS (
 		      SELECT 1 FROM user_blocks ub
 		      WHERE (ub.blocker_id = rm.user_id AND ub.blocked_id = r.owner_id)

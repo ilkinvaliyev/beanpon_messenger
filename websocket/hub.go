@@ -2334,9 +2334,20 @@ func (h *Hub) ScheduleRoomPushNotification(
 		for _, id := range readerIDs {
 			readers[id] = true
 		}
+		// Still in the room at push time: someone who left or was removed
+		// (= banned) during the delay gets no message text.
+		stillIn := make(map[uint]bool, len(memberIDs))
+		var memberNow []uint
+		h.db.Table("room_members").
+			Where("room_id = ? AND user_id IN ?", roomID, memberIDs).
+			Where("NOT EXISTS (SELECT 1 FROM room_bans rb WHERE rb.room_id = room_members.room_id AND rb.user_id = room_members.user_id)").
+			Pluck("user_id", &memberNow)
+		for _, id := range memberNow {
+			stillIn[id] = true
+		}
 		remaining := make([]uint, 0, len(memberIDs))
 		for _, uid := range memberIDs {
-			if uid == senderID || readers[uid] {
+			if uid == senderID || readers[uid] || !stillIn[uid] {
 				continue
 			}
 			remaining = append(remaining, uid)

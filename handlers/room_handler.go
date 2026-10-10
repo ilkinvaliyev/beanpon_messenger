@@ -15,7 +15,6 @@ import (
 	"beanpon_messenger/utils"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
 
@@ -126,6 +125,11 @@ func (h *RoomHandler) CreateRoom(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Yanlış məlumat"})
 		return
 	}
+	name, ok := cleanRoomName(req.Name)
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Yanlış məlumat", "code": "ROOM_NAME_INVALID"})
+		return
+	}
 
 	// Aktiv otaq limiti (silinməmiş, owner).
 	var active int64
@@ -143,7 +147,7 @@ func (h *RoomHandler) CreateRoom(c *gin.Context) {
 	now := time.Now()
 	room := models.ChatRoom{
 		OwnerID:        userID,
-		Name:           req.Name,
+		Name:           name,
 		Description:    req.Description,
 		Avatar:         req.Avatar,
 		HistoryVisible: historyVisible,
@@ -152,7 +156,19 @@ func (h *RoomHandler) CreateRoom(c *gin.Context) {
 	}
 	room.Score = recomputeScore(&room)
 
-	if err := database.DB.Create(&room).Error; err != nil {
+	// One room per name (see room_names.go).
+	err := database.DB.Transaction(func(tx *gorm.DB) error {
+		if err := claimRoomName(tx, name, 0); err != nil {
+			return err
+		}
+		return tx.Create(&room).Error
+	})
+	if isRoomNameConflict(err) {
+		c.JSON(http.StatusConflict, gin.H{"error": "Bu adda otaq artıq var", "code": "ROOM_NAME_TAKEN"})
+		return
+	}
+	if err != nil {
+		log.Printf("[Room] create failed user=%d: %v", userID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Otaq yaradılmadı"})
 		return
 	}
@@ -203,7 +219,8 @@ func (h *RoomHandler) ListRooms(c *gin.Context) {
 	// list, so the Rooms tab shows only the ones the viewer is not in.
 	q := database.DB.Where("is_frozen = ?", false).
 		Where(roomOwnerNotBlockedSQL, userID, userID).
-		Where(roomNotHiddenSQL, userID)
+		Where(roomNotHiddenSQL, userID).
+		Where(roomNotBannedSQL, userID)
 	if c.Query("exclude_joined") == "1" {
 		q = q.Where("rooms.owner_id <> ?", userID).
 			Where("NOT EXISTS (SELECT 1 FROM room_members rm WHERE rm.room_id = rooms.id AND rm.user_id = ?)", userID)
@@ -278,6 +295,10 @@ func (h *RoomHandler) JoinRoom(c *gin.Context) {
 	database.DB.Exec(`DELETE FROM room_hides WHERE room_id = ? AND user_id = ?`, roomID, userID)
 	log.Printf("[Room] JoinRoom start room=%d user=%d", roomID, userID)
 	if err := h.ensureMember(roomID, userID); err != nil {
+		if err == errRoomBanned {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Otaq tapılmadı", "code": "ROOM_NOT_FOUND"})
+			return
+		}
 		log.Printf("[Room] JoinRoom ensureMember err room=%d user=%d: %v", roomID, userID, err)
 		// DEBUG: gerçek hatayı response'da da döndür (geçici teşhis için).
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Qoşulma alınmadı", "debug": err.Error()})
@@ -318,6 +339,16 @@ func (h *RoomHandler) ensureMember(roomID, userID uint) error {
 		log.Printf("[Room] ensureMember insert FAILED room=%d user=%d: %v", roomID, userID, err)
 		return err
 	}
+	// A kick (= ban) racing this join: the ban is written before the kick
+	// deletes memberships, so re-checking AFTER the insert always catches it.
+	if inserted && isRoomBanned(roomID, userID) {
+		if err := database.DB.Exec(`DELETE FROM room_members WHERE room_id = ? AND user_id = ?`,
+			roomID, userID).Error; err != nil {
+			// The leftover row is harmless: every read/fan-out path filters bans.
+			log.Printf("[Room] ensureMember: banned-row cleanup failed room=%d user=%d: %v", roomID, userID, err)
+		}
+		return errRoomBanned
+	}
 	if roomMembership(roomID, userID) == nil {
 		log.Printf("[Room] ensureMember: no membership row after insert room=%d user=%d", roomID, userID)
 		return errMembershipNotSaved
@@ -334,6 +365,9 @@ func (h *RoomHandler) ensureMember(roomID, userID uint) error {
 }
 
 var errMembershipNotSaved = errors.New("room membership row was not saved")
+
+// errRoomBanned — the user is banned from the room (see room_bans_handler.go).
+var errRoomBanned = errors.New("user is banned from the room")
 
 // insertRoomMember writes a room_members row with the core columns only — the
 // per-user columns (is_muted, is_archived, is_pinned, …) take their DB defaults,
@@ -396,8 +430,17 @@ func (h *RoomHandler) UpdateRoom(c *gin.Context) {
 	}
 
 	updates := map[string]interface{}{}
-	if req.Name != nil && *req.Name != "" {
-		updates["name"] = *req.Name
+	newName := ""
+	// An empty name means "no change" (as before); anything else must be a
+	// valid name that no other room uses.
+	if req.Name != nil && strings.TrimSpace(*req.Name) != "" {
+		name, ok := cleanRoomName(*req.Name)
+		if !ok {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Yanlış məlumat", "code": "ROOM_NAME_INVALID"})
+			return
+		}
+		newName = name
+		updates["name"] = name
 	}
 	if req.Description != nil {
 		updates["description"] = *req.Description
@@ -409,7 +452,23 @@ func (h *RoomHandler) UpdateRoom(c *gin.Context) {
 		updates["history_visible"] = *req.HistoryVisible
 	}
 	if len(updates) > 0 {
-		database.DB.Model(&models.ChatRoom{}).Where("id = ?", roomID).Updates(updates)
+		err := database.DB.Transaction(func(tx *gorm.DB) error {
+			if newName != "" {
+				if err := claimRoomName(tx, newName, roomID); err != nil {
+					return err
+				}
+			}
+			return tx.Model(&models.ChatRoom{}).Where("id = ?", roomID).Updates(updates).Error
+		})
+		if isRoomNameConflict(err) {
+			c.JSON(http.StatusConflict, gin.H{"error": "Bu adda otaq artıq var", "code": "ROOM_NAME_TAKEN"})
+			return
+		}
+		if err != nil {
+			log.Printf("[Room] update failed room=%d user=%d: %v", roomID, userID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Alınmadı"})
+			return
+		}
 	}
 	// Keep the uploaded avatar out of the 24 h orphan-media sweep.
 	if req.Avatar != nil {
@@ -475,8 +534,18 @@ func (h *RoomHandler) SetAdmin(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "İcazə yoxdur"})
 		return
 	}
+	// A banned user is out of the room until an admin lifts the ban — making
+	// them admin must not pull them back in.
+	if isRoomBanned(roomID, targetID) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "İstifadəçinin girişi bağlanıb", "code": "ROOM_USER_BANNED"})
+		return
+	}
 	// Hədəf üzv deyilsə əvvəlcə üzv et.
 	if err := h.ensureMember(roomID, targetID); err != nil {
+		if err == errRoomBanned {
+			c.JSON(http.StatusForbidden, gin.H{"error": "İstifadəçinin girişi bağlanıb", "code": "ROOM_USER_BANNED"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Alınmadı"})
 		return
 	}
@@ -608,10 +677,13 @@ func (h *RoomHandler) requireAdmin(c *gin.Context, roomID, userID uint) bool {
 	return true
 }
 
-// roomMemberIDs — otağın bütün üzv id-ləri (WS fan-out üçün).
+// roomMemberIDs — otağın bütün üzv id-ləri (WS fan-out üçün). Banned users
+// are never members, but a leftover row must not leak room events either.
 func (h *RoomHandler) roomMemberIDs(roomID uint) []uint {
 	var ids []uint
-	database.DB.Model(&models.RoomMember{}).Where("room_id = ?", roomID).Pluck("user_id", &ids)
+	database.DB.Model(&models.RoomMember{}).Where("room_id = ?", roomID).
+		Where("NOT EXISTS (SELECT 1 FROM room_bans rb WHERE rb.room_id = room_members.room_id AND rb.user_id = room_members.user_id)").
+		Pluck("user_id", &ids)
 	return ids
 }
 
@@ -645,6 +717,3 @@ func parseRoomID(c *gin.Context) uint {
 }
 
 func strPtr(s string) *string { return &s }
-
-// newRoomMessageID — yeni UUID v4 (client_message_id yoxdursa).
-func newRoomMessageID() string { return uuid.NewString() }
