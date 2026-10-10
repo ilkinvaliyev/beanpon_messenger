@@ -2307,6 +2307,86 @@ func (h *Hub) SendGroupPushNotification(conversationID, senderID uint, groupName
 	}()
 }
 
+// ScheduleRoomPushNotification — delayed room push (rooms twin of
+// ScheduleGroupPushNotification). After `delay`, members whose
+// room_members.last_read_at reached the message (they read the room while it
+// was open — the room screen marks read on every message at the bottom) are
+// skipped; the rest get a normal message push that opens the room on tap.
+func (h *Hub) ScheduleRoomPushNotification(
+	roomID, senderID uint,
+	roomName, roomAvatar, message, messageID string,
+	sentAt time.Time,
+	memberIDs []uint,
+	delay time.Duration,
+) {
+	time.AfterFunc(delay, func() {
+		if len(memberIDs) == 0 {
+			return
+		}
+		// last_read_at is stored with second precision — compare at seconds.
+		readSince := sentAt.Truncate(time.Second)
+		readers := make(map[uint]bool, len(memberIDs))
+		var readerIDs []uint
+		h.db.Table("room_members").
+			Where("room_id = ? AND user_id IN ? AND last_read_at IS NOT NULL AND last_read_at >= ?",
+				roomID, memberIDs, readSince).
+			Pluck("user_id", &readerIDs)
+		for _, id := range readerIDs {
+			readers[id] = true
+		}
+		remaining := make([]uint, 0, len(memberIDs))
+		for _, uid := range memberIDs {
+			if uid == senderID || readers[uid] {
+				continue
+			}
+			remaining = append(remaining, uid)
+		}
+		if len(remaining) == 0 {
+			return
+		}
+		h.SendRoomPushNotification(roomID, senderID, roomName, roomAvatar, message, messageID, remaining)
+	})
+}
+
+// SendRoomPushNotification — room message push via Laravel
+// `/notification/new-room-message` (title = room name, body = "Sender: text",
+// tap opens the room — route room_chat_page). Async, best-effort.
+func (h *Hub) SendRoomPushNotification(roomID, senderID uint, roomName, roomAvatar, message, messageID string, memberIDs []uint) {
+	go func() {
+		if len(memberIDs) == 0 || h.config.CloudToken == "" || h.config.BackendUrl == "" {
+			return
+		}
+		payload := map[string]interface{}{
+			"receiver_ids": memberIDs,
+			"sender_id":    senderID,
+			"room_id":      roomID,
+			"room_name":    roomName,
+			"room_avatar":  roomAvatar,
+			"message":      message,
+			"message_id":   messageID,
+		}
+		jsonData, err := json.Marshal(payload)
+		if err != nil {
+			return
+		}
+		req, err := http.NewRequest("POST", h.config.BackendUrl+"/notification/new-room-message", bytes.NewBuffer(jsonData))
+		if err != nil {
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-api-key", h.config.CloudToken)
+		resp, err := h.httpClient.Do(req)
+		if err != nil {
+			log.Printf("❌ Room push göndərmə hatası: %v", err)
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			log.Printf("❌ Room push uğursuz, status: %d", resp.StatusCode)
+		}
+	}()
+}
+
 // sendPushNotification push notification göndər (async)
 func (h *Hub) sendPushNotification(senderID, receiverID uint, message, msgType string) {
 	go func() {

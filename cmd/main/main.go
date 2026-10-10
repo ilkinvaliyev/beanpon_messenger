@@ -428,6 +428,9 @@ func main() {
 		// Oxumaq üçün üzvlük yoxdur; yazmaq üçün tək-klik join. Guest olmaz.
 		api.GET("/rooms", roomHandler.ListRooms)
 		api.GET("/rooms/my", roomHandler.GetMyRooms) // Söhbətlər siyahısı (join olunmuşlar)
+		// Rooms the user hid + the post share sheet's room list.
+		api.GET("/rooms/hidden", roomHandler.GetHiddenRooms)
+		api.GET("/rooms/share-targets", roomHandler.GetRoomShareTargets)
 		api.POST("/rooms", roomHandler.CreateRoom)
 		api.GET("/rooms/:room_id", roomHandler.GetRoom)
 		api.PUT("/rooms/:room_id", roomHandler.UpdateRoom) // admin redaktə (ad/təsvir/avatar)
@@ -437,11 +440,21 @@ func main() {
 		api.DELETE("/rooms/:room_id", roomHandler.DeleteRoom)
 		api.PUT("/rooms/:room_id/admin/:user_id", roomHandler.SetAdmin)
 		api.GET("/rooms/:room_id/members", roomHandler.GetRoomMembers) // detay səhifəsi (group parite)
+		// Admin moderation: kick, write block, room switches (screenshots, lock).
+		api.DELETE("/rooms/:room_id/members/:user_id", roomHandler.KickRoomMember)
+		api.PUT("/rooms/:room_id/members/:user_id/write-block", roomHandler.SetRoomWriteBlock)
+		api.PUT("/rooms/:room_id/settings", roomHandler.UpdateRoomSettings)
+		// Per-user hide (the room shows nowhere until unhidden).
+		api.POST("/rooms/:room_id/hide", roomHandler.HideRoom)
+		api.POST("/rooms/:room_id/unhide", roomHandler.UnhideRoom)
+		// Member-only message search.
+		api.GET("/rooms/:room_id/messages/search", roomHandler.SearchRoomMessages)
 		api.GET("/rooms/:room_id/messages", roomHandler.GetRoomMessages)
 		api.POST("/rooms/:room_id/messages", roomHandler.SendRoomMessage)
 		api.DELETE("/rooms/:room_id/messages/:message_id", roomHandler.DeleteRoomMessage)
 		// Mesaj reaksiyası (emoji) — group chat paritesi.
 		api.POST("/rooms/:room_id/messages/:message_id/reaction", roomHandler.SetRoomReaction)
+		api.GET("/rooms/:room_id/messages/:message_id/reactions", roomHandler.GetRoomMessageReactions)
 		// Per-user Söhbətlər-siyahısı əməliyyatları (group chat paritesi).
 		api.POST("/rooms/:room_id/mark-read", roomHandler.MarkRoomRead)
 		api.POST("/rooms/:room_id/mute", roomHandler.MuteRoom)

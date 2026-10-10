@@ -7,6 +7,7 @@ import (
 
 	"beanpon_messenger/database"
 	"beanpon_messenger/models"
+	"beanpon_messenger/services"
 	"beanpon_messenger/utils"
 
 	"github.com/gin-gonic/gin"
@@ -25,13 +26,30 @@ func (h *RoomHandler) SendRoomMessage(c *gin.Context) {
 	}
 	roomID := parseRoomID(c)
 
-	var room models.ChatRoom
-	if err := database.DB.First(&room, roomID).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Otaq tapılmadı"})
+	roomPtr, ok := loadVisibleRoom(c, roomID, userID)
+	if !ok {
 		return
 	}
+	room := *roomPtr
 	if room.IsFrozen {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Otaq dondurulub", "code": "ROOM_FROZEN"})
+		return
+	}
+	// Admin locks: messaging closed for everyone but admins, or this user is
+	// blocked from writing. Enforced here so every path (composer, post share,
+	// retries, old clients) is covered.
+	mem := roomMembership(roomID, userID)
+	senderIsAdmin := (mem != nil && mem.HasAdminAccess()) || room.OwnerID == userID
+	if !senderIsAdmin && room.IsMessagingLocked(time.Now()) {
+		c.JSON(http.StatusForbidden, gin.H{
+			"error":                  "Otaqda yazışma bağlanıb",
+			"code":                   "ROOM_LOCKED",
+			"messaging_locked_until": lockUntilIfActive(room),
+		})
+		return
+	}
+	if !senderIsAdmin && isWriteBlocked(roomID, userID) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Bu otaqda yaza bilməzsiniz", "code": "ROOM_WRITE_BLOCKED"})
 		return
 	}
 
@@ -102,6 +120,10 @@ func (h *RoomHandler) SendRoomMessage(c *gin.Context) {
 		return
 	}
 
+	// Media in the text (images/videos/voices) is now referenced — otherwise the
+	// 24 h orphan-media sweep deletes it from S3 (rooms used to skip this).
+	services.MarkMediaReferenced(database.DB, req.Text)
+
 	// Sayğac + son aktivlik + skor.
 	database.DB.Model(&models.ChatRoom{}).Where("id = ?", roomID).Updates(map[string]interface{}{
 		"message_count":    gorm.Expr("message_count + 1"),
@@ -136,13 +158,17 @@ func (h *RoomHandler) SendRoomMessage(c *gin.Context) {
 		h.wsHub.SendToUser(mid, "new_room_message", payload)
 	}
 
-	// Push bildirişi — JOIN olmuş, muted OLMAYAN, bloklu olmayan üzvlərə (group
-	// chat paritesi). Qrupun push helper-i təkrar istifadə olunur. Gecikmə ilə
-	// (10s) göndərilir ki, istifadəçi onlayn görübsə təkrar bildiriş olmasın.
+	// Push bildirişi — JOIN olmuş, muted OLMAYAN, bloklu olmayan üzvlərə. Room
+	// push (route room_chat_page): delayed 10 s and skipped for members who read
+	// the room past this message in the meantime (they saw it live).
 	pushTargets := h.roomPushTargets(roomID, userID)
 	if len(pushTargets) > 0 {
-		h.wsHub.ScheduleGroupPushNotification(
-			roomID, userID, room.Name, req.Text, *messageID,
+		avatar := ""
+		if room.Avatar != nil {
+			avatar = *room.Avatar
+		}
+		h.wsHub.ScheduleRoomPushNotification(
+			roomID, userID, room.Name, avatar, req.Text, *messageID, now,
 			pushTargets, 10*time.Second,
 		)
 	}
@@ -161,12 +187,11 @@ func (h *RoomHandler) GetRoomMessages(c *gin.Context) {
 	}
 	roomID := parseRoomID(c)
 
-	var room models.ChatRoom
-	if err := database.DB.First(&room, roomID).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Otaq tapılmadı"})
+	roomPtr, ok := loadVisibleRoom(c, roomID, userID)
+	if !ok {
 		return
 	}
-	if room.IsFrozen {
+	if roomPtr.IsFrozen {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Otaq dondurulub", "code": "ROOM_FROZEN"})
 		return
 	}
@@ -178,7 +203,24 @@ func (h *RoomHandler) GetRoomMessages(c *gin.Context) {
 		}
 	}
 	// Açıq otaq qaydası: HƏR KƏS (join olmayan belə) BÜTÜN mesajları görür.
-	// Join yalnız mesaj yazmaq üçün lazımdır (SendRoomMessage). Filtr yoxdur.
+	// Join yalnız mesaj yazmaq üçün lazımdır (SendRoomMessage).
+	//
+	// Paging (new clients): before_id = the oldest message the client has; the
+	// page continues strictly older than it. Without it → the newest page.
+	cursorSQL := ""
+	var cursorArgs []interface{}
+	var upperBound *time.Time
+	if beforeID := c.Query("before_id"); beforeID != "" {
+		var anchor struct {
+			CreatedAt time.Time `gorm:"column:created_at"`
+		}
+		database.DB.Raw(`SELECT created_at FROM messages WHERE id = ? AND room_id = ?`, beforeID, roomID).Scan(&anchor)
+		if !anchor.CreatedAt.IsZero() {
+			cursorSQL = ` AND (m.created_at < ? OR (m.created_at = ? AND m.id < ?))`
+			cursorArgs = []interface{}{anchor.CreatedAt, anchor.CreatedAt, beforeID}
+			upperBound = &anchor.CreatedAt
+		}
+	}
 
 	type row struct {
 		ID             string
@@ -225,9 +267,14 @@ func (h *RoomHandler) GetRoomMessages(c *gin.Context) {
 		LEFT JOIN users reply_u ON reply_u.id = reply.sender_id
 		WHERE m.room_id = ?
 		  AND m.deleted_at IS NULL
+		  AND NOT EXISTS (
+		      SELECT 1 FROM user_blocks ub
+		      WHERE (ub.blocker_id = ? AND ub.blocked_id = m.sender_id)
+		         OR (ub.blocker_id = m.sender_id AND ub.blocked_id = ?)
+		  )`+cursorSQL+`
 		ORDER BY m.created_at DESC, m.id DESC
 		LIMIT ?
-	`, userID, userID, roomID, limit).Scan(&rows)
+	`, append(append([]interface{}{userID, userID, roomID, userID, userID}, cursorArgs...), limit)...).Scan(&rows)
 	log.Printf("[Room] GetRoomMessages room=%d userID=%d → rows=%d", roomID, userID, len(rows))
 
 	// Reaksiyalar — N+1 yox: səhifədəki bütün mesaj id-ləri üçün BİR sorğu,
@@ -288,7 +335,26 @@ func (h *RoomHandler) GetRoomMessages(c *gin.Context) {
 		out = append(out, item)
 	}
 
-	c.JSON(http.StatusOK, gin.H{"data": out})
+	resp := gin.H{"data": out, "has_more": len(rows) == limit}
+	// include_events=1 (new clients): the join/leave lines of this page's time
+	// span, only those the viewer may see (members since before the event).
+	if c.Query("include_events") == "1" {
+		events := []models.RoomEventResponse{}
+		if mem := roomMembership(roomID, userID); mem != nil && mem.JoinedAt != nil {
+			to := time.Now().Add(time.Minute)
+			if upperBound != nil {
+				to = *upperBound
+			}
+			from := *mem.JoinedAt
+			if len(rows) == limit {
+				// More history exists: this page starts at its oldest message.
+				from = rows[len(rows)-1].CreatedAt
+			}
+			events = roomEventsForViewer(roomID, userID, *mem.JoinedAt, from, to)
+		}
+		resp["events"] = events
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // SetRoomReaction — POST /api/v1/rooms/:room_id/messages/:message_id/reaction
@@ -303,6 +369,9 @@ func (h *RoomHandler) SetRoomReaction(c *gin.Context) {
 	}
 	roomID := parseRoomID(c)
 	messageID := c.Param("message_id")
+	if _, ok := loadVisibleRoom(c, roomID, userID); !ok {
+		return
+	}
 
 	var body struct {
 		Emoji string `json:"emoji" binding:"required"`
@@ -391,11 +460,16 @@ func (h *RoomHandler) DeleteRoomMessage(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "İcazə yoxdur"})
 		return
 	}
+	// Soft delete: gone for everyone instantly, the row (and its encrypted text)
+	// stays for moderation; room_message_deletions records who removed it.
 	database.DB.Delete(&models.Message{}, "id = ?", messageID)
+	database.DB.Exec(`
+		INSERT INTO room_message_deletions (room_id, message_id, sender_id, deleted_by, by_admin, created_at)
+		VALUES (?, ?, ?, ?, ?, NOW())`, roomID, messageID, msg.SenderID, userID, msg.SenderID != userID)
 	// Silinən mesajın reaksiyalarını da təmizlə (sahibsiz qalmasın).
 	database.DB.Exec(`DELETE FROM room_message_reactions WHERE message_id = ?`, messageID)
 	h.wsHub.SendToMultipleUsers(h.roomMemberIDs(roomID), "room_message_deleted", gin.H{
-		"room_id": roomID, "message_id": messageID,
+		"room_id": roomID, "message_id": messageID, "deleted_by": userID,
 	})
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
@@ -411,6 +485,9 @@ func (h *RoomHandler) roomMemberIDsExcludingBlocked(roomID, senderID uint) []uin
 		      SELECT 1 FROM user_blocks ub
 		      WHERE (ub.blocker_id = rm.user_id AND ub.blocked_id = ?)
 		         OR (ub.blocker_id = ? AND ub.blocked_id = rm.user_id)
+		  )
+		  AND NOT EXISTS (
+		      SELECT 1 FROM room_hides rh WHERE rh.room_id = rm.room_id AND rh.user_id = rm.user_id
 		  )
 	`, roomID, senderID, senderID).Scan(&ids)
 	return ids

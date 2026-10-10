@@ -23,6 +23,13 @@ type ChatRoom struct {
 	IsFrozen bool `json:"is_frozen" gorm:"default:false;index"`
 	// Yeni gələn üzv əvvəlki mesajları görsünmü? Yaradan seçir.
 	HistoryVisible bool `json:"history_visible" gorm:"default:true"`
+	// Admin turned screenshots off: clients host the chat in a secure canvas
+	// (same mechanism as the 1:1 chat switch).
+	ScreenshotDisabled bool `json:"screenshot_disabled" gorm:"default:false"`
+	// Writing closed for everyone but admins. locked + until NULL = until an
+	// admin reopens it; a past `until` means the lock already expired.
+	MessagingLocked      bool       `json:"messaging_locked" gorm:"default:false"`
+	MessagingLockedUntil *time.Time `json:"messaging_locked_until"`
 	// Karma sıralama sayğacları.
 	JoinCount      uint           `json:"join_count" gorm:"default:0"`
 	MessageCount   uint           `json:"message_count" gorm:"default:0"`
@@ -37,6 +44,37 @@ type ChatRoom struct {
 }
 
 func (ChatRoom) TableName() string { return "rooms" }
+
+// IsMessagingLocked — writing is closed for non-admins at `now`.
+func (r ChatRoom) IsMessagingLocked(now time.Time) bool {
+	if !r.MessagingLocked {
+		return false
+	}
+	return r.MessagingLockedUntil == nil || r.MessagingLockedUntil.After(now)
+}
+
+// RoomEvent — a "joined" / "left" line in the room timeline. Only users who
+// were members when it happened see it (filtered by their joined_at).
+type RoomEvent struct {
+	ID        uint      `json:"id" gorm:"primaryKey"`
+	RoomID    uint      `json:"room_id"`
+	UserID    uint      `json:"user_id"`
+	Kind      string    `json:"kind" gorm:"type:varchar(10)"` // join | leave
+	CreatedAt time.Time `json:"created_at"`
+}
+
+func (RoomEvent) TableName() string { return "room_events" }
+
+// RoomEventResponse — a timeline event as clients receive it (REST + WS).
+type RoomEventResponse struct {
+	ID        string    `json:"id"` // "evt_<id>" — never collides with message UUIDs
+	RoomID    uint      `json:"room_id"`
+	Kind      string    `json:"kind"`
+	UserID    uint      `json:"user_id"`
+	Username  string    `json:"username"`
+	Name      string    `json:"name"`
+	CreatedAt time.Time `json:"created_at"`
+}
 
 // RoomMember — otaq üzvü. role: owner | admin | member. Member = join edən
 // (tək-klik). Oxumaq üçün üzvlük tələb olunmur; yazmaq üçün tələb olunur.
@@ -106,6 +144,19 @@ type RoomResponse struct {
 	IsMember       bool       `json:"is_member"`
 	LastActivityAt *time.Time `json:"last_activity_at"`
 	CreatedAt      time.Time  `json:"created_at"`
+	// Room settings (additive — old clients ignore them).
+	ScreenshotDisabled   bool       `json:"screenshot_disabled"`
+	MessagingLocked      bool       `json:"messaging_locked"` // effective (expired lock = false)
+	MessagingLockedUntil *time.Time `json:"messaging_locked_until"`
+	// Current member count (join_count is cumulative and never goes down).
+	MemberCount int `json:"member_count"`
+	// Viewer state — filled on the detail endpoints (GetRoom / UpdateRoom /
+	// settings); zero values on the discover list.
+	WriteBlocked bool       `json:"write_blocked"`
+	CanWrite     bool       `json:"can_write"`
+	IsMuted      bool       `json:"is_muted"`
+	IsHidden     bool       `json:"is_hidden"`
+	JoinedAt     *time.Time `json:"joined_at"`
 }
 
 // RoomListItem — join olunmuş otağın "Söhbətlər" siyahısı üçün sətri (iOS
@@ -125,6 +176,11 @@ type RoomListItem struct {
 	IsArchived      bool       `json:"is_archived"`
 	IsPinned        bool       `json:"is_pinned"`
 	PinnedAt        *time.Time `json:"pinned_at"`
+	// Room settings + my write state (additive).
+	ScreenshotDisabled   bool       `json:"screenshot_disabled"`
+	MessagingLocked      bool       `json:"messaging_locked"`
+	MessagingLockedUntil *time.Time `json:"messaging_locked_until"`
+	WriteBlocked         bool       `json:"write_blocked"`
 }
 
 type RoomMessageResponse struct {
@@ -164,4 +220,6 @@ type RoomMemberResponse struct {
 	ProfileImage *string    `json:"profile_image"`
 	Role         string     `json:"role"`
 	JoinedAt     *time.Time `json:"joined_at"`
+	// Admin blocked this member from writing (admin views only).
+	WriteBlocked bool `json:"write_blocked"`
 }

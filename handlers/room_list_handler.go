@@ -68,9 +68,23 @@ func (h *RoomHandler) GetMyRooms(c *gin.Context) {
 		memByRoom[m.RoomID] = m
 	}
 
-	// Otaqlar (silinmiş/dondurulmuş olmayan — frozen siyahıda görünməsin).
+	// Otaqlar (silinmiş/dondurulmuş olmayan — frozen siyahıda görünməsin). Hidden
+	// rooms and rooms whose owner is blocked with the user never show.
 	var rooms []models.ChatRoom
-	database.DB.Where("id IN ? AND is_frozen = ?", roomIDs, false).Find(&rooms)
+	database.DB.Where("id IN ? AND is_frozen = ?", roomIDs, false).
+		Where(roomOwnerNotBlockedSQL, userID, userID).
+		Where(roomNotHiddenSQL, userID).
+		Find(&rooms)
+
+	// My write blocks in these rooms (one query).
+	writeBlocked := map[uint]bool{}
+	var blockedRoomIDs []uint
+	database.DB.Table("room_write_blocks").
+		Where("user_id = ? AND room_id IN ?", userID, roomIDs).
+		Pluck("room_id", &blockedRoomIDs)
+	for _, id := range blockedRoomIDs {
+		writeBlocked[id] = true
+	}
 
 	// Üzv sayıları (bir sorğu).
 	type cnt struct {
@@ -152,6 +166,11 @@ func (h *RoomHandler) GetMyRooms(c *gin.Context) {
 			IsArchived:      mem.IsArchived,
 			IsPinned:        mem.IsPinned,
 			PinnedAt:        mem.PinnedAt,
+			// Settings + my write state.
+			ScreenshotDisabled:   r.ScreenshotDisabled,
+			MessagingLocked:      r.IsMessagingLocked(time.Now()),
+			MessagingLockedUntil: lockUntilIfActive(r),
+			WriteBlocked:         writeBlocked[r.ID] && mem.Role != "owner" && mem.Role != "admin",
 		})
 	}
 
@@ -160,11 +179,14 @@ func (h *RoomHandler) GetMyRooms(c *gin.Context) {
 
 // roomPushTargets — push bildirişi göndəriləcək üzvlər: JOIN olmuş, muted
 // OLMAYAN (muted_until keçibsə mute sayılmır), göndərənlə bloklu olmayan,
-// göndərənin özü olmayan. Group chat push məntiqi ilə eyni.
+// göndərənin özü olmayan. Group chat push məntiqi ilə eyni. Also skipped:
+// members who hid the room and members blocked with the room owner (for them
+// the room does not exist).
 func (h *RoomHandler) roomPushTargets(roomID, senderID uint) []uint {
 	var ids []uint
 	database.DB.Raw(`
 		SELECT rm.user_id FROM room_members rm
+		JOIN rooms r ON r.id = rm.room_id
 		WHERE rm.room_id = ?
 		  AND rm.user_id <> ?
 		  AND (rm.is_muted = false OR (rm.muted_until IS NOT NULL AND rm.muted_until < NOW()))
@@ -172,6 +194,14 @@ func (h *RoomHandler) roomPushTargets(roomID, senderID uint) []uint {
 		      SELECT 1 FROM user_blocks ub
 		      WHERE (ub.blocker_id = rm.user_id AND ub.blocked_id = ?)
 		         OR (ub.blocker_id = ? AND ub.blocked_id = rm.user_id)
+		  )
+		  AND NOT EXISTS (
+		      SELECT 1 FROM room_hides rh WHERE rh.room_id = rm.room_id AND rh.user_id = rm.user_id
+		  )
+		  AND NOT EXISTS (
+		      SELECT 1 FROM user_blocks ob
+		      WHERE (ob.blocker_id = rm.user_id AND ob.blocked_id = r.owner_id)
+		         OR (ob.blocker_id = r.owner_id AND ob.blocked_id = rm.user_id)
 		  )
 	`, roomID, senderID, senderID, senderID).Scan(&ids)
 	return ids

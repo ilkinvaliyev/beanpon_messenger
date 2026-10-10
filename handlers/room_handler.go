@@ -6,10 +6,12 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"beanpon_messenger/database"
 	"beanpon_messenger/models"
+	"beanpon_messenger/services"
 	"beanpon_messenger/utils"
 
 	"github.com/gin-gonic/gin"
@@ -25,8 +27,9 @@ type RoomHandler struct {
 		IsUserOnline(userID uint) bool
 		SendToUser(userID uint, messageType string, data interface{})
 		SendToMultipleUsers(userIDs []uint, messageType string, data interface{})
-		// Qrup push helper-ini otaqlar üçün də istifadə edirik (eyni FCM axını).
-		ScheduleGroupPushNotification(conversationID, senderID uint, groupName, message, messageID string, memberIDs []uint, delay time.Duration)
+		// Room push (delayed, skips members who already read the message) —
+		// Laravel /notification/new-room-message opens the room on tap.
+		ScheduleRoomPushNotification(roomID, senderID uint, roomName, roomAvatar, message, messageID string, sentAt time.Time, memberIDs []uint, delay time.Duration)
 	}
 	encryptionService interface {
 		EncryptMessage(plainText string) (string, error)
@@ -38,7 +41,7 @@ func NewRoomHandler(wsHub interface {
 	IsUserOnline(userID uint) bool
 	SendToUser(userID uint, messageType string, data interface{})
 	SendToMultipleUsers(userIDs []uint, messageType string, data interface{})
-	ScheduleGroupPushNotification(conversationID, senderID uint, groupName, message, messageID string, memberIDs []uint, delay time.Duration)
+	ScheduleRoomPushNotification(roomID, senderID uint, roomName, roomAvatar, message, messageID string, sentAt time.Time, memberIDs []uint, delay time.Duration)
 }, encryptionService interface {
 	EncryptMessage(plainText string) (string, error)
 	DecryptMessage(encryptedText string) (string, error)
@@ -153,14 +156,23 @@ func (h *RoomHandler) CreateRoom(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Otaq yaradılmadı"})
 		return
 	}
+	// The avatar is uploaded through /messenger/upload-media, which tracks it as
+	// chat media and deletes it after 24 h unless something references it.
+	if req.Avatar != nil {
+		services.MarkMediaReferenced(database.DB, *req.Avatar)
+	}
 
 	// Owner avtomatik üzv. Xəta yutulmasın — logla (member satırı yazılmasa
 	// otaq "Söhbətlər"də görünməz və owner "üzv deyil" kimi görünər).
-	if _, err := insertRoomMember(room.ID, userID, "owner"); err != nil {
+	if _, err := insertRoomMember(room.ID, userID, "owner", now); err != nil {
 		log.Printf("[Room] owner member insert FAILED room=%d user=%d: %v", room.ID, userID, err)
 	}
 
-	c.JSON(http.StatusOK, gin.H{"data": h.toRoomResponse(room, strPtr("owner"), true)})
+	resp := h.toRoomResponse(room, strPtr("owner"), true)
+	resp.MemberCount = 1
+	resp.CanWrite = true
+	resp.JoinedAt = &now
+	c.JSON(http.StatusOK, gin.H{"data": resp})
 }
 
 // GET /api/v1/rooms — otaq siyahısı, karma sıralı. Guest oxuya bilməz.
@@ -185,9 +197,18 @@ func (h *RoomHandler) ListRooms(c *gin.Context) {
 	}
 
 	var rooms []models.ChatRoom
-	// Dondurulmuş otaqlar siyahıda görünmür (yalnız admin idarəçiliyi).
-	database.DB.Where("is_frozen = ?", false).
-		Order("score DESC, last_activity_at DESC NULLS LAST").
+	// Dondurulmuş otaqlar siyahıda görünmür (yalnız admin idarəçiliyi). Rooms of
+	// an owner the viewer is blocked with (either way) and rooms the viewer hid
+	// never show. exclude_joined=1 (new clients): joined rooms live in the chats
+	// list, so the Rooms tab shows only the ones the viewer is not in.
+	q := database.DB.Where("is_frozen = ?", false).
+		Where(roomOwnerNotBlockedSQL, userID, userID).
+		Where(roomNotHiddenSQL, userID)
+	if c.Query("exclude_joined") == "1" {
+		q = q.Where("rooms.owner_id <> ?", userID).
+			Where("NOT EXISTS (SELECT 1 FROM room_members rm WHERE rm.room_id = rooms.id AND rm.user_id = ?)", userID)
+	}
+	q.Order("score DESC, last_activity_at DESC NULLS LAST").
 		Limit(limit).Offset(offset).Find(&rooms)
 
 	// Üzvlük xəritəsi (bir sorğu).
@@ -196,6 +217,7 @@ func (h *RoomHandler) ListRooms(c *gin.Context) {
 		roomIDs = append(roomIDs, r.ID)
 	}
 	memberRole := map[uint]string{}
+	memberCount := roomMemberCounts(roomIDs)
 	if len(roomIDs) > 0 {
 		var mems []models.RoomMember
 		database.DB.Where("room_id IN ? AND user_id = ?", roomIDs, userID).Find(&mems)
@@ -217,7 +239,9 @@ func (h *RoomHandler) ListRooms(c *gin.Context) {
 			rolePtr = strPtr("owner")
 			isMember = true
 		}
-		out = append(out, h.toRoomResponse(r, rolePtr, isMember))
+		resp := h.toRoomResponse(r, rolePtr, isMember)
+		resp.MemberCount = memberCount[r.ID]
+		out = append(out, resp)
 	}
 	c.JSON(http.StatusOK, gin.H{"data": out})
 }
@@ -230,17 +254,11 @@ func (h *RoomHandler) GetRoom(c *gin.Context) {
 		return
 	}
 	roomID := parseRoomID(c)
-	var room models.ChatRoom
-	if err := database.DB.First(&room, roomID).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Otaq tapılmadı"})
+	room, ok := loadVisibleRoom(c, roomID, userID)
+	if !ok {
 		return
 	}
-	mem := roomMembership(roomID, userID)
-	var rolePtr *string
-	if mem != nil {
-		rolePtr = strPtr(mem.Role)
-	}
-	c.JSON(http.StatusOK, gin.H{"data": h.toRoomResponse(room, rolePtr, mem != nil)})
+	c.JSON(http.StatusOK, gin.H{"data": h.roomDetailResponse(*room, userID)})
 }
 
 // POST /api/v1/rooms/:room_id/join — tək-klik join (idempotent).
@@ -251,12 +269,13 @@ func (h *RoomHandler) JoinRoom(c *gin.Context) {
 		return
 	}
 	roomID := parseRoomID(c)
-	// A deleted / unknown room is a clear 404 instead of a foreign-key 500.
-	var room models.ChatRoom
-	if err := database.DB.Select("id").First(&room, roomID).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Otaq tapılmadı", "code": "ROOM_NOT_FOUND"})
+	// A deleted / unknown room (or one whose owner is blocked with the viewer)
+	// is a clear 404 instead of a foreign-key 500.
+	if _, ok := loadVisibleRoom(c, roomID, userID); !ok {
 		return
 	}
+	// Joining a room the user hid brings it back everywhere.
+	database.DB.Exec(`DELETE FROM room_hides WHERE room_id = ? AND user_id = ?`, roomID, userID)
 	log.Printf("[Room] JoinRoom start room=%d user=%d", roomID, userID)
 	if err := h.ensureMember(roomID, userID); err != nil {
 		log.Printf("[Room] JoinRoom ensureMember err room=%d user=%d: %v", roomID, userID, err)
@@ -281,6 +300,8 @@ func (h *RoomHandler) LeaveRoom(c *gin.Context) {
 		return
 	}
 	database.DB.Delete(&models.RoomMember{}, mem.ID)
+	// "X left" line for the members who are still in the room.
+	h.recordRoomEvent(roomID, userID, "leave", time.Now())
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
@@ -291,7 +312,8 @@ func (h *RoomHandler) ensureMember(roomID, userID uint) error {
 	if roomMembership(roomID, userID) != nil {
 		return nil
 	}
-	inserted, err := insertRoomMember(roomID, userID, "member")
+	now := time.Now()
+	inserted, err := insertRoomMember(roomID, userID, "member", now)
 	if err != nil {
 		log.Printf("[Room] ensureMember insert FAILED room=%d user=%d: %v", roomID, userID, err)
 		return err
@@ -304,6 +326,9 @@ func (h *RoomHandler) ensureMember(roomID, userID uint) error {
 		database.DB.Model(&models.ChatRoom{}).Where("id = ?", roomID).
 			UpdateColumn("join_count", gorm.Expr("join_count + 1"))
 		h.bumpScore(roomID)
+		// "X joined" line — same instant as joined_at, so the joiner sees it
+		// and anyone who joins later does not.
+		h.recordRoomEvent(roomID, userID, "join", now)
 	}
 	return nil
 }
@@ -316,8 +341,7 @@ var errMembershipNotSaved = errors.New("room membership row was not saved")
 // ON CONFLICT DO NOTHING absorbs a concurrent duplicate and, unlike
 // ON CONFLICT (room_id, user_id), does not require that unique index to exist.
 // inserted=false → the row was already there.
-func insertRoomMember(roomID, userID uint, role string) (inserted bool, err error) {
-	now := time.Now()
+func insertRoomMember(roomID, userID uint, role string, now time.Time) (inserted bool, err error) {
 	res := database.DB.Exec(`
 		INSERT INTO room_members (room_id, user_id, role, joined_at, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?)
@@ -387,16 +411,15 @@ func (h *RoomHandler) UpdateRoom(c *gin.Context) {
 	if len(updates) > 0 {
 		database.DB.Model(&models.ChatRoom{}).Where("id = ?", roomID).Updates(updates)
 	}
+	// Keep the uploaded avatar out of the 24 h orphan-media sweep.
+	if req.Avatar != nil {
+		services.MarkMediaReferenced(database.DB, *req.Avatar)
+	}
 
 	var room models.ChatRoom
 	if err := database.DB.First(&room, roomID).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Otaq tapılmadı"})
 		return
-	}
-	role := roomMembership(roomID, userID)
-	var rolePtr *string
-	if role != nil {
-		rolePtr = &role.Role
 	}
 	// Üzvlərə WS bildir (client başlıq/avatar yeniləsin).
 	h.wsHub.SendToMultipleUsers(h.roomMemberIDs(roomID), "room_updated", gin.H{
@@ -405,7 +428,7 @@ func (h *RoomHandler) UpdateRoom(c *gin.Context) {
 		"description": room.Description,
 		"avatar":      room.Avatar,
 	})
-	c.JSON(http.StatusOK, gin.H{"data": h.toRoomResponse(room, rolePtr, role != nil)})
+	c.JSON(http.StatusOK, gin.H{"data": h.roomDetailResponse(room, userID)})
 }
 
 // DELETE /api/v1/rooms/:room_id — otağı sil (yalnız owner).
@@ -426,13 +449,15 @@ func (h *RoomHandler) DeleteRoom(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
-// PUT /api/v1/rooms/:room_id/admin/:user_id — admin et / geri al (yalnız owner).
+// PUT /api/v1/rooms/:room_id/admin/:user_id — admin et / geri al.
+// The owner promotes and demotes; an admin may only promote a member (it can
+// never demote another admin or touch the owner).
 func (h *RoomHandler) SetAdmin(c *gin.Context) {
 	userID := c.MustGet("user_id").(uint)
 	roomID := parseRoomID(c)
 	mem := roomMembership(roomID, userID)
-	if mem == nil || !mem.IsOwner() {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Yalnız sahib admin təyin edə bilər"})
+	if mem == nil || !mem.HasAdminAccess() {
+		c.JSON(http.StatusForbidden, gin.H{"error": "İcazə yoxdur"})
 		return
 	}
 	targetID64, _ := strconv.ParseUint(c.Param("user_id"), 10, 32)
@@ -441,6 +466,15 @@ func (h *RoomHandler) SetAdmin(c *gin.Context) {
 		Admin bool `json:"admin"`
 	}
 	_ = c.ShouldBindJSON(&body)
+	if !body.Admin && !mem.IsOwner() {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Yalnız sahib adminliyi geri ala bilər"})
+		return
+	}
+	target := roomMembership(roomID, targetID)
+	if target != nil && target.IsOwner() {
+		c.JSON(http.StatusForbidden, gin.H{"error": "İcazə yoxdur"})
+		return
+	}
 	// Hədəf üzv deyilsə əvvəlcə üzv et.
 	if err := h.ensureMember(roomID, targetID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Alınmadı"})
@@ -449,18 +483,29 @@ func (h *RoomHandler) SetAdmin(c *gin.Context) {
 	role := "member"
 	if body.Admin {
 		role = "admin"
+		// Admins can always write — a leftover write block would only confuse.
+		database.DB.Exec(`DELETE FROM room_write_blocks WHERE room_id = ? AND user_id = ?`, roomID, targetID)
 	}
 	// Owner rolunu dəyişmə (owner həmişə owner).
 	database.DB.Model(&models.RoomMember{}).
 		Where("room_id = ? AND user_id = ? AND role <> 'owner'", roomID, targetID).
 		UpdateColumn("role", role)
+	// The target's open room screen updates its role (admin tools appear/go).
+	h.wsHub.SendToUser(targetID, "room_member_updated", gin.H{
+		"room_id": roomID, "user_id": targetID, "role": role, "write_blocked": false,
+	})
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "role": role})
 }
 
-// GET /api/v1/rooms/:room_id/members — otaq üzvləri (detay səhifəsi üçün).
-// Group GetMembers ikizi: `{members: [...]}`. İki yönlü block cascade — cari
-// istifadəçi ilə bloklu üzvlər siyahıda görünmür. Üzvlük tələb olunmur (oxuyan
-// da detay aça bilər), amma guest yox.
+// GET /api/v1/rooms/:room_id/members — otaq üzvləri (detay səhifəsi).
+// Group GetMembers ikizi: `{members: [...], total: N}`. Visibility:
+//   - not a member → empty list (outsiders never see who is in the room);
+//   - member → only the owner + admins;
+//   - owner/admin → everyone, newest joiner first, `?q=` search on
+//     username/name, `?limit=&offset=` paging, plus each member's write block.
+//
+// `?scope=admins` returns only the owner + admins for anyone allowed to see
+// them. Members the viewer is blocked with (either way) never show.
 func (h *RoomHandler) GetRoomMembers(c *gin.Context) {
 	userID := c.MustGet("user_id").(uint)
 	if isGuest(userID) {
@@ -468,6 +513,26 @@ func (h *RoomHandler) GetRoomMembers(c *gin.Context) {
 		return
 	}
 	roomID := parseRoomID(c)
+	if _, ok := loadVisibleRoom(c, roomID, userID); !ok {
+		return
+	}
+	total := roomMemberCounts([]uint{roomID})[roomID]
+
+	mem := roomMembership(roomID, userID)
+	if mem == nil {
+		c.JSON(http.StatusOK, gin.H{"members": []models.RoomMemberResponse{}, "total": total})
+		return
+	}
+	adminsOnly := !mem.HasAdminAccess() || c.Query("scope") == "admins"
+
+	limit := 50
+	if v, ok := atoiPos(c.Query("limit")); ok && v > 0 && v <= 200 {
+		limit = v
+	}
+	offset := 0
+	if v, ok := atoiPos(c.Query("offset")); ok {
+		offset = v
+	}
 
 	type row struct {
 		UserID       uint       `gorm:"column:user_id"`
@@ -477,11 +542,13 @@ func (h *RoomHandler) GetRoomMembers(c *gin.Context) {
 		ProfileImage *string    `gorm:"column:profile_image"`
 		Role         string     `gorm:"column:role"`
 		JoinedAt     *time.Time `gorm:"column:joined_at"`
+		WriteBlocked bool       `gorm:"column:write_blocked"`
 	}
-	var rows []row
-	database.DB.Raw(`
+	query := `
 		SELECT rm.user_id, u.name, u.username, u.is_verified,
-		       p.profile_image, rm.role, rm.joined_at
+		       p.profile_image, rm.role, rm.joined_at,
+		       EXISTS (SELECT 1 FROM room_write_blocks wb
+		               WHERE wb.room_id = rm.room_id AND wb.user_id = rm.user_id) AS write_blocked
 		FROM room_members rm
 		JOIN users u ON u.id = rm.user_id
 		LEFT JOIN profiles p ON p.user_id = rm.user_id
@@ -490,11 +557,25 @@ func (h *RoomHandler) GetRoomMembers(c *gin.Context) {
 		      SELECT 1 FROM user_blocks ub
 		      WHERE (ub.blocker_id = ? AND ub.blocked_id = rm.user_id)
 		         OR (ub.blocker_id = rm.user_id AND ub.blocked_id = ?)
-		  )
-		ORDER BY
-			CASE rm.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END,
-			rm.joined_at ASC NULLS LAST
-	`, roomID, userID, userID).Scan(&rows)
+		  )`
+	args := []interface{}{roomID, userID, userID}
+	if adminsOnly {
+		query += ` AND rm.role IN ('owner', 'admin')`
+	}
+	if q := strings.TrimSpace(c.Query("q")); q != "" && !adminsOnly {
+		like := "%" + strings.ToLower(q) + "%"
+		query += ` AND (LOWER(u.username) LIKE ? OR LOWER(u.name) LIKE ?)`
+		args = append(args, like, like)
+	}
+	if adminsOnly {
+		query += ` ORDER BY CASE rm.role WHEN 'owner' THEN 0 ELSE 1 END, rm.joined_at ASC NULLS LAST`
+	} else {
+		// Newest joiner on top (admin members page).
+		query += ` ORDER BY rm.joined_at DESC NULLS LAST, rm.id DESC LIMIT ? OFFSET ?`
+		args = append(args, limit, offset)
+	}
+	var rows []row
+	database.DB.Raw(query, args...).Scan(&rows)
 
 	out := make([]models.RoomMemberResponse, 0, len(rows))
 	for _, r := range rows {
@@ -506,9 +587,15 @@ func (h *RoomHandler) GetRoomMembers(c *gin.Context) {
 			ProfileImage: utils.PrependBaseURL(r.ProfileImage),
 			Role:         r.Role,
 			JoinedAt:     r.JoinedAt,
+			// Only admins learn who is write-blocked.
+			WriteBlocked: r.WriteBlocked && mem.HasAdminAccess(),
 		})
 	}
-	c.JSON(http.StatusOK, gin.H{"members": out})
+	resp := gin.H{"members": out, "total": total}
+	if !adminsOnly {
+		resp["has_more"] = len(rows) == limit
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // requireAdmin — owner|admin deyilsə 403 yazıb false qaytarır.
@@ -545,6 +632,10 @@ func (h *RoomHandler) toRoomResponse(r models.ChatRoom, myRole *string, isMember
 		IsMember:       isMember,
 		LastActivityAt: r.LastActivityAt,
 		CreatedAt:      r.CreatedAt,
+		// Settings. An expired lock reads as unlocked.
+		ScreenshotDisabled:   r.ScreenshotDisabled,
+		MessagingLocked:      r.IsMessagingLocked(time.Now()),
+		MessagingLockedUntil: lockUntilIfActive(r),
 	}
 }
 
