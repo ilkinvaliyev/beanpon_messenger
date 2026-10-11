@@ -535,6 +535,51 @@ func (h *RoomHandler) DeleteRoomMessage(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
+// DELETE /api/v1/rooms/:room_id/messages — owner|admin clears the whole room
+// history for everyone. Same rules as a single delete, for every message at
+// once: soft delete (content stays for moderation) + one room_message_deletions
+// row each; reactions and join/leave lines go too. One transaction, then the
+// members get WS room_messages_cleared (clients drop their cache and reload).
+func (h *RoomHandler) ClearRoomMessages(c *gin.Context) {
+	userID := c.MustGet("user_id").(uint)
+	roomID := parseRoomID(c)
+	if _, ok := loadVisibleRoom(c, roomID, userID); !ok {
+		return
+	}
+	if !h.requireAdmin(c, roomID, userID) {
+		return
+	}
+	clearedAt := time.Now()
+	var cleared int64
+	err := database.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec(`
+			INSERT INTO room_message_deletions (room_id, message_id, sender_id, deleted_by, by_admin, created_at)
+			SELECT room_id, CAST(id AS TEXT), sender_id, ?, sender_id <> ?, ?
+			FROM messages WHERE room_id = ? AND deleted_at IS NULL`,
+			userID, userID, clearedAt, roomID).Error; err != nil {
+			return err
+		}
+		res := tx.Exec(`UPDATE messages SET deleted_at = ? WHERE room_id = ? AND deleted_at IS NULL`, clearedAt, roomID)
+		if res.Error != nil {
+			return res.Error
+		}
+		cleared = res.RowsAffected
+		if err := tx.Exec(`DELETE FROM room_message_reactions WHERE room_id = ?`, roomID).Error; err != nil {
+			return err
+		}
+		return tx.Exec(`DELETE FROM room_events WHERE room_id = ?`, roomID).Error
+	})
+	if err != nil {
+		log.Printf("[Room] clear messages failed room=%d by=%d: %v", roomID, userID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Mesajlar silinmədi"})
+		return
+	}
+	h.wsHub.SendToMultipleUsers(h.roomMemberIDs(roomID), "room_messages_cleared", gin.H{
+		"room_id": roomID, "cleared_by": userID, "cleared_at": clearedAt, "count": cleared,
+	})
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "cleared": cleared})
+}
+
 // roomMemberIDsExcludingBlocked — WS fan-out üçün üzvlər; göndərənlə iki yönlü
 // block əlaqəsi olanlar çıxarılır (mesaj onlara çatmasın).
 func (h *RoomHandler) roomMemberIDsExcludingBlocked(roomID, senderID uint) []uint {

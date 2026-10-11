@@ -64,3 +64,12 @@ messenger build — every room endpoint reads `room_bans`.
   partial unique index `rooms_name_unique_ci` — if live duplicates already exist it creates the lookup index
   `rooms_name_lookup_ci` instead and logs them (rename them, then add the unique index in a follow-up
   migration); the messenger check works either way.
+
+## Delete all messages (2026-10-11, additive — no migration)
+
+`DELETE /rooms/:id/messages` — owner|admin only (403 otherwise, 404 for banned / owner-blocked viewers). In one
+transaction: every live message of the room gets `deleted_at` (soft delete, content stays for moderation) plus
+one `room_message_deletions` audit row each (`deleted_by` = the admin, `by_admin` = not their own message);
+`room_message_reactions` and `room_events` (join/leave lines) of the room are deleted. Then WS
+`room_messages_cleared` `{room_id, cleared_by, cleared_at, count}` goes to the members. Reply
+`{"status":"ok","cleared":N}`. Old clients ignore the WS event; their next open shows the empty history.
