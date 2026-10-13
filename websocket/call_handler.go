@@ -72,6 +72,9 @@ type callMessageRequest struct {
 	Status   string `json:"status" binding:"required"` // ended | missed | rejected | canceled
 	Duration int    `json:"duration"`
 	CallID   string `json:"call_id"`
+	// Media — "audio" | "video" (optional, additive). Kept in the bubble JSON so a
+	// video call's bubble stays a video bubble after this server-side rewrite.
+	Media string `json:"media"`
 }
 
 func (h *Hub) HandleCallMessage(c *gin.Context) {
@@ -90,6 +93,9 @@ func (h *Hub) HandleCallMessage(c *gin.Context) {
 		"status":   req.Status,
 		"duration": req.Duration,
 		"call_id":  req.CallID,
+	}
+	if req.Media == "video" {
+		payload["media"] = "video"
 	}
 	textBytes, _ := json.Marshal(payload)
 	text := string(textBytes)
@@ -216,6 +222,12 @@ func (h *Hub) lookupCallMessageID(callID string) string {
 	h.callMsgMu.Unlock()
 	if id != "" {
 		return id
+	}
+	// Client-created bubbles use the call id as the message id (WS send_message
+	// client_message_id = call_id) → direct primary-key hit, no scan.
+	var direct models.Message
+	if err := h.db.Select("id").Where("id = ?", callID).Limit(1).Find(&direct).Error; err == nil && direct.ID != "" {
+		return direct.ID
 	}
 	// Fallback: son çağrı mesajlarını deşifrə edib call_id tap (restart halı).
 	var rows []models.Message

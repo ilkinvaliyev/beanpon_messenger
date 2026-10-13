@@ -68,11 +68,12 @@ func (h *RoomHandler) GetMyRooms(c *gin.Context) {
 		memByRoom[m.RoomID] = m
 	}
 
-	// Otaqlar (silinmiş/dondurulmuş olmayan — frozen siyahıda görünməsin). Hidden
-	// rooms, rooms whose owner is blocked with the user and rooms the user is
-	// banned from never show.
+	// Otaqlar. A frozen room stays in its members' list at the same place
+	// (is_frozen = true, no preview, no unread — its messages are unreadable).
+	// Hidden rooms, rooms whose owner is blocked with the user and rooms the
+	// user is banned from never show.
 	var rooms []models.ChatRoom
-	database.DB.Where("id IN ? AND is_frozen = ?", roomIDs, false).
+	database.DB.Where("id IN ?", roomIDs).
 		Where(roomOwnerNotBlockedSQL, userID, userID).
 		Where(roomNotHiddenSQL, userID).
 		Where(roomNotBannedSQL, userID).
@@ -127,31 +128,37 @@ func (h *RoomHandler) GetMyRooms(c *gin.Context) {
 		var lastText, lastSender *string
 		var lastAt *time.Time
 		if !last.CreatedAt.IsZero() {
-			t, _ := h.encryptionService.DecryptMessage(last.EncryptedText)
-			lastText = &t
-			s := last.SenderUser
-			lastSender = &s
+			// Frozen: keep the time (the row keeps its place), never the text.
+			if !r.IsFrozen {
+				t, _ := h.encryptionService.DecryptMessage(last.EncryptedText)
+				lastText = &t
+				s := last.SenderUser
+				lastSender = &s
+			}
 			ca := last.CreatedAt
 			lastAt = &ca
 		}
 
 		// Unread: son oxumadan sonra, başqasının göndərdiyi, bloklu olmayan.
+		// A frozen room has nothing to read → 0.
 		unread := 0
 		var afterArg interface{} = time.Unix(0, 0)
 		if mem.LastReadAt != nil {
 			afterArg = *mem.LastReadAt
 		}
-		database.DB.Raw(`
-			SELECT COUNT(*) FROM messages m
-			WHERE m.room_id = ? AND m.deleted_at IS NULL
-			  AND m.sender_id <> ?
-			  AND m.created_at > ?
-			  AND NOT EXISTS (
-			      SELECT 1 FROM user_blocks ub
-			      WHERE (ub.blocker_id = ? AND ub.blocked_id = m.sender_id)
-			         OR (ub.blocker_id = m.sender_id AND ub.blocked_id = ?)
-			  )
-		`, r.ID, userID, afterArg, userID, userID).Scan(&unread)
+		if !r.IsFrozen {
+			database.DB.Raw(`
+				SELECT COUNT(*) FROM messages m
+				WHERE m.room_id = ? AND m.deleted_at IS NULL
+				  AND m.sender_id <> ?
+				  AND m.created_at > ?
+				  AND NOT EXISTS (
+				      SELECT 1 FROM user_blocks ub
+				      WHERE (ub.blocker_id = ? AND ub.blocked_id = m.sender_id)
+				         OR (ub.blocker_id = m.sender_id AND ub.blocked_id = ?)
+				  )
+			`, r.ID, userID, afterArg, userID, userID).Scan(&unread)
+		}
 
 		out = append(out, models.RoomListItem{
 			ID:              r.ID,

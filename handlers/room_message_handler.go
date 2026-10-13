@@ -430,7 +430,13 @@ func (h *RoomHandler) SetRoomReaction(c *gin.Context) {
 	}
 	roomID := parseRoomID(c)
 	messageID := canonicalMessageID(c.Param("message_id"))
-	if _, ok := loadVisibleRoom(c, roomID, userID); !ok {
+	room, ok := loadVisibleRoom(c, roomID, userID)
+	if !ok {
+		return
+	}
+	// Frozen: messages are unreadable and nobody writes — reactions included.
+	if room.IsFrozen {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Otaq dondurulub", "code": "ROOM_FROZEN"})
 		return
 	}
 

@@ -531,6 +531,11 @@ func (h *RoomHandler) SearchRoomMessages(c *gin.Context) {
 	if !ok {
 		return
 	}
+	// Frozen: the history is unreadable, search included.
+	if room.IsFrozen {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Otaq dondurulub", "code": "ROOM_FROZEN"})
+		return
+	}
 	if roomMembership(roomID, userID) == nil && room.OwnerID != userID {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Yalnız üzvlər axtara bilər", "code": "ROOM_MEMBERS_ONLY"})
 		return
@@ -644,7 +649,12 @@ func (h *RoomHandler) SearchRoomMessages(c *gin.Context) {
 func (h *RoomHandler) GetRoomMessageReactions(c *gin.Context) {
 	userID := c.MustGet("user_id").(uint)
 	roomID := parseRoomID(c)
-	if _, ok := loadVisibleRoom(c, roomID, userID); !ok {
+	room, ok := loadVisibleRoom(c, roomID, userID)
+	if !ok {
+		return
+	}
+	if room.IsFrozen {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Otaq dondurulub", "code": "ROOM_FROZEN"})
 		return
 	}
 	messageID := c.Param("message_id")
