@@ -158,18 +158,28 @@ func (h *RoomHandler) SendRoomMessage(c *gin.Context) {
 	})
 	h.bumpScore(roomID)
 
-	// Göndərənin məlumatı (WS yük üçün).
-	var sender models.User
-	database.DB.First(&sender, userID)
+	// Sender + the quoted message (WS payload = the GET /messages row: the
+	// avatar comes from profiles, a reply carries its text and author).
+	sender := loadRoomSender(userID)
+	reply := h.loadRoomReply(roomID, message.ReplyToMessageID)
+	hiddenFor := replyHiddenFor(reply)
 
 	// WS fan-out — otaq üzvlərinə. Block filtri alıcı tərəfdə (client) deyil,
 	// burada tətbiq olunur: göndərənlə block əlaqəsi olan üzvə göndərmə.
-	payload := roomMessagePayload(message, roomID, sender, req.Text)
+	payload := roomMessagePayload(message, roomID, sender, req.Text, reply, false)
+	hiddenPayload := payload
+	if len(hiddenFor) > 0 {
+		hiddenPayload = roomMessagePayload(message, roomID, sender, req.Text, reply, true)
+	}
 	for _, mid := range h.roomMemberIDsExcludingBlocked(roomID, userID) {
 		if mid == userID {
 			continue
 		}
-		h.wsHub.SendToUser(mid, "new_room_message", payload)
+		if hiddenFor[mid] {
+			h.wsHub.SendToUser(mid, "new_room_message", hiddenPayload)
+		} else {
+			h.wsHub.SendToUser(mid, "new_room_message", payload)
+		}
 	}
 
 	// Push bildirişi — JOIN olmuş, muted OLMAYAN, bloklu olmayan üzvlərə. Room
@@ -187,7 +197,8 @@ func (h *RoomHandler) SendRoomMessage(c *gin.Context) {
 		)
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "göndərildi", "data": payload})
+	c.JSON(http.StatusOK, gin.H{"message": "göndərildi",
+		"data": roomMessagePayload(message, roomID, sender, req.Text, reply, hiddenFor[userID])})
 }
 
 // replyRoomDuplicate answers a send whose id is already stored. Həqiqi təkrar
@@ -208,26 +219,105 @@ func (h *RoomHandler) replyRoomDuplicate(c *gin.Context, existing models.Message
 			"data": gin.H{"id": existing.ID}})
 		return
 	}
-	var dupSender models.User
-	database.DB.First(&dupSender, userID)
+	dupSender := loadRoomSender(userID)
+	reply := h.loadRoomReply(roomID, existing.ReplyToMessageID)
 	storedText, _ := h.encryptionService.DecryptMessage(existing.EncryptedText)
 	c.JSON(http.StatusOK, gin.H{"message": "göndərildi", "duplicate": true,
-		"data": roomMessagePayload(existing, roomID, dupSender, storedText)})
+		"data": roomMessagePayload(existing, roomID, dupSender, storedText, reply, replyHiddenFor(reply)[userID])})
 }
 
-// roomMessagePayload — a just-sent room message as clients receive it (WS
+// roomSender — the sender columns of a room message row. Same source as
+// GET /messages: the avatar lives on profiles (users.profile_image was
+// dropped), so a live message shows the same name + photo as the history.
+type roomSender struct {
+	Name         string  `gorm:"column:name"`
+	Username     string  `gorm:"column:username"`
+	IsVerified   bool    `gorm:"column:is_verified"`
+	ProfileImage *string `gorm:"column:profile_image"`
+}
+
+func loadRoomSender(userID uint) roomSender {
+	var s roomSender
+	database.DB.Raw(`
+		SELECT u.name, u.username, u.is_verified, p.profile_image
+		FROM users u
+		LEFT JOIN profiles p ON p.user_id = u.id
+		WHERE u.id = ?`, userID).Scan(&s)
+	return s
+}
+
+// roomReply — the message a reply quotes (GET /messages reply card).
+type roomReply struct {
+	SenderID uint
+	Username string
+	Text     string
+	// Deleted or not found → every viewer gets the "no access" card.
+	Gone bool
+}
+
+// loadRoomReply — nil when the message is not a reply.
+func (h *RoomHandler) loadRoomReply(roomID uint, replyID *string) *roomReply {
+	if replyID == nil || *replyID == "" {
+		return nil
+	}
+	var row struct {
+		SenderID      uint    `gorm:"column:sender_id"`
+		EncryptedText *string `gorm:"column:encrypted_text"`
+		Deleted       bool    `gorm:"column:deleted"`
+		Username      *string `gorm:"column:username"`
+	}
+	database.DB.Raw(`
+		SELECT m.sender_id, m.encrypted_text, (m.deleted_at IS NOT NULL) AS deleted, u.username
+		FROM messages m
+		LEFT JOIN users u ON u.id = m.sender_id
+		WHERE m.id = ? AND m.room_id = ?`, *replyID, roomID).Scan(&row)
+	if row.EncryptedText == nil || row.Deleted {
+		return &roomReply{Gone: true}
+	}
+	text, _ := h.encryptionService.DecryptMessage(*row.EncryptedText)
+	r := &roomReply{SenderID: row.SenderID, Text: text}
+	if row.Username != nil {
+		r.Username = *row.Username
+	}
+	return r
+}
+
+// replyHiddenFor — users with a block (either way) with the quoted message's
+// author: GET /messages shows them the "no access" card, and so does WS.
+func replyHiddenFor(reply *roomReply) map[uint]bool {
+	out := map[uint]bool{}
+	if reply == nil || reply.Gone || reply.SenderID == 0 {
+		return out
+	}
+	var ids []uint
+	database.DB.Raw(`
+		SELECT CASE WHEN blocker_id = ? THEN blocked_id ELSE blocker_id END
+		FROM user_blocks
+		WHERE blocker_id = ? OR blocked_id = ?`,
+		reply.SenderID, reply.SenderID, reply.SenderID).Scan(&ids)
+	for _, id := range ids {
+		out[id] = true
+	}
+	return out
+}
+
+// roomMessagePayload — a room message as clients receive it live (WS
 // `new_room_message` + the send reply, first send and duplicate retry alike).
-func roomMessagePayload(msg models.Message, roomID uint, sender models.User, text string) gin.H {
-	return gin.H{
+// Same keys as a GET /messages row, so a live message renders exactly like
+// one loaded from the history (sender photo, reply card, edited mark).
+func roomMessagePayload(msg models.Message, roomID uint, sender roomSender, text string,
+	reply *roomReply, replyHidden bool) gin.H {
+	p := gin.H{
 		"id":                  msg.ID,
 		"room_id":             roomID,
 		"sender_id":           msg.SenderID,
 		"sender_name":         sender.Name,
 		"sender_username":     sender.Username,
-		"sender_avatar":       sender.ProfileImage,
+		"sender_avatar":       utils.PrependBaseURL(sender.ProfileImage),
 		"sender_verified":     sender.IsVerified,
 		"text":                text,
 		"reply_to_message_id": msg.ReplyToMessageID,
+		"is_edited":           msg.IsEdited,
 		// Group chat paritesi — client null-ı pozuq sayır, boş massiv ver.
 		"reactions": []gin.H{},
 		// Same value and precision as GET /messages (the column keeps
@@ -235,6 +325,16 @@ func roomMessagePayload(msg models.Message, roomID uint, sender models.User, tex
 		// a page's time span, where clients treat missing rows as deleted.
 		"created_at": msg.CreatedAt.UTC().Truncate(time.Microsecond),
 	}
+	if msg.ReplyToMessageID != nil {
+		if reply == nil || reply.Gone || replyHidden {
+			p["reply_blocked"] = true
+		} else {
+			p["reply_blocked"] = false
+			p["reply_text"] = reply.Text
+			p["reply_sender_username"] = reply.Username
+		}
+	}
+	return p
 }
 
 // GetRoomMessages — GET /api/v1/rooms/:room_id/messages
@@ -283,6 +383,15 @@ func (h *RoomHandler) GetRoomMessages(c *gin.Context) {
 		}
 	}
 
+	// unread_window=1 (new clients, newest page only): where my unread part
+	// starts (the oldest message from someone else after my last read) — the
+	// room opens there — and the page stretches down to it (+ a few rows of
+	// context, capped) so it is loaded in the same request.
+	var firstUnreadID *string
+	if c.Query("before_id") == "" && c.Query("unread_window") == "1" {
+		firstUnreadID, limit = roomFirstUnread(roomID, userID, limit)
+	}
+
 	type row struct {
 		ID             string
 		SenderID       uint
@@ -291,6 +400,7 @@ func (h *RoomHandler) GetRoomMessages(c *gin.Context) {
 		SenderAvatar   *string
 		SenderVerified bool
 		EncryptedText  string
+		IsEdited       bool
 		ReplyToID      *string
 		ReplyEnc       *string
 		ReplySender    *string
@@ -311,6 +421,7 @@ func (h *RoomHandler) GetRoomMessages(c *gin.Context) {
 			p.profile_image AS sender_avatar,
 			u.is_verified AS sender_verified,
 			m.encrypted_text,
+			COALESCE(m.is_edited, false) AS is_edited,
 			m.reply_to_message_id AS reply_to_id,
 			reply.encrypted_text AS reply_enc,
 			reply_u.username AS reply_sender,
@@ -378,6 +489,7 @@ func (h *RoomHandler) GetRoomMessages(c *gin.Context) {
 			SenderAvatar:   utils.PrependBaseURL(r.SenderAvatar),
 			SenderVerified: r.SenderVerified,
 			Text:           text,
+			IsEdited:       r.IsEdited,
 			ReplyToID:      r.ReplyToID,
 			Reactions:      reactions,
 			CreatedAt:      r.CreatedAt,
@@ -397,6 +509,9 @@ func (h *RoomHandler) GetRoomMessages(c *gin.Context) {
 	}
 
 	resp := gin.H{"data": out, "has_more": len(rows) == limit}
+	if firstUnreadID != nil {
+		resp["first_unread_message_id"] = *firstUnreadID
+	}
 	// include_events=1 (new clients): the join/leave lines of this page's time
 	// span, only those the viewer may see (members since before the event).
 	if c.Query("include_events") == "1" {
@@ -416,6 +531,152 @@ func (h *RoomHandler) GetRoomMessages(c *gin.Context) {
 		resp["events"] = events
 	}
 	c.JSON(http.StatusOK, resp)
+}
+
+// roomUnreadWindowMax — the most rows the newest page stretches to so it
+// reaches the first unread message (Flutter group "around" window cap).
+const roomUnreadWindowMax = 300
+
+// roomFirstUnread — my oldest unread message in the room (someone else's,
+// after my last read; never read → after I joined), visible to me (no block
+// either way). The returned limit grows so the newest page reaches it plus 3
+// rows of context, capped at roomUnreadWindowMax.
+func roomFirstUnread(roomID, userID uint, limit int) (*string, int) {
+	mem := roomMembership(roomID, userID)
+	if mem == nil {
+		return nil, limit
+	}
+	since := mem.LastReadAt
+	if since == nil {
+		since = mem.JoinedAt
+	}
+	if since == nil {
+		return nil, limit
+	}
+	var first struct {
+		ID        string    `gorm:"column:id"`
+		CreatedAt time.Time `gorm:"column:created_at"`
+	}
+	database.DB.Raw(`
+		SELECT m.id, m.created_at FROM messages m
+		WHERE m.room_id = ? AND m.deleted_at IS NULL
+		  AND m.sender_id <> ?
+		  AND m.created_at > ?
+		  AND NOT EXISTS (
+		      SELECT 1 FROM user_blocks ub
+		      WHERE (ub.blocker_id = ? AND ub.blocked_id = m.sender_id)
+		         OR (ub.blocker_id = m.sender_id AND ub.blocked_id = ?)
+		  )
+		ORDER BY m.created_at ASC, m.id ASC
+		LIMIT 1`, roomID, userID, *since, userID, userID).Scan(&first)
+	if first.ID == "" {
+		return nil, limit
+	}
+	// Rows from the first unread up to the newest, in the page's order.
+	var span int64
+	database.DB.Raw(`
+		SELECT COUNT(*) FROM messages m
+		WHERE m.room_id = ? AND m.deleted_at IS NULL
+		  AND (m.created_at > ? OR (m.created_at = ? AND m.id >= ?))
+		  AND NOT EXISTS (
+		      SELECT 1 FROM user_blocks ub
+		      WHERE (ub.blocker_id = ? AND ub.blocked_id = m.sender_id)
+		         OR (ub.blocker_id = m.sender_id AND ub.blocked_id = ?)
+		  )`, roomID, first.CreatedAt, first.CreatedAt, first.ID, userID, userID).Scan(&span)
+	if want := int(span) + 3; want > limit {
+		limit = want
+		if limit > roomUnreadWindowMax {
+			limit = roomUnreadWindowMax
+		}
+	}
+	return &first.ID, limit
+}
+
+// EditRoomMessage — PUT /api/v1/rooms/:room_id/messages/:message_id
+// Body {"text": "..."}. Only the sender edits, only their own text (group
+// EditGroupMessage twin — no time limit). The same write gates as a send:
+// frozen room, admin lock, write block, not a member. Everyone in the room
+// (minus blocked pairs) gets WS room_message_edited.
+func (h *RoomHandler) EditRoomMessage(c *gin.Context) {
+	userID := c.MustGet("user_id").(uint)
+	if isGuest(userID) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Qonaq hesab", "code": "GUEST_FORBIDDEN"})
+		return
+	}
+	roomID := parseRoomID(c)
+	messageID := canonicalMessageID(c.Param("message_id"))
+	room, ok := loadVisibleRoom(c, roomID, userID)
+	if !ok {
+		return
+	}
+
+	var body struct {
+		Text string `json:"text" binding:"required,min=1"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || strings.TrimSpace(body.Text) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Mətn tələb olunur"})
+		return
+	}
+
+	var msg models.Message
+	if err := database.DB.Where("id = ? AND room_id = ?", messageID, roomID).First(&msg).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Mesaj tapılmadı"})
+		return
+	}
+	if msg.SenderID != userID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Yalnız öz mesajını edit edə bilərsən"})
+		return
+	}
+	if room.IsFrozen {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Otaq dondurulub", "code": "ROOM_FROZEN"})
+		return
+	}
+	mem := roomMembership(roomID, userID)
+	if mem == nil && room.OwnerID != userID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Otağın üzvü deyilsiniz", "code": "ROOM_NOT_MEMBER"})
+		return
+	}
+	isAdmin := (mem != nil && mem.HasAdminAccess()) || room.OwnerID == userID
+	if !isAdmin && room.IsMessagingLocked(time.Now()) {
+		c.JSON(http.StatusForbidden, gin.H{
+			"error":                  "Otaqda yazışma bağlanıb",
+			"code":                   "ROOM_LOCKED",
+			"messaging_locked_until": lockUntilIfActive(*room),
+		})
+		return
+	}
+	if !isAdmin && isWriteBlocked(roomID, userID) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Bu otaqda yaza bilməzsiniz", "code": "ROOM_WRITE_BLOCKED"})
+		return
+	}
+
+	encrypted, err := h.encryptionService.EncryptMessage(body.Text)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Şifrələmə xətası"})
+		return
+	}
+	now := time.Now()
+	if err := database.DB.Model(&models.Message{}).
+		Where("id = ? AND room_id = ?", messageID, roomID).
+		Updates(map[string]interface{}{
+			"encrypted_text": encrypted,
+			"is_edited":      true,
+			"updated_at":     now,
+		}).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Mesaj yenilənmədi"})
+		return
+	}
+
+	payload := gin.H{
+		"room_id":    roomID,
+		"message_id": messageID,
+		"text":       body.Text,
+		"is_edited":  true,
+		"edited_at":  now,
+	}
+	// The sender's other devices follow too (the sender is in the list).
+	h.wsHub.SendToMultipleUsers(h.roomMemberIDsExcludingBlocked(roomID, userID), "room_message_edited", payload)
+	c.JSON(http.StatusOK, gin.H{"message": "Mesaj yeniləndi", "data": payload})
 }
 
 // SetRoomReaction — POST /api/v1/rooms/:room_id/messages/:message_id/reaction

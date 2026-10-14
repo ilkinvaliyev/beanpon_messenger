@@ -192,6 +192,8 @@ type RoomMessageResponse struct {
 	SenderAvatar   *string `json:"sender_avatar"`
 	SenderVerified bool    `json:"sender_verified"`
 	Text           string  `json:"text"`
+	// The sender edited the text (PUT /rooms/:id/messages/:message_id).
+	IsEdited bool `json:"is_edited"`
 	// Reply — reply edilən mesaj blok/silinmişsə ReplyBlocked=true və mətn boş
 	// (client "erişiminiz yoxdur" kartı göstərir).
 	ReplyToID    *string `json:"reply_to_message_id"`

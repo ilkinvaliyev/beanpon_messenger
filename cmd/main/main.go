@@ -456,6 +456,7 @@ func main() {
 		api.POST("/rooms/:room_id/messages", roomHandler.SendRoomMessage)
 		api.DELETE("/rooms/:room_id/messages", roomHandler.ClearRoomMessages) // admin: hamı üçün bütün mesajlar
 		api.DELETE("/rooms/:room_id/messages/:message_id", roomHandler.DeleteRoomMessage)
+		api.PUT("/rooms/:room_id/messages/:message_id", roomHandler.EditRoomMessage) // öz mesajını redaktə et
 		// Mesaj reaksiyası (emoji) — group chat paritesi.
 		api.POST("/rooms/:room_id/messages/:message_id/reaction", roomHandler.SetRoomReaction)
 		api.GET("/rooms/:room_id/messages/:message_id/reactions", roomHandler.GetRoomMessageReactions)
