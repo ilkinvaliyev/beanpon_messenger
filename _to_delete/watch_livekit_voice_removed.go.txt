@@ -1,0 +1,170 @@
+package watch
+
+import (
+	"bytes"
+	"encoding/json"
+	"log"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
+)
+
+var (
+	errVoiceOff         = errf(http.StatusForbidden, "VOICE_OFF", "Bu otaqda səsli söhbət bağlıdır")
+	errVoiceUnavailable = errf(http.StatusServiceUnavailable, "VOICE_UNAVAILABLE", "Səsli söhbət hazırda əlçatan deyil")
+)
+
+func (m *Module) voiceAvailable() bool {
+	return strings.TrimSpace(m.cfg.LiveKitAPIKey) != "" && strings.TrimSpace(m.cfg.LiveKitAPISecret) != "" &&
+		strings.TrimSpace(m.cfg.LiveKitURL) != ""
+}
+
+type lkVideoGrant struct {
+	RoomJoin       bool   `json:"roomJoin,omitempty"`
+	RoomAdmin      bool   `json:"roomAdmin,omitempty"`
+	RoomCreate     bool   `json:"roomCreate,omitempty"`
+	Room           string `json:"room,omitempty"`
+	CanPublish     *bool  `json:"canPublish,omitempty"`
+	CanSubscribe   *bool  `json:"canSubscribe,omitempty"`
+	CanPublishData *bool  `json:"canPublishData,omitempty"`
+}
+
+func lkRoomName(roomID int64) string { return "watch_" + itoa(roomID) }
+
+// voiceTokenTTL — short on purpose: LiveKit refreshes the token of a
+// connected participant itself, and a removed (kicked / left) user can't
+// rejoin with an old token for long.
+const voiceTokenTTL = 20 * time.Minute
+
+// liveKitToken — the same AccessToken shape piokio_live signs (iss = api
+// key, sub/jti = identity, video grant), plus the display name.
+func (m *Module) liveKitToken(room string, uid int64, name string) (string, error) {
+	now := time.Now()
+	pub, sub, data := true, true, false
+	claims := jwt.MapClaims{
+		"iss":  m.cfg.LiveKitAPIKey,
+		"sub":  itoa(uid),
+		"jti":  itoa(uid),
+		"name": name,
+		"nbf":  now.Unix(),
+		"exp":  now.Add(voiceTokenTTL).Unix(),
+		"video": lkVideoGrant{
+			RoomJoin: true, Room: room, CanPublish: &pub, CanSubscribe: &sub, CanPublishData: &data,
+		},
+	}
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(m.cfg.LiveKitAPISecret))
+}
+
+// ── Server API (Twirp/JSON): remove a participant, close a room ──────────
+
+func (m *Module) lkAPIBase() string {
+	u := strings.TrimRight(strings.TrimSpace(m.cfg.LiveKitURL), "/")
+	switch {
+	case strings.HasPrefix(u, "wss://"):
+		return "https://" + strings.TrimPrefix(u, "wss://")
+	case strings.HasPrefix(u, "ws://"):
+		return "http://" + strings.TrimPrefix(u, "ws://")
+	}
+	return u
+}
+
+func (m *Module) lkAdminToken(room string) (string, error) {
+	now := time.Now()
+	claims := jwt.MapClaims{
+		"iss":   m.cfg.LiveKitAPIKey,
+		"sub":   "watch-server",
+		"nbf":   now.Unix(),
+		"exp":   now.Add(5 * time.Minute).Unix(),
+		"video": lkVideoGrant{RoomAdmin: true, RoomCreate: true, Room: room},
+	}
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(m.cfg.LiveKitAPISecret))
+}
+
+func (m *Module) lkCall(method, room string, body map[string]any) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[watch] livekit %s panic: %v", method, r)
+		}
+	}()
+	if !m.voiceAvailable() {
+		return
+	}
+	token, err := m.lkAdminToken(room)
+	if err != nil {
+		return
+	}
+	b, _ := json.Marshal(body)
+	req, err := http.NewRequest(http.MethodPost, m.lkAPIBase()+"/twirp/livekit.RoomService/"+method, bytes.NewReader(b))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := m.http.Do(req)
+	if err != nil {
+		log.Printf("[watch] livekit %s %s: %v", method, room, err)
+		return
+	}
+	resp.Body.Close()
+	// 404 = room / participant not there (nobody was in voice) — fine.
+	if resp.StatusCode >= 300 && resp.StatusCode != http.StatusNotFound {
+		log.Printf("[watch] livekit %s %s: HTTP %d", method, room, resp.StatusCode)
+	}
+}
+
+// lkRemoveParticipant — a kicked / leaving member is cut from voice now.
+func (m *Module) lkRemoveParticipant(roomID, uid int64) {
+	room := lkRoomName(roomID)
+	m.lkCall("RemoveParticipant", room, map[string]any{"room": room, "identity": itoa(uid)})
+}
+
+// lkDeleteRoom — room ended / voice switched off: everyone leaves voice.
+func (m *Module) lkDeleteRoom(roomID int64) {
+	room := lkRoomName(roomID)
+	m.lkCall("DeleteRoom", room, map[string]any{"room": room})
+}
+
+func (m *Module) handleVoiceToken(c *gin.Context) {
+	v, err := m.guardWrite(c)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	id, ok := paramID(c, "id")
+	if !ok {
+		fail(c, errNotFound)
+		return
+	}
+	if !m.voiceAvailable() {
+		fail(c, errVoiceUnavailable)
+		return
+	}
+	var name string
+	err = m.withRoom(id, func(r *liveRoom) error {
+		if r.member(v.ID) == nil {
+			return errNotMember
+		}
+		if r.row.Status == "ended" {
+			return errEnded
+		}
+		if !r.row.VoiceEnabled {
+			return errVoiceOff
+		}
+		name = m.ensureUserLocked(r, v.ID).Username
+		return nil
+	})
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	room := lkRoomName(id)
+	token, err := m.liveKitToken(room, v.ID, name)
+	if err != nil {
+		fail(c, errServer)
+		return
+	}
+	respond(c, gin.H{"url": m.cfg.LiveKitURL, "token": token, "room": room})
+}
