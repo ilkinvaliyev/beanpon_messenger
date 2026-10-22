@@ -91,6 +91,7 @@ func (m *Module) RegisterRoutes(api *gin.RouterGroup, internal *gin.RouterGroup)
 
 	w.GET("/rooms/:id/messages", m.handleMessages)
 	w.POST("/rooms/:id/messages", m.handleSendMessage)
+	w.DELETE("/rooms/:id/messages", m.handleClearMessages)
 	w.DELETE("/rooms/:id/messages/:mid", m.handleDeleteMessage)
 	w.POST("/rooms/:id/pin", m.handlePin)
 	w.POST("/rooms/:id/moments", m.handleMoment)

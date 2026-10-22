@@ -35,8 +35,19 @@ cache), `push.go` (7-language pushes),
   `WebView.loadDataWithBaseURL`). `baseURL` = `https://<app id>` (iOS bundle id,
   Android applicationId, lower-cased) so YouTube receives the required Referer
   (otherwise error 152/153). Required Minimum Functionality:
-  - nothing is drawn **over** the player (no buttons, badges, emojis) — the
-    room chrome sits in a strip directly under the video;
+  - nothing is drawn **over** the player (no badges, emojis, chat) — the
+    room chrome sits in a strip directly under the video. Only exception: the
+    landscape full screen shows **playback controls** over the picture (play /
+    pause, ±10 s, progress, exit / minimize / close, title) that fade in on a
+    tap and fade out 2.5 s later while the film runs — YouTube's developer
+    policies guide allows playback-control overlays that don't clash with the
+    player's UI (the player runs with `controls=0`);
+  - **no background playback**: the film stops for that viewer when the app
+    leaves the screen or the screen locks (the room and chat go on; on return
+    it jumps to the room clock). The policies name "play even when your API
+    service window is closed or minimized" as a violation, so there is no
+    system PiP and no lock-screen audio for YouTube either (the in-app mini
+    window is fine — the app is on screen);
   - the player viewport is at least 200×200 pt (the mini window uses a
     200 pt-tall frame);
   - one auto-playing player per screen; scripted playback only while the
@@ -250,6 +261,7 @@ Success = `{"data": …}`; error = `{"error": "<az text>", "code": "UPPER_SNAKE"
 | `GET /rooms/:id/messages?before_id=&limit=` | members: `{messages, has_more}` (newest first, ≤50) |
 | `POST /rooms/:id/messages` `{client_id (uuid), type: text\|voice\|gif\|photo\|sound, text?, media_url? (allowlisted, §4), meta? (object ≤4 KB)}` | members; idempotent by the sender's own `client_id` → `Message` |
 | `DELETE /rooms/:id/messages/:mid` | own or host/cohost |
+| `DELETE /rooms/:id/messages` | host only: clears the whole chat for everyone (soft delete; the pin goes too) → WS `messages_cleared` |
 | `POST /rooms/:id/pin` `{message_id\|null}` | controller (a shadow line → 404 `MESSAGE_NOT_FOUND`) |
 | `POST /rooms/:id/moments` `{note?}` | members (live rooms): `moment` line at the current room position |
 | `POST /rooms/:id/polls` `{question?, options: [{label, title_id? \| provider + media_ref? \| url?}] (2–4)}` | members (chat rules apply; spam-banned 403 `ACTION_RESTRICTED`); one open poll per room (409 `POLL_ACTIVE`); closes after 5 min; posts a `poll` line → `Poll` |
@@ -281,6 +293,7 @@ Server → client:
 | `settings` | changed settings (`code` only to host/cohosts) |
 | `host` | `{host: UserLite, previous_host_id, reason: left\|transfer\|auto}` |
 | `message` · `message_deleted` `{id}` · `pinned` `{message\|null}` | chat (`pinned` per recipient: `null` for one with a block with the author) |
+| `messages_cleared` `{by}` | the host cleared the chat: drop every line already shown (keep only your own unsent ones) |
 | `reaction` | `{emoji, user_id}` (only when flying reactions are on; not echoed to the sender; emoji only — whitelisted emoji ranges + ZWJ / VS16 / keycap / tag sequences, ≤12 code points, else ack `INVALID_EMOJI`) |
 | `presence` | `{user_id, online}` |
 | `member` | `{member: Member, change: joined\|updated\|left\|kicked\|role}` |

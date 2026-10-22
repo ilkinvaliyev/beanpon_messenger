@@ -2,6 +2,7 @@ package watch
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -356,6 +357,45 @@ func (m *Module) handleDeleteMessage(c *gin.Context) {
 		}
 		r.broadcast("message_deleted", map[string]any{"id": mid}, nil)
 		if r.row.PinnedMessageID != nil && *r.row.PinnedMessageID == mid {
+			m.db.Exec(`UPDATE watch_rooms SET pinned_message_id = NULL, updated_at = NOW() WHERE id = ?`, r.id)
+			r.row.PinnedMessageID = nil
+			r.pinned = nil
+			m.broadcastPinnedLocked(r)
+		}
+		return nil
+	})
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	respond(c, gin.H{"ok": true})
+}
+
+// handleClearMessages — DELETE /watch/rooms/:id/messages: the host wipes the
+// whole chat for everyone (soft delete, like a single delete). Every client
+// gets `messages_cleared` and drops the lines it already shows; a pinned
+// message goes with them.
+func (m *Module) handleClearMessages(c *gin.Context) {
+	v, err := m.guardWrite(c)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	id, ok := paramID(c, "id")
+	if !ok {
+		fail(c, errNotFound)
+		return
+	}
+	err = m.withRoom(id, func(r *liveRoom) error {
+		if !r.isHost(v.ID) {
+			return errNotHost
+		}
+		if err := m.db.Exec(`UPDATE watch_room_messages SET deleted_at = NOW(), updated_at = NOW() WHERE room_id = ? AND deleted_at IS NULL`, r.id).Error; err != nil {
+			log.Printf("[watch] clear messages room=%d: %v", r.id, err)
+			return errServer
+		}
+		r.broadcast("messages_cleared", map[string]any{"by": v.ID}, nil)
+		if r.row.PinnedMessageID != nil {
 			m.db.Exec(`UPDATE watch_rooms SET pinned_message_id = NULL, updated_at = NOW() WHERE id = ?`, r.id)
 			r.row.PinnedMessageID = nil
 			r.pinned = nil
