@@ -66,6 +66,13 @@ type Config struct {
 
 	// Ops — davranışa təsir etməyən istismar açarları (log səviyyəsi və s.).
 	Ops OpsConfig
+
+	// Watch party (package watch, docs/WATCH_PARTY.md). YouTubeAPIKey feeds
+	// search / trending / video meta; empty only switches those off.
+	YouTubeAPIKey string
+	// YouTubeSearchDailyMax — watch search.list calls per day (100 quota
+	// units each, the default 10k/day quota fits ~100). 0 = no cap.
+	YouTubeSearchDailyMax int
 }
 
 // DBConfig — PostgreSQL hovuzu və sorğu vaxt limiti.
@@ -164,6 +171,8 @@ func LoadConfig() *Config {
 		TelegramChatID:         envStr("TELEGRAM_CHAT_ID", "739452673"),
 		PgBouncerEnabled:       envBool("PGBOUNCER_ENABLED", false),
 		AppURL:                 envStr("APP_URL", "https://api.beanpon.com"),
+		YouTubeAPIKey:          os.Getenv("YOUTUBE_API_KEY"),
+		YouTubeSearchDailyMax:  envInt("YOUTUBE_SEARCH_DAILY_MAX", 90),
 		S3: S3Config{
 			Bucket:    envStr("AWS_BUCKET", ""),
 			Region:    envStr("AWS_DEFAULT_REGION", "us-east-1"),

@@ -1,0 +1,1 @@
+{"nodes": [{"id": "$graphify-root$_xmpp_doc_go", "label": "doc.go", "file_type": "code", "source_file": "xmpp/doc.go", "source_location": "L1"}], "edges": [], "raw_calls": [], "go_imports": {}, "go_type_table": {"path": "$graphify-root$/xmpp/doc.go", "table": {}}}

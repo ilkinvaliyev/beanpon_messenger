@@ -1,0 +1,1 @@
+{"nodes": [{"id": "$graphify-root$_config_blocked_words_go", "label": "blocked_words.go", "file_type": "code", "source_file": "config/blocked_words.go", "source_location": "L1"}], "edges": [], "raw_calls": [], "go_imports": {}, "go_type_table": {"path": "$graphify-root$/config/blocked_words.go", "table": {}}}

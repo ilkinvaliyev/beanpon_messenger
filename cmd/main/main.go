@@ -8,6 +8,7 @@ import (
 	"beanpon_messenger/middleware"
 	"beanpon_messenger/services"
 	"beanpon_messenger/utils"
+	"beanpon_messenger/watch"
 	"beanpon_messenger/websocket"
 	"beanpon_messenger/xmpp"
 	"context"
@@ -237,6 +238,16 @@ func main() {
 	raveHub := websocket.NewRaveHub()
 	go raveHub.Run()
 
+	// 4. Birlikdə izlə (watch party) — REST /api/v1/watch/*, WS /ws/watch,
+	// sweeper + hub ticker. Contract: docs/WATCH_PARTY.md.
+	watchModule := watch.New(database.DB, watch.Config{
+		CloudToken:            cfg.CloudToken,
+		BackendURL:            cfg.BackendUrl,
+		YouTubeAPIKey:         cfg.YouTubeAPIKey,
+		YouTubeSearchDailyMax: cfg.YouTubeSearchDailyMax,
+	})
+	watchModule.Start(context.Background())
+
 	// Handler'ları oluştur
 	messageHandler := handlers.NewMessageHandler(encryptionService, wsHub)
 	// HTTP axını üçün moderasiya queue-sunu handler-a bağla.
@@ -319,6 +330,7 @@ func main() {
 	router.GET("/ws", middleware.JWTMiddlewareForWebSocket(cfg.JWTSecret), wsHub.HandleWebSocket)
 	router.GET("/ws/live", middleware.JWTMiddlewareForWebSocket(cfg.JWTSecret), liveHub.HandleWebSocket)
 	router.GET("/ws/rave", middleware.JWTMiddlewareForWebSocket(cfg.JWTSecret), raveHandler.HandleWebSocket) // ← YENİ
+	router.GET("/ws/watch", middleware.JWTMiddlewareForWebSocket(cfg.JWTSecret), watchModule.HandleWS)
 
 	// Mesajlaşma API route'ları (JWT korumalı)
 	api := router.Group("/api/v1")
@@ -597,6 +609,9 @@ func main() {
 		// Bax handlers/internal_spam_ban.go.
 		internal.POST("/users/:user_id/spam-ban/invalidate", handlers.InvalidateSpamBanCache)
 	}
+
+	// Watch party REST (JWT group) + Filament hooks (internal group).
+	watchModule.RegisterRoutes(api, internal)
 
 	// Public routes
 	router.GET("/ping", func(c *gin.Context) {
