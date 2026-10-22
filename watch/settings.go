@@ -44,10 +44,10 @@ func (s watchSettings) normalized() watchSettings {
 		}
 	}
 	def(&s.MaxMembers, 50, 2, 500)
-	def(&s.MaxActiveRoomsPerUser, 2, 1, 20)
+	def(&s.MaxActiveRoomsPerUser, 1, 1, 20)
 	def(&s.MaxRoomsPerDay, 20, 1, 500)
 	def(&s.RequestTTLMinutes, 10, 1, 1440)
-	def(&s.EmptyRoomMinutes, 15, 2, 1440)
+	def(&s.EmptyRoomMinutes, 2, 2, 1440)
 	def(&s.ScheduledGraceMinutes, 120, 10, 1440)
 	def(&s.MaxScheduleDays, 7, 1, 60)
 	def(&s.ChatMaxLength, 500, 20, 4000)

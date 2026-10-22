@@ -137,6 +137,17 @@ func (m *Module) resolveMedia(cfg *config, in mediaInput) (resolvedMedia, error)
 			if meta.Thumbnail != "" {
 				out.Poster = strPtr(meta.Thumbnail)
 			}
+		} else if meta, ok, err := m.yt.oembed(ref); err == nil {
+			// No API key: the keyless oEmbed answer (best-effort; the player
+			// reports the length itself).
+			if !ok {
+				return out, errNotEmbeddable
+			}
+			out.Title = clampRunes(meta.Title, 200)
+			out.Subtitle = nonEmptyPtr(clampRunes(meta.Channel, 200))
+			if meta.Thumbnail != "" {
+				out.Poster = strPtr(meta.Thumbnail)
+			}
 		}
 		if out.Title == "" {
 			t, err := typedText(in.MediaTitle, 200)

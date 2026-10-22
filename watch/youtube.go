@@ -279,6 +279,55 @@ func (y *youtubeClient) videos(ids []string) (map[string]ytVideo, error) {
 	return out, nil
 }
 
+// oembed — title / channel / thumbnail of a public video from YouTube's
+// keyless oEmbed endpoint (used when no Data API key is configured).
+// ok = false: the video does not exist, is private or may not be embedded
+// (oEmbed answers 400/401/403/404). Other failures are errors and the caller
+// goes on without metadata.
+func (y *youtubeClient) oembed(id string) (ytVideo, bool, error) {
+	key := "watch:yt:o:" + id
+	if raw, ok := y.cacheGet(key); ok {
+		if raw == "-" {
+			return ytVideo{}, false, nil
+		}
+		var v ytVideo
+		if json.Unmarshal([]byte(raw), &v) == nil {
+			return v, true, nil
+		}
+	}
+	q := url.Values{"url": {"https://www.youtube.com/watch?v=" + id}, "format": {"json"}}
+	req, err := http.NewRequest(http.MethodGet, "https://www.youtube.com/oembed?"+q.Encode(), nil)
+	if err != nil {
+		return ytVideo{}, false, err
+	}
+	resp, err := y.http.Do(req)
+	if err != nil {
+		return ytVideo{}, false, err
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound:
+		y.cacheSet(key, "-", time.Hour)
+		return ytVideo{}, false, nil
+	default:
+		return ytVideo{}, false, fmt.Errorf("%w: oembed %d", errYouTube, resp.StatusCode)
+	}
+	var body struct {
+		Title        string `json:"title"`
+		AuthorName   string `json:"author_name"`
+		ThumbnailURL string `json:"thumbnail_url"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&body); err != nil {
+		return ytVideo{}, false, err
+	}
+	v := ytVideo{ID: id, Title: body.Title, Channel: body.AuthorName, Thumbnail: body.ThumbnailURL, Embeddable: true}
+	if b, err := json.Marshal(v); err == nil {
+		y.cacheSet(key, string(b), 24*time.Hour)
+	}
+	return v, true, nil
+}
+
 // video — one video; ok = false when YouTube does not know it (or it is private).
 func (y *youtubeClient) video(id string) (ytVideo, bool, error) {
 	if !y.enabled() {

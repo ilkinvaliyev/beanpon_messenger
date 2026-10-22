@@ -582,6 +582,14 @@ func (m *Module) handleTitlesResolve(c *gin.Context) {
 				return
 			}
 			res = ytResult(vid)
+		} else if vid, ok, err := m.yt.oembed(ref); err == nil {
+			// No API key: the keyless oEmbed answer names the video (best-effort —
+			// a network error keeps the bare result).
+			if !ok {
+				fail(c, errNotEmbeddable)
+				return
+			}
+			res = ytResult(vid)
 		}
 	} else {
 		var t titleRow

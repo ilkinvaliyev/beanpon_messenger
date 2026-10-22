@@ -222,8 +222,8 @@ Success = `{"data": …}`; error = `{"error": "<az text>", "code": "UPPER_SNAKE"
 | `GET /rooms?filter=&sort=popular\|new&title_id=&media_ref=&cursor=` | `{rooms, next_cursor, total}` |
 | `GET /titles/featured?provider=&region=` | `{provider, items: [TitleResult]}` — catalog (featured first) or YouTube trending (cached 1 h per region; `region` ∈ AZ TR RU UZ KZ GE UA US GB DE ES, anything else = `AZ`; a region without a chart falls back to TR / US) |
 | `GET /titles/search?provider=&q=&region=` | catalog (companion) or YouTube search (cached 6 h, signed-in users only — guests 403 `GUEST_FORBIDDEN`; 503 `SEARCH_UNAVAILABLE` without a key / when switched off / on an API error, 503 `SEARCH_LIMIT` once the day's cap is spent — the client offers "paste a link"); empty `q` = featured |
-| `POST /titles/resolve` `{url}` | signed-in users: link → `{provider, result: TitleResult}`; 422 `LINK_UNSUPPORTED`; YouTube 422 `NOT_EMBEDDABLE` (unknown / private / not embeddable / live / age-restricted), 503 `YOUTUBE_UNAVAILABLE` when the API does not answer |
-| `POST /rooms` | `{name, provider, title_id?, media_ref?, media_title?, media_subtitle?, duration_ms?, season?, episode?, url?, access, followers_only, scheduled_at? (RFC 3339)}` → `RoomDetail` (status `lobby`, or `scheduled` when `scheduled_at` is > 2 min ahead; ≤ `max_schedule_days`). Errors: `PROVIDER_UNAVAILABLE`, `MEDIA_REQUIRED`, `NOT_EMBEDDABLE`, `LINK_UNSUPPORTED`, `YOUTUBE_UNAVAILABLE` (503), `MESSAGE_BLOCKED` (name / typed title), `SCHEDULE_INVALID`, `ROOM_LIMIT`, `DAILY_LIMIT`. With a YouTube key every video is checked; without one the client's title is used |
+| `POST /titles/resolve` `{url}` | signed-in users: link → `{provider, result: TitleResult}`; 422 `LINK_UNSUPPORTED`; YouTube 422 `NOT_EMBEDDABLE` (unknown / private / not embeddable / live / age-restricted), 503 `YOUTUBE_UNAVAILABLE` when the API does not answer. Without an API key the title / channel / thumbnail come from YouTube's keyless oEmbed (400/401/403/404 there → `NOT_EMBEDDABLE`; a network error keeps the bare result) — create / media change / queue do the same |
+| `POST /rooms` | `{name, provider, title_id?, media_ref?, media_title?, media_subtitle?, duration_ms?, season?, episode?, url?, access, followers_only, scheduled_at? (RFC 3339)}` → `RoomDetail` (status `lobby`, or `scheduled` when `scheduled_at` is > 2 min ahead; ≤ `max_schedule_days`). Errors: `PROVIDER_UNAVAILABLE`, `MEDIA_REQUIRED`, `NOT_EMBEDDABLE`, `LINK_UNSUPPORTED`, `YOUTUBE_UNAVAILABLE` (503), `MESSAGE_BLOCKED` (name / typed title), `SCHEDULE_INVALID`, `ROOM_LIMIT` (the host already has an open room), `DAILY_LIMIT`. With a YouTube key every video is checked; without one the client's title is used |
 | `GET /rooms/:id` | `RoomDetail` (code rooms: see §4) |
 | `GET /code/:code` | `{room: RoomDetail}`; ended / unknown → 404 `CODE_NOT_FOUND` (`scheduled` rooms are returned — the client shows "starts at" + reminder) |
 | `POST /rooms/:id/join` `{code?}` | `{state: "joined"\|"requested", room: RoomDetail}` |
@@ -359,8 +359,8 @@ Clients route `route == "watch_room"` to the room (join flow when not a member).
 ## 9. Settings (`watch_settings`, cached 60 s)
 
 `enabled` (feature switch, default ON), `home_preview_enabled`,
-`max_members` (50), `max_active_rooms_per_user` (2), `max_rooms_per_day` (20),
-`request_ttl_minutes` (10), `empty_room_minutes` (15),
+`max_members` (50), `max_active_rooms_per_user` (1 — one open room per host: a lobby / scheduled / live room must end before the next one; the create re-checks it under a per-user advisory lock, class 7313), `max_rooms_per_day` (20),
+`request_ttl_minutes` (10), `empty_room_minutes` (2; was 15 before migration `2026_10_22_000000`),
 `scheduled_grace_minutes` (120), `max_schedule_days` (7),
 `youtube_search_enabled`, `chat_max_length` (500), `break_minutes` (5),
 `next_poll_seconds` (100). Zero / out-of-range values fall back to the
@@ -393,7 +393,8 @@ stats flush every 3 s, counters, `last_active_at` + session progress every
 1. Laravel migration `2026_10_21_000000` (+ Filament).
 2. messenger (env: `YOUTUBE_API_KEY`, `YOUTUBE_SEARCH_DAILY_MAX` (default 90);
    without the YouTube key search/trending are
-   empty but pasted links still work — titles then come from the client).
+   empty but pasted links still work — titles then come from YouTube oEmbed,
+   lengths from the players).
    YouTube Data API quota: search costs 100 units of the default 10 000 / day,
    a video lookup 1 — searches are cached 6 h, limited per user and capped per
    day (`YOUTUBE_SEARCH_DAILY_MAX` × 100 units, Pacific day) so room creation

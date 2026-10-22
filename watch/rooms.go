@@ -20,7 +20,7 @@ var (
 	errFollowersOnly  = errf(http.StatusForbidden, "FOLLOWERS_ONLY", "Bu otaq yalnız aparıcının izlədiyi insanlar üçündür")
 	errCodeRequired   = errf(http.StatusForbidden, "CODE_REQUIRED", "Otaq kodu lazımdır")
 	errRejected       = errf(http.StatusForbidden, "REQUEST_REJECTED", "İstəyin qəbul edilmədi")
-	errRoomLimit      = errf(http.StatusForbidden, "ROOM_LIMIT", "Eyni anda açıq otaq limitinə çatdın")
+	errRoomLimit      = errf(http.StatusForbidden, "ROOM_LIMIT", "Artıq açıq otağın var. Yenisini açmaq üçün əvvəlcə onu bağla")
 	errDailyLimit     = errf(http.StatusTooManyRequests, "DAILY_LIMIT", "Bu gün üçün otaq limitinə çatdın")
 	errNotLive        = errf(http.StatusConflict, "NOT_LIVE", "Otaq hələ canlı deyil")
 	errScheduleWindow = errf(http.StatusUnprocessableEntity, "SCHEDULE_INVALID", "Vaxt düzgün deyil")
@@ -117,6 +117,10 @@ type createRoomReq struct {
 }
 
 func validAccess(a string) bool { return a == "public" || a == "approval" || a == "code" }
+
+// createRoomLockClass — first key of the two-key advisory lock that serializes
+// one user's room creates (7311 = chat room names, 7312 = referrals).
+const createRoomLockClass = 7313
 
 func (m *Module) handleCreateRoom(c *gin.Context) {
 	v, err := m.guardWrite(c)
@@ -228,6 +232,25 @@ func (m *Module) handleCreateRoom(c *gin.Context) {
 		row.ID = 0
 		row.Code = newRoomCode()
 		tx := m.db.Begin()
+		// The open-room limit again, under a per-user lock: two creates sent at
+		// the same time (double tap, two devices) can't both pass the check above.
+		if err := tx.Exec(`SELECT pg_advisory_xact_lock(?, ?)`, createRoomLockClass, int32(v.ID)).Error; err != nil {
+			tx.Rollback()
+			log.Printf("[watch] create room lock: %v", err)
+			fail(c, errServer)
+			return
+		}
+		var open int64
+		if err := tx.Raw(`SELECT COUNT(*) FROM watch_rooms WHERE host_id = ? AND status <> 'ended'`, v.ID).Scan(&open).Error; err != nil {
+			tx.Rollback()
+			fail(c, errServer)
+			return
+		}
+		if int(open) >= cfg.s.MaxActiveRoomsPerUser {
+			tx.Rollback()
+			fail(c, errRoomLimit)
+			return
+		}
 		if err := tx.Create(&row).Error; err != nil {
 			tx.Rollback()
 			if isPgUniqueViolation(err) {
