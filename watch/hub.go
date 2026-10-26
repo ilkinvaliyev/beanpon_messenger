@@ -22,6 +22,7 @@ type wsClient struct {
 	once    sync.Once
 	blocked map[int64]bool // users with a block either way (loaded on connect)
 	since   time.Time
+	cinema  bool // the app knows the cinema mode (socket `cinema=1`)
 }
 
 // close — idempotent stop signal. `send` is never closed (no send-on-closed panics).
@@ -125,6 +126,8 @@ type liveRoom struct {
 	hostAway   time.Time // host offline while others are online (auto transfer)
 	countDirty bool
 	gone       bool // evicted — holders must reload
+
+	cinema *cinemaState // "Kino zalı" (nil = a plain room), cinema.go
 }
 
 func (r *liveRoom) userLimits(uid int64) *limits {
@@ -385,6 +388,7 @@ func (m *Module) loadRoom(id int64) (*liveRoom, error) {
 		r.pinned = m.loadMessageJSON(id, *row.PinnedMessageID, r.users)
 	}
 	m.loadOpenPoll(r)
+	m.loadCinema(r)
 
 	// A break that ran out while nobody had the room loaded.
 	if row.BreakUntilMs != nil && *row.BreakUntilMs <= nowMs() {
@@ -712,6 +716,9 @@ func (h *Hub) tickRoom(r *liveRoom, now time.Time) {
 	}
 	if r.row.Status == "ended" {
 		return
+	}
+	if r.cinema != nil {
+		m.cinemaTickLocked(r, now)
 	}
 
 	if r.row.Status == "live" {

@@ -110,10 +110,11 @@ func (m *Module) canOpenByIDLocked(r *liveRoom, viewerID int64) bool {
 
 type createRoomReq struct {
 	mediaInput
-	Name          string  `json:"name"`
-	Access        string  `json:"access"`
-	FollowersOnly bool    `json:"followers_only"`
-	ScheduledAt   *string `json:"scheduled_at"`
+	Name          string           `json:"name"`
+	Access        string           `json:"access"`
+	FollowersOnly bool             `json:"followers_only"`
+	ScheduledAt   *string          `json:"scheduled_at"`
+	Cinema        *cinemaCreateReq `json:"cinema"` // "Kino zalı" (§13), nil = a plain room
 }
 
 func validAccess(a string) bool { return a == "public" || a == "approval" || a == "code" }
@@ -192,6 +193,11 @@ func (m *Module) handleCreateRoom(c *gin.Context) {
 	if name == "" {
 		name = clampRunes(media.Title, 40)
 	}
+	cinema, err := m.planCinema(v.ID, req.Cinema)
+	if err != nil {
+		fail(c, err)
+		return
+	}
 
 	now := dbNow()
 	row := roomRow{
@@ -222,6 +228,13 @@ func (m *Module) handleCreateRoom(c *gin.Context) {
 		LastActiveAt:           &now,
 		CreatedAt:              now,
 		UpdatedAt:              now,
+		CinemaAllowSeatChange:  true,
+	}
+	if cinema != nil {
+		seats := cinema.layout.Seats
+		row.CinemaEnabled = true
+		row.CinemaSeats = &seats
+		row.CinemaAllowSeatChange = cinema.allow
 	}
 	if status == "lobby" {
 		row.OpenedAt = &now
@@ -267,6 +280,12 @@ func (m *Module) handleCreateRoom(c *gin.Context) {
 			fail(c, errServer)
 			return
 		}
+		if err := applyCinemaPlanTx(tx, row.ID, v.ID, cinema); err != nil {
+			tx.Rollback()
+			log.Printf("[watch] create room seats: %v", err)
+			fail(c, errServer)
+			return
+		}
 		if err := tx.Commit().Error; err != nil {
 			fail(c, errServer)
 			return
@@ -278,8 +297,12 @@ func (m *Module) handleCreateRoom(c *gin.Context) {
 		return
 	}
 
-	var out RoomDetail
+	var (
+		out RoomDetail
+		fx  after
+	)
 	err = m.withRoom(row.ID, func(r *liveRoom) error {
+		m.inviteReservedLocked(r, cinema, &fx)
 		out = m.detailLocked(r, v.ID)
 		return nil
 	})
@@ -287,6 +310,7 @@ func (m *Module) handleCreateRoom(c *gin.Context) {
 		fail(c, err)
 		return
 	}
+	fx.run()
 	respond(c, out)
 }
 
@@ -718,6 +742,7 @@ func (m *Module) addMemberLocked(r *liveRoom, uid int64, role string) error {
 		WHERE room_id = ? AND user_id = ? AND status = 'pending'`, r.id, uid)
 	r.broadcast("member", map[string]any{"member": m.memberJSONLocked(r, &row, time.Now()), "change": "joined"}, nil)
 	m.systemMessageLocked(r, uid, "joined")
+	m.cinemaJoinedLocked(r, uid)
 	return nil
 }
 
@@ -757,6 +782,7 @@ func (m *Module) removeMemberLocked(r *liveRoom, uid int64, state string) error 
 	if state == "left" {
 		m.systemMessageLocked(r, uid, "left")
 	}
+	m.cinemaLeftLocked(r, uid)
 	return nil
 }
 

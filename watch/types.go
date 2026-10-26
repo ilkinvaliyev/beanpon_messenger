@@ -33,6 +33,9 @@ type roomRow struct {
 	ChatMode               string     `gorm:"column:chat_mode"`
 	PauseRequestsEnabled   bool       `gorm:"column:pause_requests_enabled"`
 	FlyingReactionsEnabled bool       `gorm:"column:flying_reactions_enabled"`
+	CinemaEnabled          bool       `gorm:"column:cinema_enabled"`
+	CinemaSeats            *int       `gorm:"column:cinema_seats"`
+	CinemaAllowSeatChange  bool       `gorm:"column:cinema_allow_seat_change"`
 	Code                   string     `gorm:"column:code"`
 	Status                 string     `gorm:"column:status"`
 	ScheduledAt            *time.Time `gorm:"column:scheduled_at"`
@@ -266,6 +269,9 @@ type RoomDetail struct {
 	EndReason              *string       `json:"end_reason"`
 	Me                     MeJSON        `json:"me"`
 	ProviderInfo           *ProviderJSON `json:"provider_info"`
+	// Cinema — the hall's shape (§13; absent = not a cinema room). Old apps
+	// ignore the key; the places come with the socket `state` / GET /cinema.
+	Cinema *CinemaInfoJSON `json:"cinema,omitempty"`
 }
 
 type ProviderJSON struct {

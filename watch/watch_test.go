@@ -233,3 +233,45 @@ func TestProviderMatch(t *testing.T) {
 		}
 	}
 }
+
+func TestCinemaLayout(t *testing.T) {
+	cases := []struct{ n, rows, cols, couch int }{
+		{6, 2, 3, 2}, {12, 3, 4, 4}, {18, 3, 6, 6}, {24, 4, 6, 6}, {40, 5, 8, 6}, {60, 6, 10, 6},
+		{1, 2, 3, 2}, {99, 6, 10, 6}, // clamped to 6 / 60
+	}
+	for _, c := range cases {
+		l := layoutFor(c.n)
+		if l.Rows != c.rows || l.Cols != c.cols || l.Couch != c.couch {
+			t.Fatalf("layoutFor(%d) = %+v, want rows %d cols %d couch %d", c.n, l, c.rows, c.cols, c.couch)
+		}
+		total := 0
+		for row := 0; row < l.Rows; row++ {
+			total += l.rowLen(row)
+		}
+		if total != l.Seats {
+			t.Fatalf("layoutFor(%d): rows hold %d seats, want %d", c.n, total, l.Seats)
+		}
+	}
+	l := layoutFor(40)
+	if got := l.code(19); got != "C4" {
+		t.Fatalf("code(19) = %q, want C4", got)
+	}
+	if got := l.code(0); got != "A1" {
+		t.Fatalf("code(0) = %q, want A1", got)
+	}
+	// The best seat of a 5×8 hall is in row C, next to the centre aisle.
+	best, bestScore := -1, 1e9
+	for idx := 0; idx < l.Seats; idx++ {
+		if s := l.score(idx); s < bestScore {
+			best, bestScore = idx, s
+		}
+	}
+	if code := l.code(best); code != "C4" {
+		t.Fatalf("best seat = %s, want C4", code)
+	}
+	// A partial back row: 13 seats → 3×4 + 1, the last row holds one seat.
+	p := layoutFor(13)
+	if p.rowLen(p.Rows-1) != 13-p.Cols*(p.Rows-1) {
+		t.Fatalf("partial row length wrong: %+v", p)
+	}
+}

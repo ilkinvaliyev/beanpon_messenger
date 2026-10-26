@@ -140,7 +140,13 @@ type sendMessageReq struct {
 	Text     *string         `json:"text"`
 	MediaURL *string         `json:"media_url"`
 	Meta     json.RawMessage `json:"meta"`
+	// ReplyToID — the line this one answers (same room). The server stores a
+	// small snapshot of it in meta.reply; a client-sent meta.reply is ignored.
+	ReplyToID *int64 `json:"reply_to_id"`
 }
+
+// maxReplySnippet — runes of the quoted text kept in meta.reply.
+const maxReplySnippet = 140
 
 // mediaDomains — chat media comes from our own storage (uploads return
 // APP_URL/api/s3-storage/…) or the GIF providers the apps use; any other
@@ -180,6 +186,7 @@ func cleanMeta(raw json.RawMessage, shadow bool) *string {
 		}
 	}
 	delete(obj, "shadow")
+	delete(obj, "reply") // only the server writes the reply snapshot
 	if shadow {
 		obj["shadow"] = true
 	}
@@ -285,6 +292,14 @@ func (m *Module) handleSendMessage(c *gin.Context) {
 		if !r.userLimits(v.ID).msg.allow(time.Now(), 2.5, 5) {
 			return errRateLimited
 		}
+		rowMeta := meta
+		if req.ReplyToID != nil && *req.ReplyToID > 0 {
+			reply, err := m.replySnapshotLocked(r, *req.ReplyToID, v.ID)
+			if err != nil {
+				return err
+			}
+			rowMeta = mergeMeta(meta, "reply", reply)
+		}
 		pos := r.expected(nowMs())
 		now := dbNow()
 		row := messageRow{
@@ -294,7 +309,7 @@ func (m *Module) handleSendMessage(c *gin.Context) {
 			Type:       typ,
 			Text:       text,
 			MediaURL:   mediaURLPtr,
-			Meta:       meta,
+			Meta:       rowMeta,
 			PositionMs: &pos,
 			ClientID:   clientID,
 			CreatedAt:  now,
@@ -326,6 +341,53 @@ func (m *Module) handleSendMessage(c *gin.Context) {
 		return
 	}
 	respond(c, out)
+}
+
+// replySnapshotLocked — meta.reply for an answer to `mid`: {id, user_id,
+// username, type, text}. Only a live user line of this room can be answered
+// (not a system / poll / moment line, not someone else's shadow line).
+func (m *Module) replySnapshotLocked(r *liveRoom, mid, uid int64) (map[string]any, error) {
+	var target messageRow
+	if m.db.Where("id = ? AND room_id = ? AND deleted_at IS NULL", mid, r.id).Limit(1).Find(&target).RowsAffected == 0 {
+		return nil, errNoMessage
+	}
+	if target.UserID == nil || !clientMessageTypes[target.Type] {
+		return nil, errInvalid
+	}
+	if *target.UserID != uid && target.Meta != nil && strings.Contains(*target.Meta, `"shadow":true`) {
+		return nil, errNoMessage
+	}
+	author := *target.UserID
+	username := ""
+	if u, ok := r.users[author]; ok {
+		username = u.Username
+	} else if u, ok := m.loadUsers([]int64{author})[author]; ok {
+		username = u.Username
+	}
+	snap := map[string]any{"id": target.ID, "user_id": author, "username": username, "type": target.Type}
+	if target.Text != nil {
+		t := []rune(*target.Text)
+		if len(t) > maxReplySnippet {
+			t = append(t[:maxReplySnippet], '…')
+		}
+		snap["text"] = string(t)
+	}
+	return snap, nil
+}
+
+// mergeMeta — the cleaned meta JSON with one more key.
+func mergeMeta(meta *string, key string, value any) *string {
+	obj := map[string]any{}
+	if meta != nil {
+		_ = json.Unmarshal([]byte(*meta), &obj)
+	}
+	obj[key] = value
+	b, err := json.Marshal(obj)
+	if err != nil {
+		return meta
+	}
+	s := string(b)
+	return &s
 }
 
 func (m *Module) handleDeleteMessage(c *gin.Context) {

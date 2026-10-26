@@ -334,7 +334,12 @@ func (m *Module) detailLocked(r *liveRoom, viewerID int64) RoomDetail {
 		j := p.toJSON()
 		pj = &j
 	}
+	var cinema *CinemaInfoJSON
+	if r.cinema != nil {
+		cinema = r.cinema.info()
+	}
 	return RoomDetail{
+		Cinema:                 cinema,
 		RoomCard:               card,
 		ChatMode:               row.ChatMode,
 		PauseRequestsEnabled:   row.PauseRequestsEnabled,

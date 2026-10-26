@@ -74,6 +74,7 @@ func (m *Module) HandleWS(c *gin.Context) {
 		done:    make(chan struct{}),
 		blocked: blocked,
 		since:   time.Now(),
+		cinema:  c.Query("cinema") == "1",
 	}
 	go cl.writePump()
 
@@ -117,6 +118,7 @@ func (m *Module) registerLocked(r *liveRoom, cl *wsClient) {
 	}
 	wasOnline := r.clients[uid] != nil
 	r.clients[uid] = cl
+	r.cinemaOnline(uid, true)
 	if _, ok := r.ready[uid]; !ok {
 		r.ready[uid] = "loading"
 	}
@@ -128,6 +130,7 @@ func (m *Module) registerLocked(r *liveRoom, cl *wsClient) {
 	}
 	go m.db.Exec(`UPDATE watch_room_members SET last_seen_at = NOW() WHERE room_id = ? AND user_id = ?`, r.id, uid)
 
+	m.cinemaConnectedLocked(r, uid, cl.cinema)
 	if b := encodeFrame(r.id, "state", m.stateSnapshotLocked(r, uid)); b != nil {
 		cl.enqueue(b)
 	}
@@ -165,6 +168,7 @@ func (m *Module) stateSnapshotLocked(r *liveRoom, uid int64) map[string]any {
 		"countdown_start_ms": countdown,
 		"session_id":         r.row.CurrentSessionID,
 		"session_ended":      r.sessionEnded,
+		"cinema":             m.cinemaSnapshotLocked(r, uid),
 	}
 }
 
@@ -181,6 +185,7 @@ func (m *Module) unregister(cl *wsClient) {
 	}
 	uid := cl.userID
 	delete(r.clients, uid)
+	r.cinemaOnline(uid, false)
 	delete(r.ready, uid)
 	delete(r.sync, uid)
 	r.countDirty = true

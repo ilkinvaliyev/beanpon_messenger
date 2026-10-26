@@ -109,6 +109,17 @@ func (m *Module) RegisterRoutes(api *gin.RouterGroup, internal *gin.RouterGroup)
 
 	w.GET("/rooms/:id/summary", m.handleSummary)
 
+	// Kino zalı (cinema mode, §13).
+	w.GET("/cinema/friends", m.handleCinemaFriends)
+	w.GET("/rooms/:id/cinema", m.handleCinema)
+	w.POST("/rooms/:id/cinema/seat", m.handleCinemaSeat)
+	w.POST("/rooms/:id/cinema/view", m.handleCinemaView)
+	w.POST("/rooms/:id/cinema/notify", m.handleCinemaNotify)
+	w.POST("/rooms/:id/cinema/offer/decline", m.handleCinemaOfferDecline)
+	w.POST("/rooms/:id/cinema/swap", m.handleCinemaSwap)
+	w.POST("/rooms/:id/cinema/swap/:sid/accept", m.handleCinemaSwapAccept)
+	w.POST("/rooms/:id/cinema/swap/:sid/decline", m.handleCinemaSwapDecline)
+
 	if internal != nil {
 		internal.POST("/watch/rooms/:id/end", m.handleInternalEnd)
 		internal.POST("/watch/settings/reload", m.handleInternalReloadSettings)

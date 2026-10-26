@@ -41,7 +41,19 @@ cache), `push.go` (7-language pushes),
     pause, ±10 s, progress, exit / minimize / close, title) that fade in on a
     tap and fade out 2.5 s later while the film runs — YouTube's developer
     policies guide allows playback-control overlays that don't clash with the
-    player's UI (the player runs with `controls=0`);
+    player's UI (the player runs with `controls=0`). In portrait the player
+    itself still takes no touches; a tap on the picture is the app's own
+    gesture: it pauses / plays the film **for that viewer only** (host
+    included — "detached", then back with the room on play) and, while paused,
+    a centred play glyph + "only for you" is shown over the picture (a playback
+    control). Only the controls under the player change the room for everyone;
+  - **subtitles** = YouTube's own captions module (`loadModule('captions')`,
+    `getOption/setOption('captions', 'tracklist' | 'translationLanguages' |
+    'track')`): the viewer picks a track or an auto-translate language in the
+    app's subtitle sheet (CC button). Personal — never synced. A video's dubbed
+    audio tracks are not reachable through the IFrame API;
+  - opening a user's profile from the room puts the room into the mini window
+    first (the film stays in sight — never covered by another screen);
   - **no background playback**: the film stops for that viewer when the app
     leaves the screen or the screen locks (the room and chat go on; on return
     it jumps to the room clock). The policies name "play even when your API
@@ -259,7 +271,7 @@ Success = `{"data": …}`; error = `{"error": "<az text>", "code": "UPPER_SNAKE"
 | `POST /rooms/:id/remind-unready` | host: push `watch_remind` to joined members not ready/offline + invitees not joined → `{reminded}` |
 | `POST /rooms/:id/help/:uid` | host: WS `help` (+ push `watch_help` when offline) to a member |
 | `GET /rooms/:id/messages?before_id=&limit=` | members: `{messages, has_more}` (newest first, ≤50) |
-| `POST /rooms/:id/messages` `{client_id (uuid), type: text\|voice\|gif\|photo\|sound, text?, media_url? (allowlisted, §4), meta? (object ≤4 KB)}` | members; idempotent by the sender's own `client_id` → `Message` |
+| `POST /rooms/:id/messages` `{client_id (uuid), type: text\|voice\|gif\|photo\|sound, text?, media_url? (allowlisted, §4), meta? (object ≤4 KB), reply_to_id?}` | members; idempotent by the sender's own `client_id` → `Message`. `reply_to_id` = a live person's line of this room (text/voice/gif/photo/sound, not someone else's shadow line; 404 `MESSAGE_NOT_FOUND` / 422 otherwise): the server stores `meta.reply {id, user_id, username, type, text (≤140 runes)}` — a client-sent `meta.reply` is dropped. No migration (meta is jsonb); old apps ignore the key |
 | `DELETE /rooms/:id/messages/:mid` | own or host/cohost |
 | `DELETE /rooms/:id/messages` | host only: clears the whole chat for everyone (soft delete; the pin goes too) → WS `messages_cleared` |
 | `POST /rooms/:id/pin` `{message_id\|null}` | controller (a shadow line → 404 `MESSAGE_NOT_FOUND`) |
@@ -414,3 +426,135 @@ stats flush every 3 s, counters, `last_active_at` + session progress every
    always keeps units; raise the cap after Google grants more quota.
 3. piokio_gateway (`/watch*` → messenger; `/ws/watch` already routed by `/ws/`).
 4. Apps.
+
+Kino zalı (§13): Laravel migration `2026_10_26_000000` (`watch_rooms.cinema_*`
++ `watch_room_seats`) **before** the messenger deploy — every room create
+writes the new columns, so a missing migration breaks every create. Then
+messenger, then the apps (gateway: nothing new, `/watch/*` already routed).
+
+## 13. Kino zalı (cinema mode, 3D hall)
+
+An optional mode of a room: the members sit in a virtual hall (one place
+each) and the new apps draw it in 3D (the film on the hall's screen, heads of
+the people in front, neighbours at the sides). **Additive only**: an old app
+joins a cinema room like any room and never notices — the server seats it,
+never sends it offers, and it just watches the plain player.
+
+### Layout
+
+`seats` 6…60 (clamped). `cols = clamp(round(sqrt(seats × 1.6)), 3, 10)`;
+when that doesn't divide the seats, `cols + 1` and then `cols − 1` are tried
+and the first that fills every row wins. `rows = ceil(seats / cols)`; the last
+row may be short (centred). `couch` (side sofa spots) = `seats / 3` clamped
+to 2…6. 12 → 3×4, 18 → 3×6, 24 → 4×6, 40 → 5×8, 60 → 6×10. Codes = row
+letter (A = front) + 1-based seat number in the row (`C4`). Best seat = the
+lowest `score = |row − (rows − 1) / 2| + 0.7 × |col − rowCentre|` (middle
+row, centre of the row). Swift `CinemaLayout.forSeats` = Go `layoutFor` (the
+same numbers for every count — change both together).
+
+### Create
+
+`POST /rooms` adds `cinema` (absent / `enabled: false` = a plain room; old
+servers ignore it):
+
+```json
+{"enabled": true, "seats": 40, "allow_seat_change": true, "seat": 19,
+ "reserve": [{"user_id": 7, "seat": 18}, {"user_id": 9, "seat": 20}]}
+```
+
+`seat` = the host's seat (default: the best one). `reserve` ≤ 2 seats for
+accounts the host follows (accepted follow, no block, not a guest); invalid
+entries are skipped silently. Reserved friends get the normal room invite;
+their seat is kept until they join, or 10 minutes into the film.
+`GET /cinema/friends?q=` → `{users: [UserLite]}` — who can get a kept seat
+(accepted follows, mutual first, ≤ 50).
+
+Room detail (`GET /rooms/:id`, the cards) adds `cinema {enabled, seats, rows,
+cols, couch, allow_seat_change}` for cinema rooms only (omitted otherwise).
+
+### Hall state
+
+`GET /rooms/:id/cinema` (members) and the socket `state` frame's `cinema` key
+(`null` for plain rooms):
+
+```json
+{"enabled": true, "seats": 40, "rows": 5, "cols": 8, "couch": 6,
+ "allow_seat_change": true, "rev": 1729950000123,
+ "places": [{"user": {UserLite}, "user_id": 7, "kind": "seat", "index": 18,
+             "code": "C3", "view": "hall", "reserved": false, "chosen": true,
+             "notify": false}],
+ "queue": [12, 15], "held": [20],
+ "my_offer": {"index": 20, "code": "C5", "expires_at_ms": 1729950030000}}
+```
+
+- `kind` `seat` | `couch` | `none` (the hall and the sofas are full).
+  `view` `hall` | `full` ("Tam ekran": the place is kept, the person watches
+  the plain player; the others still see them sitting).
+- A place with a block either way shows `user: null, user_id: 0` (an
+  anonymous occupied place).
+- `queue` = couch / no-place members with "Yer boşalanda xəbər ver" on,
+  oldest first. `held` = seats held by an open queue offer.
+- `my_offer` only in per-viewer answers (the socket `state`, `GET`, and the
+  seat / notify / swap answers), never in the `cinema_places` broadcast.
+- `rev` grows with every change sent to the clients (it starts at the room's
+  load time in ms, so it keeps growing across a restart): a client drops an
+  answer whose `rev` is lower than the state it shows.
+
+### Actions (all `{data: …}`, guarded like other writes)
+
+| Request | Body | Answer |
+|---|---|---|
+| `POST /rooms/:id/cinema/seat` | `{kind: seat\|couch, index}` | hall state |
+| `POST /rooms/:id/cinema/view` | `{view: hall\|full}` | `{ok}` |
+| `POST /rooms/:id/cinema/notify` | `{on}` | hall state |
+| `POST /rooms/:id/cinema/offer/decline` | `{index}` | `{ok}` |
+| `POST /rooms/:id/cinema/swap` | `{index}` | `{id, expires_at_ms}` |
+| `POST /rooms/:id/cinema/swap/:sid/accept` | — | hall state |
+| `POST /rooms/:id/cinema/swap/:sid/decline` | — | hall state |
+
+- Seat: free, or held for me by my queue offer. "Yerini dəyişmək olar" off →
+  a member who picked a seat keeps it (`SEAT_CHANGE_OFF`); the host may always
+  move, and leaving a couch / no place for a seat is always fine. Getting a
+  seat any way gives back my own open queue offer (it goes to the next
+  person) and voids my open swaps.
+- Swap: ask the person on that seat (must be in the room right now with a
+  cinema app, no block) — they get `cinema_swap_offer`, 30 s. Accept = the two
+  places change hands (only while the asked person is still on that seat). A
+  new ask replaces my previous one.
+
+### Socket (new apps connect with `&cinema=1`)
+
+| Frame | To | Data |
+|---|---|---|
+| `cinema_places` | everyone (old apps ignore it) | hall state (no `my_offer`) |
+| `cinema_seat_offer` | the first cinema app in the queue | `{index, code, expires_at_ms}` (seat held 30 s) |
+| `cinema_seat_offer_expired` | that person | `{index}` (timed out, or they got a seat another way) |
+| `cinema_swap_offer` | the asked person | `{id, from: UserLite, from_kind, from_index, from_code, to_index, to_code, expires_at_ms}` |
+| `cinema_swap_result` | the asker (and the asked person when it lapses) | `{id, status: accepted\|declined\|expired, user_id}` |
+
+Every way a swap ends sends a result: answer, 30 s timeout, a new ask from the
+same person, either side leaving or changing place (`expired`).
+
+### Seating rules (server)
+
+- Every member gets a place on join / accept / socket connect: the reserved
+  seat, else the best free seat, else a couch spot, else `none`. Leaving /
+  kick frees the place; a freed seat is offered to the queue first.
+- Offers go only to sockets with `cinema=1`. If nobody in the queue can take
+  a freed seat, an old app without a place simply gets it.
+- While connected people wait and the hall is full, the seat of a member
+  offline for 10 minutes goes to the queue (checked every 30 s); they get a
+  place again when they come back.
+- Errors: `CINEMA_OFF` (409, not a cinema room), `SEAT_TAKEN` (409),
+  `SEAT_CHANGE_OFF` (403), `SWAP_UNAVAILABLE` (409 — target gone / offline /
+  old app / blocked / the seat just became free), `OFFER_NOT_FOUND` (404).
+
+### Clients (YouTube rules stay in force)
+
+The official player is never warped or covered: it sits on the projected
+screen as a plain rectangle (≥ 200 × 200, letterboxed) for frontal seat views
+and floats, fully on screen, while the head turns or the camera rises; all
+chrome (header, mode row, time pill, neighbours, chat) is laid out around it,
+and the scrims are drawn under it. Flying reactions rise over the chat in
+YouTube rooms (over our own poster in companion rooms). The green "speaking"
+ring = the person wrote in the chat a moment ago (there is no voice chat).
