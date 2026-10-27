@@ -259,6 +259,10 @@ type Hub struct {
 	// itər → end insert edər (nadir kənar hal, zərərsiz).
 	callMsgMu  sync.Mutex
 	callMsgIDs map[string]string
+
+	// chatStreak — "X wrote a DM to Y" signal for two-person chat streaks
+	// (chat_streak.go, rules in piokio_community). nil = disabled.
+	chatStreak *chatStreakSignaler
 }
 
 // SetModerationEnqueue — WS axını üçün moderasiya enqueue callback-ini bağlayır.
@@ -791,6 +795,9 @@ func (h *Hub) FilterUsersInGroupChat(userIDs []uint, conversationID uint) []uint
 
 // HandleNewMessage yeni mesajı handle et ve WebSocket üzerinden yayınla
 func (h *Hub) HandleNewMessage(senderID, receiverID uint, messageID, content, msgType string, createdAt time.Time, replyToMessageID *string, storyID *uint, conversationStatus string, silent bool, flashID *uint, flashThumb *string, flashExpiresAt *time.Time) {
+	// Chat streak signal (async, deduped per direction per Baku day; never blocks).
+	h.signalChatStreak(senderID, receiverID, msgType)
+
 	messageData := map[string]interface{}{
 		"id":                  messageID,
 		"sender_id":           senderID,

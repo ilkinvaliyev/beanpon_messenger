@@ -22,6 +22,12 @@ type Config struct {
 	BackendUrl     string
 	InternalSecret string
 
+	// Chat streaks — every persisted DM signals piokio_community
+	// POST {CommunityInternalURL}/internal/chat-streak/activity (X-Api-Key =
+	// CommunityInternalAPIKey = community INTERNAL_API_KEY). Empty URL → off.
+	CommunityInternalURL    string
+	CommunityInternalAPIKey string
+
 	// Soft-throttle: bad_traffic flag-lı user-lərin sorğusuna gecikmə (saniyə).
 	// 0 = söndürülü. Status paylaşılan Redis-də (bp:shared:bad_traffic:{id}) keşlənir.
 	BadTrafficDelaySeconds int
@@ -173,6 +179,11 @@ func LoadConfig() *Config {
 		AppURL:                 envStr("APP_URL", "https://api.beanpon.com"),
 		YouTubeAPIKey:          os.Getenv("YOUTUBE_API_KEY"),
 		YouTubeSearchDailyMax:  envInt("YOUTUBE_SEARCH_DAILY_MAX", 90),
+
+		// Chat streaks (websocket/chat_streak.go).
+		CommunityInternalURL:    os.Getenv("COMMUNITY_INTERNAL_URL"),
+		CommunityInternalAPIKey: os.Getenv("COMMUNITY_INTERNAL_API_KEY"),
+
 		S3: S3Config{
 			Bucket:    envStr("AWS_BUCKET", ""),
 			Region:    envStr("AWS_DEFAULT_REGION", "us-east-1"),

@@ -202,6 +202,8 @@ func main() {
 	xmppReg := xmpp.NewRegistry(2 * time.Minute)
 	xmppBridge := xmpp.NewBridge(xmppCfg, xmppReg, wsHub, wsHub)
 	wsHub.AttachXMPP(xmppBridge)
+	// Chat streaks ("seriya"): DM activity signal → piokio_community (chat_streak.go).
+	wsHub.AttachChatStreak(cfg.CommunityInternalURL, cfg.CommunityInternalAPIKey)
 	xmppBridge.Start() // no-op when disabled
 	if xmppCfg.Enabled {
 		log.Printf("✅ XMPP bridge enabled (component=%s domain=%s)", xmppCfg.ComponentName, xmppCfg.Domain)
@@ -598,6 +600,8 @@ func main() {
 		internal.POST("/calls/signal", wsHub.HandleCallSignal)
 		// Çağrı bitdikdə conversation-a kalıcı "call" mesajı.
 		internal.POST("/calls/message", wsHub.HandleCallMessage)
+		// Chat streak events from piokio_community (restore) → WS `chat_streak`.
+		internal.POST("/chat-streak/notify", wsHub.RelayChatStreak)
 
 		// XMPP client auth callback (ejabberd → Go, validates the JWT). Used in
 		// PHASE 2 when native XMPP clients connect; harmless when XMPP disabled.

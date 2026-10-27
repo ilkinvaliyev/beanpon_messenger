@@ -551,10 +551,21 @@ same person, either side leaving or changing place (`expired`).
 
 ### Clients (YouTube rules stay in force)
 
-The official player is never warped or covered: it sits on the projected
-screen as a plain rectangle (≥ 200 × 200, letterboxed) for frontal seat views
-and floats, fully on screen, while the head turns or the camera rises; all
-chrome (header, mode row, time pill, neighbours, chat) is laid out around it,
-and the scrims are drawn under it. Flying reactions rise over the chat in
-YouTube rooms (over our own poster in companion rooms). The green "speaking"
-ring = the person wrote in the chat a moment ago (there is no voice chat).
+The official player is never warped or covered: for seat views it is pinned
+to the projected screen as a plain rectangle (≥ 200 × 200; a far seat's
+shorter picture is letterboxed onto the black screen masking). Looking around
+(press and hold + drag) pans the whole picture — hall and screen move
+together, the screen never turns — and every control fades out while it does,
+so nothing can overlap the player. Only the overview (camera above the rows)
+floats it, clamped to a free area. All chrome (header, mode row, time pill,
+neighbours, chat) is laid out around it; the scrims, the house-lights dim +
+screen glow and the "PIOKIO" wordmark under the screen are drawn under it. The
+viewer can hide every control (eye button / a tap on the hall). Flying
+reactions rise over the chat in YouTube rooms (over our own poster in
+companion rooms). The green "speaking" ring = the person wrote in the chat a
+moment ago (there is no voice chat).
+
+The iOS app no longer offers friends' kept seats (product decision
+2026-10-27): it sends only `enabled / seats / allow_seat_change / seat` and
+never calls `GET /cinema/friends`. The server side of `reserve` stays as it
+is (older builds of the same app may still send it).
