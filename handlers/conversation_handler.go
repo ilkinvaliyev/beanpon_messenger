@@ -1195,11 +1195,13 @@ func (h *ConversationHandler) GetConversationDetails(c *gin.Context) {
 	var myMessageCount, otherMessageCount int
 	var isMutedByMe, amIRestricted, isOtherMuted, isOtherRestricted bool
 	var callsMutedByMe bool // bu söhbətdə zənglər mənim üçün səssizdir (DnD)
+	var myMutedUntil *time.Time
 
 	if userID.(uint) == conversation.User1ID {
 		myMessageCount = conversation.User1MessageCount
 		otherMessageCount = conversation.User2MessageCount
 		isMutedByMe = conversation.User1Muted
+		myMutedUntil = conversation.User1MutedUntil
 		amIRestricted = conversation.User1Restricted
 		isOtherMuted = conversation.User2Muted
 		isOtherRestricted = conversation.User2Restricted
@@ -1208,10 +1210,21 @@ func (h *ConversationHandler) GetConversationDetails(c *gin.Context) {
 		myMessageCount = conversation.User2MessageCount
 		otherMessageCount = conversation.User1MessageCount
 		isMutedByMe = conversation.User2Muted
+		myMutedUntil = conversation.User2MutedUntil
 		amIRestricted = conversation.User2Restricted
 		isOtherMuted = conversation.User1Muted
 		isOtherRestricted = conversation.User1Restricted
 		callsMutedByMe = conversation.User2CallsMuted
+	}
+	// Timed mute: the hub only clears the flag on the next message, so a
+	// mute that already ran out still reads as muted in the DB. Report the
+	// effective state, plus the end time while it is running (the chat
+	// settings show "until 16:04"; nil = muted until turned off).
+	if isMutedByMe && myMutedUntil != nil && !myMutedUntil.After(time.Now()) {
+		isMutedByMe = false
+	}
+	if !isMutedByMe {
+		myMutedUntil = nil
 	}
 
 	if amIRestricted {
@@ -1327,6 +1340,7 @@ func (h *ConversationHandler) GetConversationDetails(c *gin.Context) {
 			"can_send_message":     canSendMessage,
 			"stop_message_reason":  stopMessageReason,
 			"is_muted_by_me":       isMutedByMe,
+			"muted_until":          myMutedUntil,
 			"calls_muted_by_me":    callsMutedByMe,
 			"peer_receive_calls":   peerReceiveCalls,
 			"am_i_restricted":      amIRestricted,
