@@ -1,10 +1,8 @@
 package middleware
 
 import (
-	"errors"
 	"fmt"
 	"log"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -17,9 +15,11 @@ import (
 // Per-user bandwidth tracking (messenger).
 //
 // Əsas backend (piokio_golang_main) ilə EYNİ cədvələ yazır:
-// bandwidth_logs + bandwidth_daily. `source = "messenger"` sütunu bu
+// bandwidth_daily. `source = "messenger"` sütunu bu
 // servisi digərlərindən ayırır (ikiqat sayma yox). Eyni Postgres DB-dir
 // (DB_NAME/DB_HOST env).
+// The raw per-request bandwidth_logs rows are turned off (2026-11-15):
+// nothing read them and the table grew forever.
 //
 // Qoşulma (cmd/main/main.go):
 //   go middleware.StartBandwidthWriter(database.GetDB())   // DB init-dən sonra
@@ -53,16 +53,12 @@ import (
 const mediaSampleMsg = 5 // messenger-də media yoxdur, amma simvolik saxlanır
 
 type BandwidthRecord struct {
-	UserID     *int64
-	Method     string
-	Path       string
-	Category   string
-	Source     string
-	StatusCode int
-	BytesSent  int64
-	BytesRecv  int64
-	IsRange    bool
-	CreatedAt  time.Time
+	UserID    *int64
+	Category  string
+	Source    string
+	BytesSent int64
+	BytesRecv int64
+	CreatedAt time.Time
 }
 
 var bandwidthChan = make(chan BandwidthRecord, 4096)
@@ -71,7 +67,7 @@ var bandwidthChan = make(chan BandwidthRecord, 4096)
 var bandwidthDropped atomic.Int64
 
 // bandwidthAnonSkipped — `user_id` NULL olduğu üçün bandwidth_daily-ə
-// yazılmayan sorğuların sayı (bandwidth_logs-da tam qalır). Görünsün deyə
+// yazılmayan sorğuların sayı (they are not stored anywhere now). Görünsün deyə
 // dövri hesabata daxil edilir.
 var bandwidthAnonSkipped atomic.Int64
 
@@ -159,44 +155,7 @@ func writeBandwidthBatch(db *gorm.DB, batch []BandwidthRecord) {
 	}
 	sess := db.Session(&gorm.Session{SkipDefaultTransaction: true})
 
-	// ── 1) bandwidth_logs — TƏK multi-row INSERT ────────────────────────────
-	// Əvvəl qeyd başına ayrıca `Exec` idi (200 qeyd = 200 gediş, hər biri
-	// hovuzdan bağlantı tutur). 200 × 10 = 2000 bind parametri — Postgres-in
-	// 65535 limitindən çox aşağıdadır.
-	placeholders := make([]string, 0, len(batch))
-	args := make([]interface{}, 0, len(batch)*10)
-	for _, r := range batch {
-		placeholders = append(placeholders, "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-		args = append(args,
-			r.UserID, r.Method, r.Path, r.Category, r.Source,
-			r.StatusCode, r.BytesSent, r.BytesRecv, r.IsRange, r.CreatedAt,
-		)
-	}
-	const logsCols = `INSERT INTO bandwidth_logs
-		(user_id, method, path, category, source, status_code, bytes_sent, bytes_recv, is_range, created_at)
-		VALUES `
-	if err := sess.Exec(logsCols+strings.Join(placeholders, ","), args...).Error; err != nil {
-		logBandwidthErr("bandwidth_logs (toplu)", err)
-		// Toplu INSERT bir pozuq sətir ucbatından BÜTÜN partiyanı itirir
-		// (köhnə sətir-bə-sətir yazıcı yalnız pozuq sətri itirirdi). Ona görə
-		// uğursuzluqda BİR DƏFƏ sətir-bə-sətir təkrar cəhd edirik: yalnız
-		// həqiqətən problemli qeyd(lər) düşür.
-		var perRowFailures int
-		for _, r := range batch {
-			if e := sess.Exec(logsCols+"(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-				r.UserID, r.Method, r.Path, r.Category, r.Source,
-				r.StatusCode, r.BytesSent, r.BytesRecv, r.IsRange, r.CreatedAt,
-			).Error; e != nil {
-				perRowFailures++
-			}
-		}
-		if perRowFailures > 0 {
-			logBandwidthErr(fmt.Sprintf("bandwidth_logs (sətir-bə-sətir, %d/%d düşdü)", perRowFailures, len(batch)),
-				errors.New("toplu yazı uğursuz oldu, təkrar cəhd qismən keçdi"))
-		}
-	}
-
-	// ── 2) bandwidth_daily — əvvəlcə YADDAŞDA topla, sonra tək upsert ───────
+	// ── bandwidth_daily — əvvəlcə YADDAŞDA topla, sonra tək upsert ──────────
 	// Eyni (user, gün, kateqoriya, mənbə) açarı bir partiyada onlarla dəfə
 	// təkrarlanır; yaddaşda toplamaq həm gediş sayını, həm də eyni sətir
 	// üzərindəki kilid rəqabətini kəskin azaldır.
@@ -213,7 +172,6 @@ func writeBandwidthBatch(db *gorm.DB, batch []BandwidthRecord) {
 		// dəyərlər unikal indeksdə BİR-BİRİNDƏN FƏRQLİ sayılır, ona görə
 		// hər anonim sorğu bandwidth_daily-də YENİ sətir yaradardı —
 		// cədvəl sonsuz böyüyür və gündəlik hesabat mənasızlaşır.
-		// Anonim trafik bandwidth_logs-da tam olaraq qalır.
 		if r.UserID == nil {
 			bandwidthAnonSkipped.Add(1)
 			continue
@@ -286,7 +244,7 @@ func BandwidthMiddleware() gin.HandlerFunc {
 			bytesRecv = 0
 		}
 
-		category, normPath := classifyBandwidthPath(path)
+		category := classifyBandwidthPath(path)
 
 		if strings.HasPrefix(category, "media_") {
 			if start.UnixNano()%mediaSampleMsg != 0 {
@@ -312,16 +270,12 @@ func BandwidthMiddleware() gin.HandlerFunc {
 		}
 
 		rec := BandwidthRecord{
-			UserID:     uid,
-			Method:     c.Request.Method,
-			Path:       normPath,
-			Category:   category,
-			Source:     "messenger",
-			StatusCode: c.Writer.Status(),
-			BytesSent:  bytesSent,
-			BytesRecv:  bytesRecv,
-			IsRange:    c.Writer.Status() == 206,
-			CreatedAt:  start,
+			UserID:    uid,
+			Category:  category,
+			Source:    "messenger",
+			BytesSent: bytesSent,
+			BytesRecv: bytesRecv,
+			CreatedAt: start,
 		}
 
 		select {
@@ -334,7 +288,7 @@ func BandwidthMiddleware() gin.HandlerFunc {
 	}
 }
 
-func classifyBandwidthPath(path string) (category, norm string) {
+func classifyBandwidthPath(path string) string {
 	if strings.HasPrefix(path, "/api/s3-storage/") {
 		ext := ""
 		if i := strings.LastIndex(path, "."); i != -1 {
@@ -343,31 +297,20 @@ func classifyBandwidthPath(path string) (category, norm string) {
 		switch ext {
 		case "jpg", "jpeg", "png", "webp", "gif",
 			"heic", "heif", "jfif", "bmp", "tiff", "tif", "svg", "avif":
-			return "media_image", "/api/s3-storage/*"
+			return "media_image"
 		case "mp4", "webm", "mov",
 			"mkv", "avi", "m4v", "3gp", "flv", "ts", "mpeg", "mpg":
-			return "media_video", "/api/s3-storage/*"
+			return "media_video"
 		case "mp3", "m4a", "aac", "wav",
 			"ogg", "opus", "amr", "flac", "weba", "caf":
-			return "media_audio", "/api/s3-storage/*"
+			return "media_audio"
 		default:
-			return "media_other", "/api/s3-storage/*"
+			return "media_other"
 		}
 	}
-
-	parts := strings.Split(path, "/")
-	for i, p := range parts {
-		if p == "" {
-			continue
-		}
-		if _, err := strconv.Atoi(p); err == nil {
-			parts[i] = ":id"
-		}
-	}
-	norm = strings.Join(parts, "/")
 
 	if strings.HasPrefix(path, "/api/") {
-		return "api", norm
+		return "api"
 	}
-	return "other", norm
+	return "other"
 }
