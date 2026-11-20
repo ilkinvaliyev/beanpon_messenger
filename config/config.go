@@ -76,6 +76,12 @@ type Config struct {
 	// Watch party (package watch, docs/WATCH_PARTY.md). YouTubeAPIKey feeds
 	// search / trending / video meta; empty only switches those off.
 	YouTubeAPIKey string
+
+	// LiveKit — voice chat of game tables (gamechat/voice.go). Same values as
+	// piokio_live / Laravel. Any of them empty = the feature is off.
+	LiveKitHost      string
+	LiveKitAPIKey    string
+	LiveKitAPISecret string
 	// YouTubeSearchDailyMax — watch search.list calls per day (100 quota
 	// units each, the default 10k/day quota fits ~100). 0 = no cap.
 	YouTubeSearchDailyMax int
@@ -178,6 +184,9 @@ func LoadConfig() *Config {
 		PgBouncerEnabled:       envBool("PGBOUNCER_ENABLED", false),
 		AppURL:                 envStr("APP_URL", "https://api.beanpon.com"),
 		YouTubeAPIKey:          os.Getenv("YOUTUBE_API_KEY"),
+		LiveKitHost:            os.Getenv("LIVEKIT_HOST"),
+		LiveKitAPIKey:          os.Getenv("LIVEKIT_API_KEY"),
+		LiveKitAPISecret:       os.Getenv("LIVEKIT_API_SECRET"),
 		YouTubeSearchDailyMax:  envInt("YOUTUBE_SEARCH_DAILY_MAX", 90),
 
 		// Chat streaks (websocket/chat_streak.go).

@@ -4,8 +4,10 @@ import (
 	"beanpon_messenger/cache"
 	"beanpon_messenger/config"
 	"beanpon_messenger/database"
+	"beanpon_messenger/gamechat"
 	"beanpon_messenger/handlers"
 	"beanpon_messenger/middleware"
+	"beanpon_messenger/models"
 	"beanpon_messenger/services"
 	"beanpon_messenger/utils"
 	"beanpon_messenger/watch"
@@ -250,6 +252,42 @@ func main() {
 	})
 	watchModule.Start(context.Background())
 
+	// 5. Oyun masalarının söhbəti (domino / Pio / loto) — WS /ws/game-chat.
+	// Canlı otaq söhbətinin imkanları (mətn, GIF, şəkil, Piound, cavab, süzgəc,
+	// kölgə ban, bloklar), amma şifrəsiz və bazasız: masa keçicidir, söhbəti də
+	// yaddaşda durur. Giriş biletini piokio_game verir (ortaq JWT sirri).
+	// Müqavilə: docs/GAME_CHAT.md.
+	gameChatHosts := append([]string{}, gamechat.DefaultMediaHosts...)
+	if h := strings.TrimPrefix(strings.TrimPrefix(cfg.AppURL, "https://"), "http://"); h != "" {
+		if i := strings.IndexAny(h, "/:"); i >= 0 {
+			h = h[:i]
+		}
+		gameChatHosts = append(gameChatHosts, strings.ToLower(h))
+	}
+	gameChat := gamechat.New(gamechat.Deps{
+		Secret:  cfg.JWTSecret,
+		BadWord: utils.ContainsBadWord,
+		Blocked: func(a, b uint64) bool { return models.IsBlocked(database.DB, uint(a), uint(b)) },
+		Shadow: func(uid uint64) bool {
+			var spam bool
+			database.DB.Table("users").Select("live_spam").Where("id = ?", uid).Scan(&spam)
+			return spam
+		},
+		FullURL: func(path string) string {
+			if full := utils.PrependS3URL(&path); full != nil {
+				return *full
+			}
+			return ""
+		},
+		MediaHosts: gameChatHosts,
+
+		// Voice chat of the table (LiveKit); empty values = the feature is off.
+		LiveKitURL:    cfg.LiveKitHost,
+		LiveKitKey:    cfg.LiveKitAPIKey,
+		LiveKitSecret: cfg.LiveKitAPISecret,
+	})
+	gameChat.Start(context.Background())
+
 	// Handler'ları oluştur
 	messageHandler := handlers.NewMessageHandler(encryptionService, wsHub)
 	// HTTP axını üçün moderasiya queue-sunu handler-a bağla.
@@ -333,6 +371,11 @@ func main() {
 	router.GET("/ws/live", middleware.JWTMiddlewareForWebSocket(cfg.JWTSecret), liveHub.HandleWebSocket)
 	router.GET("/ws/rave", middleware.JWTMiddlewareForWebSocket(cfg.JWTSecret), raveHandler.HandleWebSocket) // ← YENİ
 	router.GET("/ws/watch", middleware.JWTMiddlewareForWebSocket(cfg.JWTSecret), watchModule.HandleWS)
+	router.GET("/ws/game-chat", middleware.JWTMiddlewareForWebSocket(cfg.JWTSecret), func(c *gin.Context) {
+		uid, _ := c.Get("user_id")
+		id, _ := uid.(uint)
+		gameChat.ServeWS(c.Writer, c.Request, uint64(id))
+	})
 
 	// Mesajlaşma API route'ları (JWT korumalı)
 	api := router.Group("/api/v1")
